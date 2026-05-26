@@ -27,6 +27,8 @@ export interface StartupDiagnostics {
   proxyTools: string[]
   mcpServers: string[]
   interactiveTransport: boolean
+  /** ExitPlanMode approval routed through opencode's `question` tool. */
+  planModeQuestion: boolean
   anthropicApiKeyInEnv: boolean
 }
 
@@ -189,6 +191,7 @@ export function collectStartupDiagnostics(
     interactiveTransport:
       firstOption(providers, "interactive") === true ||
       process.env.CLAUDE_CODE_INTERACTIVE_TRANSPORT === "1",
+    planModeQuestion: firstOption(providers, "planModeQuestion") === true,
     anthropicApiKeyInEnv: Boolean(
       process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN,
     ),

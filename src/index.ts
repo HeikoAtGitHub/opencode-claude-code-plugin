@@ -111,6 +111,7 @@ export function createClaudeCode(
       controlRequestDenyMessage: settings.controlRequestDenyMessage,
       proxyTools,
       proxyToolTimeoutMs: settings.proxyToolTimeoutMs,
+      planModeQuestion: settings.planModeQuestion ?? false,
       webSearch: settings.webSearch,
       hotReloadMcp: settings.hotReloadMcp ?? true,
       proxyOpencodeMcpTools: settings.proxyOpencodeMcpTools ?? true,

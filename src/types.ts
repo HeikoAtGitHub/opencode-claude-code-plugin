@@ -29,6 +29,14 @@ export interface ClaudeCodeConfig {
   controlRequestDenyMessage?: string
   proxyTools?: string[]
   proxyToolTimeoutMs?: Record<string, number>
+  /**
+   * Route `ExitPlanMode` through opencode's native `question` tool so plan
+   * approval is a real form instead of a "(yes/no)" line the operator has to
+   * answer in prose. Off by default: opencode's question form is currently
+   * broken upstream, so enabling this trades a working text prompt for a
+   * silent hang. See the plan-mode gotcha in AGENTS.md.
+   */
+  planModeQuestion?: boolean
   webSearch?: WebSearchRouting
   hotReloadMcp?: boolean
   proxyOpencodeMcpTools?: boolean
@@ -166,6 +174,24 @@ export interface ClaudeCodeProviderSettings {
    * long build the caller explicitly asked to run is never undercut.
    */
   proxyToolTimeoutMs?: Record<string, number>
+
+  /**
+   * Route Claude's `ExitPlanMode` through opencode's native `question` tool.
+   *
+   * Off (default): the plan is rendered as markdown followed by
+   * `**Do you want to proceed with this plan?** (yes/no)` and the operator
+   * answers in prose. On: the plan is rendered, the turn ends on
+   * `tool-calls`, and opencode runs its own `question` tool so approval is a
+   * real form; the answer is fed back to the CLI as the `tool_result` for
+   * the original `ExitPlanMode` call, which is what unlocks plan mode.
+   *
+   * Two reasons it is opt-in. opencode's `question` form does not currently
+   * render (upstream anomalyco/opencode#36604), so an enabled bridge hangs
+   * the turn until the operator interrupts; and older opencode builds have
+   * no `question` registry entry at all, in which case the plugin silently
+   * keeps the text path. See the plan-mode gotcha in AGENTS.md.
+   */
+  planModeQuestion?: boolean
 
   /**
    * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of
