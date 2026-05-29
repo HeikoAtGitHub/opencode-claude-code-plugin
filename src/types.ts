@@ -24,6 +24,7 @@ export interface ClaudeCodeConfig {
   multiStepContinuation?: boolean
   autoContinueIncompleteTurns?: boolean | "smart"
   compactionModel?: string
+  disableThinking?: boolean
   logging?: LoggingConfig
 }
 
@@ -197,6 +198,23 @@ export interface ClaudeCodeProviderSettings {
    * one-off runs without editing config.
    */
   compactionModel?: string
+
+  /**
+   * Turn off Claude extended thinking for this provider. By default the
+   * plugin enables thinking (and `--thinking-display summarized`) for models
+   * that support it, notably Opus 4.7. Some Claude Code CLI versions corrupt
+   * the extended-thinking signature round-trip across turns in a reused
+   * stream-json process, which makes the Anthropic API reject the next
+   * request with `400 ... thinking or redacted_thinking blocks in the latest
+   * assistant message cannot be modified`. Setting this to `true` is the
+   * config-file equivalent of exporting `CLAUDE_CODE_DISABLE_THINKING=1`:
+   * no thinking blocks are generated, so the contract can't be violated.
+   *
+   * The `CLAUDE_CODE_DISABLE_THINKING` / `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING`
+   * env vars still force thinking off regardless of this setting. Defaults to
+   * `false`.
+   */
+  disableThinking?: boolean
 
   /**
    * Logger configuration. See `LoggingConfig` for fields. Env vars

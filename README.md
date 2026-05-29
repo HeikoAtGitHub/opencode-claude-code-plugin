@@ -174,6 +174,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `multiStepContinuation` | boolean | `true` | Append a system-prompt hint nudging Claude to chain tool calls within one turn instead of pausing between subtasks. Each opencode turn boundary requires the user to manually press "continue", so for multi-step tasks this reduces friction. Set `false` to disable. |
 | `autoContinueIncompleteTurns` | boolean \| `"smart"` | `"smart"` | Smartly continue incomplete Claude CLI results inside the same opencode turn. Reduces manual "continue" presses when Claude ends after reasoning/tool activity without a useful final answer. Set `false` to disable. |
 | `compactionModel` | string | `"claude-haiku-4-5"` | Model used when opencode invokes `/compact`. Override per-process via the `CLAUDE_CODE_COMPACTION_MODEL` env var (env wins over config). See [Compaction](#compaction). |
+| `disableThinking` | boolean | `false` | Turn off Claude extended thinking for this provider. Config-file equivalent of `CLAUDE_CODE_DISABLE_THINKING=1`. Use it when a Claude Code CLI version corrupts the thinking-signature round-trip and the API rejects turns with `400 ... thinking or redacted_thinking blocks in the latest assistant message cannot be modified`. The env vars still force thinking off regardless. See [Extended thinking](#extended-thinking). |
 
 ### Overriding model metadata
 
@@ -380,6 +381,22 @@ The plugin respects the standard Claude Code thinking env vars. If you set them 
 | `CLAUDE_CODE_DISABLE_THINKING=1` | Disable thinking entirely. |
 | `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` | Disable adaptive thinking only. |
 | `CLAUDE_CODE_SHOW_THINKING_SUMMARIES=0` | Suppress summaries (the plugin sets this to `1` by default when unset). |
+
+For a persistent per-project setting that doesn't require a shell env var, use the `disableThinking` provider option instead (the env vars above still take precedence).
+
+### Thinking-block round-trip 400s
+
+If a turn fails with:
+
+```
+400 ... thinking or redacted_thinking blocks in the latest assistant message
+cannot be modified. These blocks must remain as they were in the original response.
+```
+
+this is an extended-thinking signature round-trip getting corrupted across turns in the reused Claude CLI process (observed with Claude Opus 4.7 on some Claude Code CLI versions). It is an upstream CLI issue, not a problem with how this plugin builds requests. Workarounds, in order of preference:
+
+1. Set `"disableThinking": true` in the provider options, or export `CLAUDE_CODE_DISABLE_THINKING=1`, then continue in a session. No thinking blocks are generated, so the contract can't be violated.
+2. Upgrade the Claude Code CLI if a newer version fixes the round-trip.
 
 ---
 

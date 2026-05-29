@@ -980,7 +980,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     thinking?: "enabled"
     thinkingDisplay?: "summarized"
   } {
-    if (isClaudeThinkingDisabled()) return {}
+    if (isClaudeThinkingDisabled(this.config.disableThinking === true)) return {}
 
     return {
       thinking: "enabled",
@@ -1289,7 +1289,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const proc = spawn(this.config.cliPath, cliArgs, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: claudeSpawnEnv(),
+      env: claudeSpawnEnv(this.config.disableThinking === true),
       shell: process.platform === "win32",
     })
 
@@ -1899,6 +1899,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               spawnProxyServer,
               spawnMcpHash,
               spawnSystemPromptFile,
+              self.config.disableThinking === true,
             )
             proc = ap.proc
             lineEmitter = ap.lineEmitter

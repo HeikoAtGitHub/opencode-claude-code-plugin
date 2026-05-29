@@ -170,3 +170,39 @@ test("Claude thinking env defaults preserve explicit user choices", () => {
     assert.equal(claudeSpawnEnv().CLAUDE_CODE_SHOW_THINKING_SUMMARIES, "1")
   })
 })
+
+test("disableThinking config flag turns thinking off without env vars", () => {
+  withClaudeThinkingEnv({}, () => {
+    // config off (default): thinking stays on, summaries default to 1
+    assert.equal(isClaudeThinkingDisabled(false), false)
+    assert.equal(claudeSpawnEnv(false).CLAUDE_CODE_SHOW_THINKING_SUMMARIES, "1")
+    assert.equal(claudeSpawnEnv(false).CLAUDE_CODE_DISABLE_THINKING, undefined)
+
+    // config on: thinking off, no summaries env injected, and the disable var
+    // is propagated to the child so the CLI itself enforces thinking-off
+    assert.equal(isClaudeThinkingDisabled(true), true)
+    assert.equal(
+      claudeSpawnEnv(true).CLAUDE_CODE_SHOW_THINKING_SUMMARIES,
+      undefined,
+    )
+    assert.equal(claudeSpawnEnv(true).CLAUDE_CODE_DISABLE_THINKING, "1")
+  })
+})
+
+test("disableThinking config flag does not clobber an explicit env var value", () => {
+  withClaudeThinkingEnv({ disableThinking: "0" }, () => {
+    // User explicitly set the env var to off. Even though config requests
+    // disable, the explicit child env value is preserved untouched.
+    assert.equal(claudeSpawnEnv(true).CLAUDE_CODE_DISABLE_THINKING, "0")
+  })
+})
+
+test("disableThinking env var still forces thinking off when config is off", () => {
+  withClaudeThinkingEnv({ disableThinking: "1" }, () => {
+    assert.equal(isClaudeThinkingDisabled(false), true)
+    assert.equal(
+      claudeSpawnEnv(false).CLAUDE_CODE_SHOW_THINKING_SUMMARIES,
+      undefined,
+    )
+  })
+})

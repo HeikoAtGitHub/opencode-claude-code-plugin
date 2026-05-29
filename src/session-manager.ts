@@ -45,24 +45,39 @@ function envFlagEnabled(value: string | undefined): boolean {
   return !["0", "false", "no", "off"].includes(normalized)
 }
 
-export function isClaudeThinkingDisabled(): boolean {
+// `configDisableThinking` is the opencode.json `disableThinking` provider
+// option. The env vars still force thinking off regardless, so they remain
+// the highest-priority override; the config flag is an additional trigger.
+export function isClaudeThinkingDisabled(configDisableThinking = false): boolean {
   return (
+    configDisableThinking ||
     envFlagEnabled(process.env.CLAUDE_CODE_DISABLE_THINKING) ||
     envFlagEnabled(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING)
   )
 }
 
-export function claudeSpawnEnv(): Record<string, string | undefined> {
+export function claudeSpawnEnv(
+  configDisableThinking = false,
+): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     TERM: "xterm-256color",
+  }
+
+  // The `disableThinking` config option is meant to be a true equivalent of
+  // exporting `CLAUDE_CODE_DISABLE_THINKING=1`, so inject the var into the
+  // child when the user hasn't already set it. This makes Claude CLI itself
+  // enforce thinking-off (not just the plugin skipping `--thinking`), which
+  // is exactly the configuration that resolves the thinking-signature 400.
+  if (configDisableThinking && process.env.CLAUDE_CODE_DISABLE_THINKING === undefined) {
+    env.CLAUDE_CODE_DISABLE_THINKING = "1"
   }
 
   // Default-on thinking summaries for opus-4-7 (which omits thinking by
   // default on the CLI side). Any var the user has explicitly set in their
   // shell is passed through untouched; the plugin only fills in the default.
   if (
-    !isClaudeThinkingDisabled() &&
+    !isClaudeThinkingDisabled(configDisableThinking) &&
     process.env.CLAUDE_CODE_SHOW_THINKING_SUMMARIES === undefined
   ) {
     env.CLAUDE_CODE_SHOW_THINKING_SUMMARIES = "1"
@@ -129,6 +144,7 @@ export function spawnClaudeProcess(
   proxyServer?: ProxyMcpServer | null,
   mcpHash?: string | null,
   systemPromptFile?: string,
+  disableThinking = false,
 ): ActiveProcess {
   evictIfNeeded()
   log.info("spawning new claude process", { cliPath, cliArgs, cwd, sessionKey })
@@ -136,7 +152,7 @@ export function spawnClaudeProcess(
   const proc = spawn(cliPath, cliArgs, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: claudeSpawnEnv(),
+    env: claudeSpawnEnv(disableThinking),
     shell: process.platform === "win32",
   })
 
