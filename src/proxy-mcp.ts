@@ -198,6 +198,46 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       required: ["description", "prompt", "subagent_type"],
     },
   },
+  {
+    name: "submit_plan",
+    description:
+      "Submit a plan for user review via opencode's Plannotator submit_plan tool." +
+      " The first call should pass a single edit with start=1 and the full" +
+      " plan as content. Use end=0 only as an insert-before-line-1" +
+      " compatibility fallback when needed. Routed through opencode so the" +
+      " browser approval UI and session feedback stay on the opencode side.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        edits: {
+          type: "array",
+          description: "Line-range edits to apply to the backing plan file.",
+          items: {
+            type: "object",
+            properties: {
+              start: {
+                type: "number",
+                description: "1-indexed start line (inclusive).",
+              },
+              end: {
+                type: "number",
+                description:
+                  "Optional 1-indexed end line (inclusive). Omit to replace" +
+                  " from start through end of file; start=1,end=0 inserts" +
+                  " before line 1 as first-call compatibility fallback.",
+              },
+              content: {
+                type: "string",
+                description: "Replacement content. Empty string deletes the line range.",
+              },
+            },
+            required: ["start", "content"],
+          },
+        },
+      },
+      required: ["edits"],
+    },
+  },
 ]
 
 export async function createProxyMcpServer(
