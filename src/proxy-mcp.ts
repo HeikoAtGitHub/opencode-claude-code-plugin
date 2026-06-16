@@ -41,6 +41,7 @@ export interface ProxyToolCall {
   id: string
   toolName: string
   input: Record<string, unknown>
+  timeoutMs?: number
   resolve: (result: ProxyToolResult) => void
   reject: (err: Error) => void
 }
@@ -53,12 +54,67 @@ const PROTOCOL_VERSION = "2024-11-05"
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
-// Cap on how long a proxy tool call may wait for opencode to resolve it.
-// Matches Claude CLI's hard upper bound for Bash (10 min). Without this the
-// HTTP handler waits forever if the broker chain breaks (listener never
-// attaches, opencode crashes between turns, etc.) and the Claude
-// subprocess sits idle waiting for a tool result that never arrives.
-const PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
+export type ProxyToolTimeoutConfig = number | Record<string, number | undefined>
+
+export interface ProxyMcpServerOptions {
+  /** Per-tool or global proxy wait timeout in milliseconds. */
+  toolTimeoutMs?: ProxyToolTimeoutConfig
+}
+
+// Cap on how long a proxy tool call may wait for opencode to resolve it. Most
+// tools keep the historical 10-minute default. Interactive/user-driven tools
+// get longer defaults because they legitimately wait for browser approval or a
+// subagent run.
+const DEFAULT_PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
+const DEFAULT_PROXY_TOOL_TIMEOUT_MS: Record<string, number> = {
+  task: 30 * 60 * 1000,
+  submit_plan: 24 * 60 * 60 * 1000,
+}
+
+function parsePositiveTimeoutMs(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return Math.trunc(value)
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value.trim())
+    if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed)
+  }
+  return undefined
+}
+
+function envTimeoutForTool(toolName: string): number | undefined {
+  const normalized = toolName.replace(/[^a-zA-Z0-9]+/g, "_").toUpperCase()
+  return parsePositiveTimeoutMs(
+    process.env[`OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_${normalized}_MS`],
+  )
+}
+
+function configuredTimeoutForTool(
+  toolName: string,
+  configured: ProxyToolTimeoutConfig | undefined,
+): number | undefined {
+  if (configured === undefined) return undefined
+  if (typeof configured === "number") return parsePositiveTimeoutMs(configured)
+  const lower = toolName.toLowerCase()
+  return (
+    parsePositiveTimeoutMs(configured[toolName]) ??
+    parsePositiveTimeoutMs(configured[lower]) ??
+    parsePositiveTimeoutMs(configured[toolName.toUpperCase()])
+  )
+}
+
+export function resolveProxyToolTimeoutMs(
+  toolName: string,
+  configured?: ProxyToolTimeoutConfig,
+): number {
+  return (
+    envTimeoutForTool(toolName) ??
+    parsePositiveTimeoutMs(process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS) ??
+    configuredTimeoutForTool(toolName, configured) ??
+    DEFAULT_PROXY_TOOL_TIMEOUT_MS[toolName.toLowerCase()] ??
+    DEFAULT_PROXY_CALL_TIMEOUT_MS
+  )
+}
 
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
   {
@@ -242,6 +298,7 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
 
 export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
+  options: ProxyMcpServerOptions = {},
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
@@ -330,10 +387,12 @@ export async function createProxyMcpServer(
         }
 
         const callId = crypto.randomUUID()
+        const timeoutMs = resolveProxyToolTimeoutMs(toolName, options.toolTimeoutMs)
         log.info("proxy-mcp tool call received", {
           callId,
           toolName,
           hasInput: input != null,
+          timeoutMs,
         })
 
         let timer: ReturnType<typeof setTimeout> | null = null
@@ -343,6 +402,7 @@ export async function createProxyMcpServer(
               id: callId,
               toolName,
               input,
+              timeoutMs,
               resolve,
               reject,
             }
@@ -357,14 +417,14 @@ export async function createProxyMcpServer(
               log.notice("proxy-mcp tool call timed out", {
                 callId,
                 toolName,
-                timeoutMs: PROXY_CALL_TIMEOUT_MS,
+                timeoutMs,
               })
               reject(
                 new Error(
-                  `Proxy tool '${toolName}' timed out after ${PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
+                  `Proxy tool '${toolName}' timed out after ${timeoutMs}ms waiting for opencode to resolve the call`,
                 ),
               )
-            }, PROXY_CALL_TIMEOUT_MS)
+            }, timeoutMs)
             calls.emit("call", entry)
           },
         ).finally(() => {
@@ -411,7 +471,10 @@ export async function createProxyMcpServer(
         (errorMessage.includes("timed out after") &&
           errorMessage.includes("waiting for opencode to resolve")) ||
         errorMessage.includes("rejecting as orphaned") ||
-        errorMessage.includes("was orphaned by a new user turn")
+        errorMessage.includes("was orphaned by a new user turn") ||
+        errorMessage.includes("cannot run while interactive proxy tool") ||
+        (errorMessage.includes("cannot run while") &&
+          errorMessage.includes("proxy call(s) are pending"))
       const logFn = isExpectedCleanup ? log.notice : log.warn
       logFn("proxy-mcp error handling request", {
         error: errorMessage,

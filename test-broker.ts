@@ -198,3 +198,39 @@ test("parallel queue from same session: index reflects every callId", () => {
   rejectAllPendingProxyCallsForSession(sk, new Error("cleanup"))
   assert.equal(getPendingProxyCalls(sk).length, 0)
 })
+
+test("submit_plan pending rejects later proxy calls immediately", async () => {
+  const sk = `sk-submit-plan-lock-${Date.now()}`
+  const submitPlan = makeCall("submit_plan")
+  const edit = makeCall("edit")
+
+  queuePendingProxyCall(sk, submitPlan.call)
+  const queuedEdit = queuePendingProxyCall(sk, edit.call)
+
+  assert.equal(queuedEdit, null)
+  await assert.rejects(edit.promise, /cannot run while interactive proxy tool 'submit_plan'/)
+
+  const pending = getPendingProxyCalls(sk)
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].toolCallId, submitPlan.id)
+
+  rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+})
+
+test("submit_plan is rejected when another proxy call is already pending", async () => {
+  const sk = `sk-submit-plan-after-call-${Date.now()}`
+  const bash = makeCall("bash")
+  const submitPlan = makeCall("submit_plan")
+
+  queuePendingProxyCall(sk, bash.call)
+  const queuedSubmitPlan = queuePendingProxyCall(sk, submitPlan.call)
+
+  assert.equal(queuedSubmitPlan, null)
+  await assert.rejects(submitPlan.promise, /cannot run while 1 proxy call\(s\) are pending/)
+
+  const pending = getPendingProxyCalls(sk)
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].toolCallId, bash.id)
+
+  rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+})

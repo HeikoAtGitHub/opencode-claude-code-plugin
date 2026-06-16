@@ -28,6 +28,7 @@ export interface ClaudeCodeConfig {
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
   proxyTools?: string[]
+  proxyToolTimeoutMs?: number | Record<string, number | undefined>
   webSearch?: WebSearchRouting
   hotReloadMcp?: boolean
   proxyOpencodeMcpTools?: boolean
@@ -130,7 +131,8 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`. Leave empty or unset to disable proxying.
+   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `submit_plan`.
+   * Leave empty or unset to disable proxying.
    *
    * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
    * opencode's `task` tool, so subagent calls run under opencode's
@@ -141,6 +143,13 @@ export interface ClaudeCodeProviderSettings {
    * (see opencode's agent docs).
    */
   proxyTools?: string[]
+
+  /**
+   * Proxy tool wait timeout(s) in milliseconds. A number applies to every
+   * proxied tool; an object may override individual proxy MCP tool names
+   * such as `bash`, `task`, or `submit_plan`.
+   */
+  proxyToolTimeoutMs?: number | Record<string, number | undefined>
 
   /**
    * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of

@@ -782,7 +782,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     tools: ProxyToolDef[],
     sessionKeyForCalls: string,
   ): Promise<ProxyMcpServer> {
-    const srv = await createProxyMcpServer(tools)
+    const srv = await createProxyMcpServer(tools, {
+      toolTimeoutMs: this.config.proxyToolTimeoutMs,
+    })
     srv.calls.on("call", (call: ProxyToolCall) => {
       queuePendingProxyCall(sessionKeyForCalls, call)
     })

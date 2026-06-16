@@ -188,6 +188,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
       "options": {
         "cliPath": "claude",
         "proxyTools": ["Bash", "Edit", "Write", "WebFetch"],
+        "proxyToolTimeoutMs": { "submit_plan": 86400000 },
         "skipPermissions": true,
         "permissionMode": "default",
         "bridgeOpencodeMcp": true,
@@ -206,6 +207,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `skipPermissions` | boolean | `true` | Pass `--dangerously-skip-permissions` to `claude`. Ignored when `proxyTools` is set — the proxy handles permissions through opencode instead. |
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
 | `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
+| `proxyToolTimeoutMs` | number \| `Record<string, number>` | normal tools: `600000`, `task`: `1800000`, `submit_plan`: `86400000` | How long a proxy MCP call may wait for opencode to return the tool result. Env overrides: `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS` globally or `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_<TOOL>_MS` per tool, e.g. `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS`. |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
@@ -294,10 +296,13 @@ By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it execut
 | `"Write"` | `Write` | `mcp__opencode_proxy__write` |
 | `"WebFetch"` | `WebFetch` | `mcp__opencode_proxy__webfetch` |
 | `"Task"` | `Agent` | `mcp__opencode_proxy__task` |
+| `"submit_plan"` | – | `mcp__opencode_proxy__submit_plan` |
 
 The `Task` proxy is the way to let Claude orchestrate opencode's configured subagents (`build`, `general`, custom subagents defined in `opencode.json`) instead of Claude CLI's internal-only general-purpose / Explore / Plan options. With `"Task"` in `proxyTools` and `permission.task: allow` granted to the calling agent, a Claude session can invoke `task(subagent_type="build", prompt="...")` and the subagent runs natively under opencode (with its own permission UI, lifecycle, model assignment, and Tab visibility). Without `"Task"`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode visibility.
 
-Only those five values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
+Only those values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
+
+`submit_plan` is a Plannotator/opencode-specific proxy tool rather than a Claude built-in. It is useful when a Claude Code headless session is embedded inside opencode and must call opencode's `submit_plan` instead of Claude Code's native `ExitPlanMode` hook. Because browser approval can legitimately take much longer than a shell command, its default proxy wait timeout is 24 hours. While `submit_plan` is pending, later proxied calls in the same Claude session are rejected with a clear error instead of being left as orphaned pending calls.
 
 To turn off proxying entirely:
 

@@ -7,6 +7,7 @@ export interface PendingProxyCall {
   toolCallId: string
   toolName: string
   input: Record<string, unknown>
+  timeoutMs?: number
 }
 
 type InternalPending = PendingProxyCall & {
@@ -25,6 +26,7 @@ const callIdsBySession = new Map<string, Set<string>>()
 
 const emitter = new EventEmitter()
 const PENDING_PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
+const INTERACTIVE_PROXY_TOOLS = new Set(["submit_plan"])
 
 function eventName(sessionKey: string) {
   return `pending:${sessionKey}`
@@ -58,7 +60,29 @@ export function onPendingProxyCall(
 export function queuePendingProxyCall(
   sessionKey: string,
   call: ProxyToolCall,
-): PendingProxyCall {
+): PendingProxyCall | null {
+  const existingForSession = getPendingProxyCalls(sessionKey)
+  const existingInteractive = existingForSession.find((pending) =>
+    INTERACTIVE_PROXY_TOOLS.has(pending.toolName.toLowerCase()),
+  )
+  const incomingInteractive = INTERACTIVE_PROXY_TOOLS.has(call.toolName.toLowerCase())
+  if (existingInteractive || (incomingInteractive && existingForSession.length > 0)) {
+    const reason = existingInteractive
+      ? `Proxy tool '${call.toolName}' cannot run while interactive proxy tool '${existingInteractive.toolName}' (${existingInteractive.toolCallId}) is pending for this session`
+      : `Interactive proxy tool '${call.toolName}' cannot run while ${existingForSession.length} proxy call(s) are pending for this session`
+    call.reject(new Error(reason))
+    log.notice("rejected proxy call because interactive proxy call is pending", {
+      sessionKey,
+      toolCallId: call.id,
+      toolName: call.toolName,
+      pendingInteractiveToolCallId: existingInteractive?.toolCallId,
+      pendingInteractiveToolName: existingInteractive?.toolName,
+      pendingCount: existingForSession.length,
+      error: reason,
+    })
+    return null
+  }
+
   // Defensive: if this exact callId is somehow already pending (UUID
   // collision or retry storm), replace it cleanly so we never leak two
   // entries for the same id.
@@ -72,6 +96,7 @@ export function queuePendingProxyCall(
     indexRemove(previous.sessionKey, call.id)
   }
 
+  const timeoutMs = call.timeoutMs ?? PENDING_PROXY_CALL_TIMEOUT_MS
   const timer = setTimeout(() => {
     const current = pendingByCallId.get(call.id)
     if (!current) return
@@ -79,7 +104,7 @@ export function queuePendingProxyCall(
     indexRemove(current.sessionKey, call.id)
     current.reject(
       new Error(
-        `Proxy tool call '${call.toolName}' timed out after ${PENDING_PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
+        `Proxy tool call '${call.toolName}' timed out after ${timeoutMs}ms waiting for opencode to resolve the call`,
       ),
     )
     // v0.4.13: demoted from warn to notice. AFK-permission-pending
@@ -89,15 +114,16 @@ export function queuePendingProxyCall(
       sessionKey: current.sessionKey,
       toolCallId: call.id,
       toolName: call.toolName,
-      timeoutMs: PENDING_PROXY_CALL_TIMEOUT_MS,
+      timeoutMs,
     })
-  }, PENDING_PROXY_CALL_TIMEOUT_MS)
+  }, timeoutMs)
 
   const pending: InternalPending = {
     sessionKey,
     toolCallId: call.id,
     toolName: call.toolName,
     input: call.input,
+    timeoutMs,
     createdAt: Date.now(),
     timer,
     resolve: call.resolve,
@@ -110,6 +136,7 @@ export function queuePendingProxyCall(
     sessionKey,
     toolCallId: call.id,
     toolName: call.toolName,
+    timeoutMs,
   })
   return pending
 }
