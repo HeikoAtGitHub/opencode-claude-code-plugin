@@ -281,6 +281,19 @@ By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. 
 - **Nested tasks:** current opencode defaults `subagent_depth` to `1`, so a first-level child cannot launch another child. Increase top-level `subagent_depth` to permit deeper nesting, and explicitly grant `permission.task` on every subagent that should delegate; opencode otherwise adds a task deny to spawned subagent sessions.
 - **Background:** `background: true` returns after starting the child and lets opencode notify the parent when it finishes. Current opencode requires `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` in the environment of the opencode process. Foreground is the default.
 
+**Steering models to it.** Headless Claude Code CLIs expose no `Agent`/`Task`
+dispatch tool of their own (verified on 2.1.211), while they *do* expose
+`TaskCreate` — a todo tool. So "use a subagent" requests get mis-resolved:
+a todo appears, nothing runs, and the model may still narrate a successful
+dispatch. Two spawn-time countermeasures prevent that. The plugin overlays
+opencode's live `task` description (including the "Available agent types"
+list, so the model doesn't grep config files to check a subagent exists) onto
+the proxy def, and appends a system-prompt note naming
+`mcp__opencode_proxy__task` as the only dispatch path — with the ToolSearch
+recovery step for harnesses that defer MCP tool schemas. Both apply per Claude
+process at spawn, and provider options are read once at opencode startup, so
+`proxyTools` changes need a full opencode restart.
+
 Only those five values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
 
 Without `"Task"` in `proxyTools`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode child-session visibility. To opt out of all proxying, including Task, use an explicit empty list:
