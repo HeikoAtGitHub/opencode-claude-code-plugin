@@ -71,11 +71,118 @@ const PROTOCOL_VERSION = "2024-11-05"
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
-// Cap on how long a proxy tool call may wait for opencode to resolve it.
-// This is also written into Claude's MCP server config; otherwise Claude's
-// remote-HTTP client aborts after its 60-second default even while an
-// opencode subagent is still running.
-export const PROXY_CALL_TIMEOUT_MS = 30 * 60 * 1000
+// Flat fallback cap on how long a proxy tool call may wait for opencode to
+// resolve it. Matches Claude CLI's hard upper bound for Bash (10 min). The
+// effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
+export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
+
+// Per-tool default deadlines, keyed by lowercase proxy tool name. `task`
+// dispatches an opencode subagent that routinely runs 20-40 min; the old
+// flat ceiling fired mid-subagent, made Claude believe its dispatch had
+// failed, and (because the proxy had already returned a timeout error) the
+// late subagent result was dropped on the floor -- the operator had to
+// nudge "please check now, it seems the task succeeded" (@jknlsn, live
+// session ses_0cfc0da6, 2026-07-05).
+export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
+  task: 60 * 60 * 1000, // 60 min
+}
+
+// Node's setTimeout delay is a signed 32-bit int; values above 2^31-1 ms
+// (~24.85 days) trigger TimeoutOverflowWarning and fire at ~1ms instead.
+// Clamp absurd overrides / input.timeouts so a misconfigured deadline
+// can't collapse to "fires immediately".
+export const MAX_PROXY_TIMEOUT_MS = 2 ** 31 - 1
+
+/**
+ * Resolve the proxy deadline for a tool call. Layers, most-specific last:
+ *  1. flat default (`PROXY_DEFAULT_TIMEOUT_MS`, 10 min)
+ *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`)
+ *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key)
+ *  4. for `bash`, the call's own `input.timeout` -- the proxy must never
+ *     undercut a build the caller explicitly asked to run long. The bash
+ *     proxy def advertises a `timeout` field; before this fix the proxy
+ *     ignored it and killed the call at the flat ceiling anyway.
+ * Finally clamped to `MAX_PROXY_TIMEOUT_MS` to stay within Node's timer range.
+ */
+export function resolveProxyCallTimeoutMs(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  overrides: Record<string, number> | undefined,
+): number {
+  const key = toolName.toLowerCase()
+  let ms = PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS[key] ?? PROXY_DEFAULT_TIMEOUT_MS
+  if (overrides) {
+    const ov = lookupCaseInsensitive(overrides, key)
+    if (typeof ov === "number" && ov > 0) ms = ov
+  }
+  if (key === "bash") {
+    const requested = input?.timeout
+    if (typeof requested === "number" && requested > ms) ms = requested
+  }
+  return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+function lookupCaseInsensitive(
+  map: Record<string, number>,
+  key: string,
+): number | undefined {
+  if (Object.prototype.hasOwnProperty.call(map, key)) return map[key]
+  for (const k of Object.keys(map)) {
+    if (k.toLowerCase() === key) return map[k]
+  }
+  return undefined
+}
+
+/**
+ * Client-side abort ceiling written into Claude's `--mcp-config` entry for
+ * the proxy server. Without a `timeout` there, Claude CLI's remote-HTTP MCP
+ * client aborts each call at its 60-second default even while an opencode
+ * subagent is still running (@broskees, PR #18). It must be >= the largest
+ * server-side deadline or the client gives up before the broker does, so it
+ * tracks the max of the flat default, per-tool defaults, and user overrides.
+ * (A bash call raising its own `input.timeout` above this ceiling is a known
+ * edge; Claude CLI caps bash at 10 min anyway.)
+ */
+export function resolveProxyClientCeilingMs(
+  overrides: Record<string, number> | undefined,
+): number {
+  let ms = PROXY_DEFAULT_TIMEOUT_MS
+  for (const v of Object.values(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
+    if (v > ms) ms = v
+  }
+  if (overrides) {
+    for (const v of Object.values(overrides)) {
+      if (typeof v === "number" && v > ms) ms = v
+    }
+  }
+  return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+/**
+ * Build the timeout error surfaced to Claude. Keeps the substrings
+ * `"timed out after"` and `"waiting for opencode to resolve"` that the
+ * proxy-mcp catch block classifies as expected cleanup (notice, not warn).
+ * For `task` we append guidance: a Task timeout means the subagent may
+ * still be running but its result is now unreachable, and the model must
+ * neither declare the dispatch failed nor "schedule a wake-up" -- that is a
+ * Claude Code affordance which cannot fire in this headless/proxy context,
+ * so deferring silently drops the work.
+ */
+export function buildProxyTimeoutError(toolName: string, ms: number): Error {
+  const key = toolName.toLowerCase()
+  const base = `Proxy tool '${toolName}' timed out after ${ms}ms waiting for opencode to resolve the call`
+  if (key === "task") {
+    return new Error(
+      base +
+        " (the subagent). The subagent may still be running but its result" +
+        " is no longer reachable in this session. Do not declare the dispatch" +
+        " failed, and do not 'schedule a wake-up' or defer -- that mechanism" +
+        " does not apply here. If the result is required, re-dispatch or" +
+        " verify it directly now.",
+    )
+  }
+  return new Error(base)
+}
 
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
   {
@@ -185,7 +292,8 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " `build`, `general`, `explore`, or any custom subagent declared in" +
       " opencode.json). Foreground calls block until the subagent finishes;" +
       " set `background` to request opencode's background execution mode." +
-      " The 30-minute proxy timeout applies.",
+      " Task calls get a 60-minute proxy deadline by default (configurable" +
+      " via proxyToolTimeoutMs).",
     inputSchema: {
       type: "object",
       properties: {
@@ -225,6 +333,7 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
 
 export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
+  timeoutOverrides?: Record<string, number>,
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
@@ -332,6 +441,11 @@ export async function createProxyMcpServer(
               reject,
             }
             pending.set(callId, entry)
+            const deadlineMs = resolveProxyCallTimeoutMs(
+              toolName,
+              input,
+              timeoutOverrides,
+            )
             timer = setTimeout(() => {
               if (!pending.has(callId)) return
               pending.delete(callId)
@@ -342,14 +456,10 @@ export async function createProxyMcpServer(
               log.notice("proxy-mcp tool call timed out", {
                 callId,
                 toolName,
-                timeoutMs: PROXY_CALL_TIMEOUT_MS,
+                deadlineMs,
               })
-              reject(
-                new Error(
-                  `Proxy tool '${toolName}' timed out after ${PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
-                ),
-              )
-            }, PROXY_CALL_TIMEOUT_MS)
+              reject(buildProxyTimeoutError(toolName, deadlineMs))
+            }, deadlineMs)
             calls.emit("call", entry)
           },
         ).finally(() => {
@@ -445,7 +555,7 @@ export async function createProxyMcpServer(
             [SERVER_NAME]: {
               type: "http",
               url,
-              timeout: PROXY_CALL_TIMEOUT_MS,
+              timeout: resolveProxyClientCeilingMs(timeoutOverrides),
             },
           },
         },

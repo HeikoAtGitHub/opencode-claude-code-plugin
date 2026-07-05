@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events"
 import {
-  PROXY_CALL_TIMEOUT_MS,
+  buildProxyTimeoutError,
+  resolveProxyCallTimeoutMs,
   type ProxyToolCall,
   type ProxyToolResult,
 } from "./proxy-mcp.js"
@@ -28,6 +29,7 @@ const pendingByCallId = new Map<string, InternalPending>()
 const callIdsBySession = new Map<string, Set<string>>()
 
 const emitter = new EventEmitter()
+
 function eventName(sessionKey: string) {
   return `pending:${sessionKey}`
 }
@@ -60,6 +62,7 @@ export function onPendingProxyCall(
 export function queuePendingProxyCall(
   sessionKey: string,
   call: ProxyToolCall,
+  timeoutOverrides?: Record<string, number>,
 ): PendingProxyCall {
   // Defensive: if this exact callId is somehow already pending (UUID
   // collision or retry storm), replace it cleanly so we never leak two
@@ -74,16 +77,18 @@ export function queuePendingProxyCall(
     indexRemove(previous.sessionKey, call.id)
   }
 
+  const deadlineMs = resolveProxyCallTimeoutMs(
+    call.toolName,
+    call.input,
+    timeoutOverrides,
+  )
+
   const timer = setTimeout(() => {
     const current = pendingByCallId.get(call.id)
     if (!current) return
     pendingByCallId.delete(call.id)
     indexRemove(current.sessionKey, call.id)
-    current.reject(
-      new Error(
-        `Proxy tool call '${call.toolName}' timed out after ${PROXY_CALL_TIMEOUT_MS}ms waiting for opencode to resolve the call`,
-      ),
-    )
+    current.reject(buildProxyTimeoutError(call.toolName, deadlineMs))
     // v0.4.13: demoted from warn to notice. AFK-permission-pending
     // sessions can stack many of these; demoting keeps the UI quiet on
     // return while preserving the audit trail in plugin.log.
@@ -91,9 +96,9 @@ export function queuePendingProxyCall(
       sessionKey: current.sessionKey,
       toolCallId: call.id,
       toolName: call.toolName,
-      timeoutMs: PROXY_CALL_TIMEOUT_MS,
+      deadlineMs,
     })
-  }, PROXY_CALL_TIMEOUT_MS)
+  }, deadlineMs)
 
   const pending: InternalPending = {
     sessionKey,
