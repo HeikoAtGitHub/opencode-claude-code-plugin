@@ -44,6 +44,12 @@ function pickOpencodeDirectory(input: unknown): string | undefined {
 
 let warnedAnthropicApiKey = false
 
+// `Question` is deliberately absent: enabling it disables Claude Code's
+// built-in AskUserQuestion (via --disallowedTools) and replaces the
+// stop-and-wait deny/markdown path with an in-turn blocking form. That is a
+// behavior trade against the issue-#8 guarantee, so it stays opt-in until it
+// has the same live mileage Task had before v0.10.0 flipped it on. Users opt
+// in by listing it in `proxyTools`; see README "Question proxy tool".
 const DEFAULT_PROXY_TOOL_NAMES = [
   "Bash",
   "Edit",

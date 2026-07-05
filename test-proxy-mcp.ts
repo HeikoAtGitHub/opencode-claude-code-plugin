@@ -16,6 +16,8 @@ import {
   buildProxyTimeoutError,
   resolveProxyCallTimeoutMs,
   resolveProxyClientCeilingMs,
+  overlayQuestionProxyDescription,
+  filterQuestionProxyByOpencodeSupport,
   DEFAULT_PROXY_TOOLS,
   PROXY_DEFAULT_TIMEOUT_MS,
   MAX_PROXY_TIMEOUT_MS,
@@ -209,6 +211,7 @@ test("tools/list exposes the default proxy defs", async () => {
       method: "tools/list",
     })
     const names = res.json.result.tools.map((t: any) => t.name)
+    assert.ok(names.includes("question"))
     assert.ok(names.includes("task"))
     assert.ok(names.includes("bash"))
   })
@@ -393,4 +396,57 @@ test("tools/call bash timeout honours input.timeout over a shorter override", as
   } finally {
     await srv.close()
   }
+})
+
+// --- question proxy: version gate + description overlay ---------------------
+
+test("question gets a 30-min default deadline (a human has to read the form)", () => {
+  assert.equal(
+    resolveProxyCallTimeoutMs("question", undefined, undefined),
+    30 * MIN,
+  )
+})
+
+test("resolveProxyClientCeilingMs covers the longest per-tool default", () => {
+  // The ceiling is written into Claude's --mcp-config entry; if it were
+  // below task's 60 min the client would abort before the broker resolved.
+  assert.ok(resolveProxyClientCeilingMs(undefined) >= 60 * MIN)
+})
+
+test("filterQuestionProxyByOpencodeSupport drops the def on older opencode", () => {
+  const tools = DEFAULT_PROXY_TOOLS
+  assert.ok(tools.some((t) => t.name === "question"))
+  const kept = filterQuestionProxyByOpencodeSupport(tools, true)
+  assert.ok(kept.some((t) => t.name === "question"))
+  const dropped = filterQuestionProxyByOpencodeSupport(tools, false)
+  assert.equal(
+    dropped.some((t) => t.name === "question"),
+    false,
+    "no registry entry means a forwarded call would render as invalid",
+  )
+  // Only `question` is gated; everything else survives untouched.
+  assert.ok(dropped.some((t) => t.name === "task"))
+  assert.ok(dropped.some((t) => t.name === "bash"))
+})
+
+test("overlayQuestionProxyDescription prefers opencode's live description", () => {
+  const overlaid = overlayQuestionProxyDescription(
+    DEFAULT_PROXY_TOOLS,
+    "LIVE question description from opencode",
+  )
+  const question = overlaid.find((t) => t.name === "question")
+  assert.ok(question)
+  assert.ok(question.description.startsWith("LIVE question description"))
+  // The disambiguation note must survive, it is what tells the model the
+  // built-in AskUserQuestion is disabled.
+  assert.ok(question.description.includes("AskUserQuestion is disabled"))
+})
+
+test("overlayQuestionProxyDescription is a no-op without a live description", () => {
+  const before = DEFAULT_PROXY_TOOLS.find((t) => t.name === "question")
+  const after = overlayQuestionProxyDescription(
+    DEFAULT_PROXY_TOOLS,
+    undefined,
+  ).find((t) => t.name === "question")
+  assert.equal(after?.description, before?.description)
 })
