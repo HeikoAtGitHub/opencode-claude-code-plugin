@@ -33,6 +33,7 @@ import {
   deleteClaudeSessionId,
   deleteActiveProcess,
   deleteActiveProcessAndWait,
+  respawnActiveProcess,
   claudeSpawnEnv,
   isClaudeThinkingDisabled,
   sessionKey,
@@ -1838,6 +1839,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         let activeProcess = getActiveProcess(sk)
         let proc: import("child_process").ChildProcess
         let lineEmitter: import("events").EventEmitter
+        let cliArgs: string[]
         let proxyServer: ProxyMcpServer | null = activeProcess?.proxyServer ?? null
 
         const setup = async () => {
@@ -1941,7 +1943,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
             }
           } else {
-          let cliArgs: string[]
           let spawnSystemPromptFile: string | undefined
           let spawnProxyServer: ProxyMcpServer | null = null
           let spawnMcpHash: string | null = null
@@ -2118,6 +2119,111 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
               closeHandler()
             }, delayMs)
+          }
+
+          // Start watchdog: complementary to the inactivity watchdog above.
+          // That one only arms once content has arrived; this one covers the
+          // gap the other explicitly skips — a reused process that produces
+          // NO stdout at all after a fresh-turn envelope write. Seen after a
+          // very long proxy-blocked tool call resumed successfully (the child
+          // stays silent on stdout). On first fire we respawn the child with
+          // --session-id to resume the conversation transparently; on a
+          // second fire (respawn also silent) we end the turn cleanly so the
+          // next opencode turn spawns fresh. Tunable via env for reproduces.
+          const START_WATCHDOG_MS = (() => {
+            const env = process.env.CLAUDE_CODE_START_WATCHDOG_MS
+            const parsed = env ? Number.parseInt(env, 10) : NaN
+            return Number.isFinite(parsed) && parsed > 0 ? parsed : 90_000
+          })()
+          let startWatchdog: ReturnType<typeof setTimeout> | null = null
+          let respawnAttempted = false
+          const clearStartWatchdog = () => {
+            if (startWatchdog) {
+              clearTimeout(startWatchdog)
+              startWatchdog = null
+            }
+          }
+          const onStartWatchdogFire = () => {
+            startWatchdog = null
+            if (controllerClosed || hasReceivedContent) return
+            if (respawnAttempted) {
+              log.error(
+                "claude process still silent after respawn; ending turn",
+                { sessionKey: sk },
+              )
+              deleteActiveProcess(sk)
+              deleteClaudeSessionId(sk)
+              controllerClosed = true
+              cleanupTurn()
+              controller.enqueue({
+                type: "error",
+                error: new Error(
+                  "Claude process produced no output after the envelope write (start watchdog timeout).",
+                ),
+              })
+              try {
+                controller.close()
+              } catch {}
+              return
+            }
+            respawnAttempted = true
+            log.warn(
+              "no stdout after envelope write; respawning claude process to resume conversation",
+              { sessionKey: sk, startWatchdogMs: START_WATCHDOG_MS },
+            )
+            lineEmitter.off("line", lineHandler)
+            lineEmitter.off("close", closeHandler)
+            proc.off("error", procErrorHandler)
+            const newAp = respawnActiveProcess(
+              sk,
+              cliPath,
+              cliArgs,
+              cwd,
+              self.config.ignoreAnthropicApiKey,
+            )
+            if (!newAp) {
+              log.error(
+                "no active process to respawn (start watchdog); ending turn",
+                { sessionKey: sk },
+              )
+              controllerClosed = true
+              cleanupTurn()
+              controller.enqueue({
+                type: "error",
+                error: new Error(
+                  "No active claude process to respawn after start watchdog timeout.",
+                ),
+              })
+              try {
+                controller.close()
+              } catch {}
+              return
+            }
+            proc = newAp.proc
+            lineEmitter = newAp.lineEmitter
+            activeProcess = newAp
+            lineEmitter.on("line", lineHandler)
+            lineEmitter.on("close", closeHandler)
+            proc.on("error", procErrorHandler)
+            try {
+              proc.stdin?.write(userMsg + "\n")
+              log.debug("re-sent user message after respawn", {
+                textLength: userMsg.length,
+              })
+            } catch (err) {
+              log.error("failed to re-send envelope after respawn", {
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+            startWatchdog = setTimeout(
+              onStartWatchdogFire,
+              START_WATCHDOG_MS,
+            )
+          }
+          const armStartWatchdog = () => {
+            clearStartWatchdog()
+            if (controllerClosed) return
+            startWatchdog = setTimeout(onStartWatchdogFire, START_WATCHDOG_MS)
           }
 
           const toolCallMap = new Map<
@@ -2376,6 +2482,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           // Any line from the CLI counts as activity — reset the inactivity
           // watchdog so mid-turn pauses between blocks don't get killed.
           startResultFallback()
+          // First stdout line means the child is alive and responding —
+          // disarm the start watchdog (covers the "no output at all" gap).
+          clearStartWatchdog()
 
           try {
             const outer: ClaudeStreamMessage = JSON.parse(line)
@@ -3115,6 +3224,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           cleanedUp = true
           clearFallbackTimer()
           pendingResultCompletion = null
+          clearStartWatchdog()
           if (drainTimer) {
             clearTimeout(drainTimer)
             drainTimer = null
@@ -3277,6 +3387,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         // Send the user message for a fresh turn.
         proc.stdin?.write(userMsg + "\n")
         log.debug("sent user message", { textLength: userMsg.length })
+        // Arm the start watchdog so a reused child that goes silent after
+        // the envelope write (seen after a long proxy-blocked tool call)
+        // is respawned with --session-id instead of hanging the turn.
+        armStartWatchdog()
         }
 
         void setup().catch((err) => {

@@ -284,6 +284,82 @@ export function spawnClaudeProcess(
   return ap
 }
 
+/**
+ * Append `--resume <id>` to an already-built args vector when a Claude
+ * conversation id is known for the session and the args don't already carry
+ * a session flag. Used by `respawnActiveProcess` to resume the conversation
+ * in a fresh child without rebuilding the whole (version-gated) args vector.
+ * `--resume`, not `--session-id`: the latter means "create a NEW session
+ * with this UUID" and the CLI rejects it with "Session ID ... is already in
+ * use" whenever a transcript exists on disk — which is exactly the state a
+ * mid-conversation respawn is in. If the wedged child died before writing
+ * any transcript, `--resume` fails with "No conversation found with session
+ * ID", which the stderr recovery matcher already catches (fresh-session
+ * fallback).
+ */
+export function appendResumeIfNeeded(
+  sessionKey: string,
+  cliArgs: string[],
+): string[] {
+  if (cliArgs.includes("--resume") || cliArgs.includes("--session-id")) {
+    return cliArgs
+  }
+  const sid = claudeSessions.get(sessionKey)
+  if (!sid) return cliArgs
+  return [...cliArgs, "--resume", sid]
+}
+
+/**
+ * Replace a wedged reused process with a fresh one, resuming the same
+ * Claude conversation. Used by the doStream start-watchdog when a reused
+ * process produces no stdout within a grace window after a fresh-turn
+ * envelope write — observed after a very long proxy-blocked tool call
+ * (e.g. a multi-minute `task` subagent). Before the per-tool proxy timeout
+ * fix this was masked because the flat 10-minute ceiling ended the turn
+ * first; now that the task proxy blocks and returns successfully, resuming
+ * a reused child after such a long wait can leave it silent on stdout.
+ *
+ * Reuses the existing proxy server, system-prompt file, and MCP hash (their
+ * handles are already baked into `cliArgs`' `--mcp-config`/append-prompt
+ * paths), so this only swaps the child process. The old child's exit
+ * handler is silenced before kill so it doesn't close the proxy server we
+ * are reusing; the new child gets its own exit handler from
+ * `spawnClaudeProcess`. `claudeSessions` is left intact so the respawn can
+ * add `--resume` (see `appendResumeIfNeeded`).
+ *
+ * Returns the new `ActiveProcess`, or `undefined` if there was no active
+ * process for the key (caller should treat that as "nothing to respawn").
+ */
+export function respawnActiveProcess(
+  sessionKey: string,
+  cliPath: string,
+  cliArgs: string[],
+  cwd: string,
+  ignoreAnthropicApiKey?: boolean,
+): ActiveProcess | undefined {
+  const old = activeProcesses.get(sessionKey)
+  if (!old) return undefined
+  activeProcesses.delete(sessionKey)
+  // Silence the old exit handler so it doesn't close the proxy server,
+  // unlink the system-prompt file, or touch claudeSessions on its way out
+  // — those handles are reused by the new child. spawnClaudeProcess wires
+  // a fresh exit handler for the respawned child.
+  old.proc.removeAllListeners("exit")
+  try {
+    old.proc.kill()
+  } catch {}
+  return spawnClaudeProcess(
+    cliPath,
+    appendResumeIfNeeded(sessionKey, cliArgs),
+    cwd,
+    sessionKey,
+    old.proxyServer,
+    old.mcpHash,
+    old.systemPromptFile,
+    ignoreAnthropicApiKey,
+  )
+}
+
 export function buildCliArgs(opts: {
   sessionKey: string
   skipPermissions: boolean
