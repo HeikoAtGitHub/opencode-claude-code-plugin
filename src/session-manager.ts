@@ -58,6 +58,12 @@ export function claudeSpawnEnv(opts?: {
   const env: Record<string, string | undefined> = {
     ...process.env,
     TERM: "xterm-256color",
+    // Interactive proxy tools (notably submit_plan) block server-side for up
+    // to 24h waiting for human plan review. Claude Code's default MCP tool
+    // timeout is far shorter, so the client abandons the call early and the
+    // user's approval/feedback never returns into the session. Match the
+    // server-side ceiling; pass through any value the user set explicitly.
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? "86400000",
   }
 
   // Force subscription auth: with an API key in the env, Claude Code bills

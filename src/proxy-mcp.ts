@@ -50,7 +50,12 @@ export type ProxyToolResult =
   | { kind: "text"; text: string; isError?: boolean }
   | { kind: "error"; message: string }
 
-const PROTOCOL_VERSION = "2024-11-05"
+// Streamable HTTP (SSE responses to POST /mcp) requires a 2025-03-26+ protocol
+// version. The older 2024-11-05 makes the Claude CLI expect a buffered JSON
+// body on POST and drop our SSE stream ("transport dropped mid-call"). We also
+// echo the client's requested version in `initialize` to keep negotiation
+// correct across CLI versions.
+const PROTOCOL_VERSION = "2025-06-18"
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
@@ -70,6 +75,12 @@ const DEFAULT_PROXY_TOOL_TIMEOUT_MS: Record<string, number> = {
   task: 30 * 60 * 1000,
   submit_plan: 24 * 60 * 60 * 1000,
 }
+
+// Interval between SSE heartbeats (MCP progress notifications) emitted while a
+// proxy tool call is pending. Must stay well under the Claude CLI's ~296s HTTP
+// transport timeout and 300s MCP idle timeout, which otherwise abort a
+// long-pending interactive call (e.g. submit_plan during human plan review).
+const PROXY_HEARTBEAT_MS = 60 * 1000
 
 function parsePositiveTimeoutMs(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value) && value > 0) {
@@ -333,11 +344,14 @@ export async function createProxyMcpServer(
       })
 
       if (request.method === "initialize") {
+        const clientProtocol = (
+          request.params as { protocolVersion?: string } | undefined
+        )?.protocolVersion
         writeJson(res, {
           jsonrpc: "2.0",
           id: request.id ?? null,
           result: {
-            protocolVersion: PROTOCOL_VERSION,
+            protocolVersion: clientProtocol ?? PROTOCOL_VERSION,
             capabilities: { tools: {} },
             serverInfo: {
               name: SERVER_NAME,
@@ -395,45 +409,109 @@ export async function createProxyMcpServer(
           timeoutMs,
         })
 
+        // Respond as SSE (Streamable HTTP) rather than a single buffered JSON
+        // body. A long-pending interactive call — notably submit_plan during
+        // human plan review — otherwise dies at the Claude CLI's ~296s HTTP
+        // transport timeout (byte-silent connection) and its 300s MCP idle
+        // timeout, neither of which MCP_TOOL_TIMEOUT covers. Periodic progress
+        // notifications keep both alive; SSE also lets us return a terminal
+        // error carrying the request's REAL id instead of the id:null that
+        // desyncs the JSON-RPC transport and wedges the channel.
+        const progressToken = (
+          params as { _meta?: { progressToken?: unknown } }
+        )._meta?.progressToken
+        res.statusCode = 200
+        res.setHeader("Content-Type", "text/event-stream")
+        res.setHeader("Cache-Control", "no-cache")
+        res.setHeader("Connection", "keep-alive")
+        res.flushHeaders?.()
+        const sendSse = (msg: unknown) => {
+          try {
+            res.write(`event: message\ndata: ${JSON.stringify(msg)}\n\n`)
+          } catch {}
+        }
+        let progressN = 0
+        const heartbeat = setInterval(() => {
+          progressN += 1
+          if (progressToken !== undefined) {
+            sendSse({
+              jsonrpc: "2.0",
+              method: "notifications/progress",
+              params: { progressToken, progress: progressN },
+            })
+          } else {
+            try {
+              res.write(`: keepalive ${progressN}\n\n`)
+            } catch {}
+          }
+        }, PROXY_HEARTBEAT_MS)
+        ;(heartbeat as { unref?: () => void }).unref?.()
+
         let timer: ReturnType<typeof setTimeout> | null = null
-        const result = await new Promise<ProxyToolResult>(
-          (resolve, reject) => {
-            const entry: ProxyToolCall = {
-              id: callId,
-              toolName,
-              input,
-              timeoutMs,
-              resolve,
-              reject,
-            }
-            pending.set(callId, entry)
-            timer = setTimeout(() => {
-              if (!pending.has(callId)) return
-              pending.delete(callId)
-              // v0.4.13: demoted from warn to notice. Timeouts are usually
-              // permission-pending while the user is AFK — surfacing each as
-              // a yellow UI bubble produces a wall of noise on return. The
-              // file log still captures the event for diagnostics.
-              log.notice("proxy-mcp tool call timed out", {
-                callId,
+        let result: ProxyToolResult
+        try {
+          result = await new Promise<ProxyToolResult>(
+            (resolve, reject) => {
+              const entry: ProxyToolCall = {
+                id: callId,
                 toolName,
+                input,
                 timeoutMs,
-              })
-              reject(
-                new Error(
-                  `Proxy tool '${toolName}' timed out after ${timeoutMs}ms waiting for opencode to resolve the call`,
-                ),
-              )
-            }, timeoutMs)
-            calls.emit("call", entry)
-          },
-        ).finally(() => {
-          if (timer) clearTimeout(timer)
-          pending.delete(callId)
-        })
+                resolve,
+                reject,
+              }
+              pending.set(callId, entry)
+              timer = setTimeout(() => {
+                if (!pending.has(callId)) return
+                pending.delete(callId)
+                // v0.4.13: demoted from warn to notice. Timeouts are usually
+                // permission-pending while the user is AFK — surfacing each as
+                // a yellow UI bubble produces a wall of noise on return. The
+                // file log still captures the event for diagnostics.
+                log.notice("proxy-mcp tool call timed out", {
+                  callId,
+                  toolName,
+                  timeoutMs,
+                })
+                reject(
+                  new Error(
+                    `Proxy tool '${toolName}' timed out after ${timeoutMs}ms waiting for opencode to resolve the call`,
+                  ),
+                )
+              }, timeoutMs)
+              calls.emit("call", entry)
+            },
+          ).finally(() => {
+            if (timer) clearTimeout(timer)
+            pending.delete(callId)
+          })
+        } catch (error) {
+          clearInterval(heartbeat)
+          const message =
+            error instanceof Error ? error.message : String(error)
+          log.notice("proxy-mcp tool call rejected; sending error over SSE", {
+            callId,
+            toolName,
+            error: message,
+          })
+          // Terminal error over SSE with the request's REAL id (never null),
+          // so the CLI matches it and fails just this call instead of
+          // desyncing the JSON-RPC transport.
+          sendSse({
+            jsonrpc: "2.0",
+            id: request.id ?? null,
+            error: { code: -32000, message },
+          })
+          try {
+            res.end()
+          } catch {}
+          return
+        }
+
+        clearInterval(heartbeat)
 
         if (result.kind === "error") {
-          writeJson(res, {
+          sendSse({
             jsonrpc: "2.0",
             id: request.id ?? null,
             error: {
@@ -441,10 +519,13 @@ export async function createProxyMcpServer(
               message: result.message,
             },
           })
+          try {
+            res.end()
+          } catch {}
           return
         }
 
-        writeJson(res, {
+        sendSse({
           jsonrpc: "2.0",
           id: request.id ?? null,
           result: {
@@ -452,6 +533,9 @@ export async function createProxyMcpServer(
             isError: result.isError === true,
           },
         })
+        try {
+          res.end()
+        } catch {}
         return
       }
 

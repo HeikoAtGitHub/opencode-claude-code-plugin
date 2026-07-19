@@ -218,6 +218,10 @@ export class ClaudeSession {
         ...process.env,
         CLAUDE_CONFIG_DIR: this.o.configDir,
         TERM: "xterm-256color",
+        // Interactive proxy tools (notably submit_plan) block server-side for
+        // up to 24h waiting for human plan review; match that client-side so
+        // the approval/feedback isn't dropped by a short MCP tool timeout.
+        MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? "86400000",
         ...(this.o.ignoreAnthropicApiKey
           ? { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined }
           : {}),

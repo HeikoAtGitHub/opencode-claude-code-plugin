@@ -124,9 +124,25 @@ test("proxy MCP server passes resolved timeout into calls", async () => {
 async function rpc(url: string, method: string, params: Record<string, unknown>) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+    },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   })
   assert.equal(response.status, 200)
+  const contentType = response.headers.get("content-type") ?? ""
+  if (contentType.includes("text/event-stream")) {
+    // tools/call now streams: zero or more progress notifications followed by
+    // the terminal JSON-RPC response, each as an SSE `data:` line. Return the
+    // response message (the one carrying an `id`).
+    const body = await response.text()
+    const messages = body
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => JSON.parse(line.slice(5).trim()))
+    const final = [...messages].reverse().find((msg) => "id" in msg)
+    return (final ?? messages[messages.length - 1]) as any
+  }
   return response.json() as Promise<any>
 }
