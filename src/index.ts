@@ -18,6 +18,11 @@ import {
   setOpencodeClient,
   setOpencodeProjectDirectory,
 } from "./runtime-status.js"
+import {
+  logStartupDiagnostics,
+  pickOpencodeVersion,
+  type DiagnosticsProviderEntry,
+} from "./startup-diagnostics.js"
 
 export interface ClaudeCodeProvider {
   specificationVersion: "v3"
@@ -267,6 +272,21 @@ async function providerConfig(
   }
 }
 
+/**
+ * Narrow opencode's full provider map down to the ones this plugin owns
+ * (`claude-code` plus every `claude-code-<account>` expansion) so startup
+ * diagnostics never report another provider's options.
+ */
+export function claudeCodeProviders(
+  providers: Record<string, DiagnosticsProviderEntry> | undefined,
+): Record<string, DiagnosticsProviderEntry> {
+  const out: Record<string, DiagnosticsProviderEntry> = {}
+  for (const [id, entry] of Object.entries(providers ?? {})) {
+    if (id === PROVIDER_ID || id.startsWith(`${PROVIDER_ID}-`)) out[id] = entry
+  }
+  return out
+}
+
 async function expandAccountProviders(config: {
   provider?: Record<
     string,
@@ -331,6 +351,8 @@ async function expandAccountProviders(config: {
 const server: OpenCodePlugin = async (input) => {
   cleanupStaleUnscopedInstall()
 
+  const opencodeVersion = pickOpencodeVersion(input)
+
   // Capture the SDK client so the language model can query opencode's
   // in-memory MCP state per-turn for the runtime overlay. `input` is
   // `unknown` here (kept loose since opencode adds fields over time);
@@ -352,14 +374,10 @@ const server: OpenCodePlugin = async (input) => {
 
       const expanded = await expandAccountProviders(config)
       if (expanded) {
-        const registered = Object.entries(config.provider)
-          .filter(([id]) => id === PROVIDER_ID || id.startsWith(`${PROVIDER_ID}-`))
-          .map(([id, p]) => ({
-            id,
-            name: p?.name ?? id,
-            cwd: (p?.options as { cwd?: unknown } | undefined)?.cwd,
-          }))
-        log.notice("registered claude-code providers", { providers: registered })
+        logStartupDiagnostics(
+          claudeCodeProviders(config.provider),
+          opencodeVersion,
+        )
         return
       }
 
@@ -372,11 +390,10 @@ const server: OpenCodePlugin = async (input) => {
           PROVIDER_ID,
         ),
       }
-      log.notice("registered claude-code provider", {
-        id: PROVIDER_ID,
-        name: config.provider[PROVIDER_ID]?.name ?? PROVIDER_ID,
-        cwd: (config.provider[PROVIDER_ID]?.options as { cwd?: unknown } | undefined)?.cwd,
-      })
+      logStartupDiagnostics(
+        claudeCodeProviders(config.provider),
+        opencodeVersion,
+      )
     },
     // No `event` hook: MCP config drift is detected at turn start by the
     // hot-reload check in `claude-code-language-model.ts`, which respawns

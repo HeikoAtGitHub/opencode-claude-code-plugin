@@ -404,6 +404,8 @@ export interface BridgedMcp {
 
 /** Result of merging opencode's MCP config layers + applying runtime overlay. */
 export interface MergedMcp {
+  /** Merged, overlay-applied server specs keyed by opencode server name. */
+  servers: Record<string, OpencodeServer>
   /** Server names whose final spec is enabled (or implicitly enabled). */
   enabledServerNames: string[]
   /** Stable hash of the merged (pre-translation) MCP block. */
@@ -438,6 +440,45 @@ export function bridgeOpencodeMcp(
   runtimeStatus?: RuntimeMcpStatus,
   excludeServers?: ReadonlySet<string>,
 ): BridgedMcp | null {
+  const {
+    servers: merged,
+    enabledServerNames: allEnabledServerNames,
+    hash,
+  } = mergeOpencodeMcp(cwd, runtimeStatus)
+
+  // Translate every still-enabled server, skipping any caller has asked us
+  // to exclude (because they're being routed through the proxy instead).
+  const servers: Record<string, unknown> = {}
+  const bridgedServerNames: string[] = []
+  for (const [name, spec] of Object.entries(merged)) {
+    if (!spec || typeof spec !== "object") continue
+    if (excludeServers?.has(name)) continue
+    const translated = translateServer(name, spec as Record<string, unknown>)
+    if (translated) {
+      servers[name] = translated
+      bridgedServerNames.push(name)
+    }
+  }
+  return finishBridge({
+    servers,
+    bridgedServerNames,
+    allEnabledServerNames,
+    hash,
+    excludeServers,
+  })
+}
+
+/**
+ * Merge opencode's MCP config layers (global → `OPENCODE_CONFIG` → project
+ * walk-up → `.opencode/` siblings), apply the opencode runtime-status
+ * overlay, and hash the result. Split out of `bridgeOpencodeMcp` so
+ * read-only callers (startup diagnostics) can inspect what would be bridged
+ * without translating servers or writing a scratch config file.
+ */
+export function mergeOpencodeMcp(
+  cwd: string,
+  runtimeStatus?: RuntimeMcpStatus,
+): MergedMcp {
   const worktree = detectWorktree(cwd)
 
   // Layer 1: global merged
@@ -503,26 +544,12 @@ export function bridgeOpencodeMcp(
   // Compute the set of enabled server names BEFORE exclusion so callers can
   // tell whether a tool ID like `slack_conversations_add_message` came from
   // an opencode MCP server (vs a built-in tool that happens to contain `_`).
-  const allEnabledServerNames: string[] = []
+  const enabledServerNames: string[] = []
   for (const [name, spec] of Object.entries(merged)) {
     if (!spec || typeof spec !== "object") continue
     const enabled = (spec as { enabled?: unknown }).enabled
     if (enabled === false) continue
-    allEnabledServerNames.push(name)
-  }
-
-  // Translate every still-enabled server, skipping any caller has asked us
-  // to exclude (because they're being routed through the proxy instead).
-  const servers: Record<string, unknown> = {}
-  const bridgedServerNames: string[] = []
-  for (const [name, spec] of Object.entries(merged)) {
-    if (!spec || typeof spec !== "object") continue
-    if (excludeServers?.has(name)) continue
-    const translated = translateServer(name, spec as Record<string, unknown>)
-    if (translated) {
-      servers[name] = translated
-      bridgedServerNames.push(name)
-    }
+    enabledServerNames.push(name)
   }
 
   // Hash the pre-exclusion merged block so the hot-reload detector picks up
@@ -533,6 +560,20 @@ export function bridgeOpencodeMcp(
     .update(mergedBody)
     .digest("hex")
     .slice(0, 12)
+
+  return { servers: merged, enabledServerNames, hash }
+}
+
+/** Write the translated config (if any) and shape `bridgeOpencodeMcp`'s result. */
+function finishBridge(input: {
+  servers: Record<string, unknown>
+  bridgedServerNames: string[]
+  allEnabledServerNames: string[]
+  hash: string
+  excludeServers?: ReadonlySet<string>
+}): BridgedMcp | null {
+  const { servers, bridgedServerNames, allEnabledServerNames, hash, excludeServers } =
+    input
 
   if (Object.keys(servers).length === 0) {
     const allEnabledServersExcluded =

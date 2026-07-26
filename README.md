@@ -531,6 +531,46 @@ Boolean env vars accept `1/true/on/yes` for on and `0/false/no/off` for
 off; empty / unset falls through to config. Invalid `level` values fall
 through to config.
 
+### Startup diagnostics
+
+Once per process, right after the provider(s) register, the plugin logs a
+single `NOTICE: claude-code plugin ready` line summarizing everything worth
+knowing before you start debugging anything else:
+
+```bash
+OPENCODE_CLAUDE_CODE_LOG_FILE=1 opencode
+grep "plugin ready" ~/.local/share/opencode-claude-code/plugin.log
+```
+
+```json
+{
+  "plugin": "0.10.0",
+  "opencode": "unknown",
+  "cwd": { "resolved": "/Users/you/code/app", "source": "process" },
+  "providers": ["claude-code-default", "claude-code-work"],
+  "accounts": ["default", "work"],
+  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task"],
+  "mcpServers": ["github", "slack"],
+  "interactiveTransport": false,
+  "anthropicApiKeyInEnv": false,
+  "claudeCli": { "path": "claude", "version": "2.1.211 (Claude Code)" }
+}
+```
+
+Reading it:
+
+- **`cwd.source`** is which rule picked the working directory Claude will be
+  spawned in — `configured` (you pinned `options.cwd`), `process` (normal),
+  `captured` (`process.cwd()` was unusable and opencode's project directory
+  rescued it, the macOS GUI-launch case), or `unresolved` (neither worked).
+- **`claudeCli.version`** reading `not detected` means the `claude` binary at
+  that path didn't answer `--version`, which also disables version-gated
+  flags like `--thinking-display`.
+- **`mcpServers`** is the on-disk merge, before opencode's runtime toggles
+  are applied (those aren't settled yet at startup).
+- **`opencode`** reads `unknown` on current opencode: as of 1.17.18 it does
+  not expose its own version to plugins.
+
 ### Default behavior (no config, no env)
 
 Nothing persists; only WARN and ERROR bubble in the TUI. The plugin
