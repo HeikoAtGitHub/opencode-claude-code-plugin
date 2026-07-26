@@ -17,7 +17,7 @@ import {
   DEFAULT_PROXY_TOOLS,
   disallowedToolFlags,
   isExpectedCleanupError,
-  PROXY_CALL_TIMEOUT_MS,
+  resolveProxyClientCeilingMs,
   SERVER_CLOSED_MESSAGE,
 } from "./src/proxy-mcp.js"
 import {
@@ -502,11 +502,14 @@ test("proxy MCP initializes, lists Task, and resolves it through the broker", as
   server.calls.on("call", forwardCall)
   try {
     const generatedConfig = JSON.parse(readFileSync(server.configPath(), "utf8"))
+    // The client-side ceiling written into --mcp-config tracks the largest
+    // effective server-side deadline (task's 60-min default here), so
+    // Claude's remote-HTTP MCP client never aborts before the broker does.
     assert.equal(
       generatedConfig.mcpServers.opencode_proxy.timeout,
-      30 * 60 * 1000,
+      resolveProxyClientCeilingMs(undefined),
     )
-    assert.equal(PROXY_CALL_TIMEOUT_MS, 30 * 60 * 1000)
+    assert.equal(resolveProxyClientCeilingMs(undefined), 60 * 60 * 1000)
 
     const initialized = await postRpc(server.url, {
       jsonrpc: "2.0",
@@ -612,9 +615,11 @@ test("closing the server rejects a pending call with the cleanup message", async
 
   const rejected = await callResponse
   assert.equal(rejected.body.id, "close-1")
-  assert.equal(rejected.body.error.code, -32603)
-  assert.equal(rejected.body.error.message, SERVER_CLOSED_MESSAGE)
-  assert.equal(isExpectedCleanupError(rejected.body.error.message), true)
+  // tools/call failures are MCP results with isError, never JSON-RPC error
+  // envelopes (Claude CLI rejects those as schema-invalid).
+  assert.equal(rejected.body.result.isError, true)
+  assert.equal(rejected.body.result.content[0].text, SERVER_CLOSED_MESSAGE)
+  assert.equal(isExpectedCleanupError(rejected.body.result.content[0].text), true)
 })
 
 test("parallel proxy calls preserve success and error correlation", async () => {
@@ -671,10 +676,15 @@ test("parallel proxy calls preserve success and error correlation", async () => 
     assert.equal(successResponse.body.id, "batch-0")
     assert.equal(successResponse.body.result.content[0].text, "batch complete")
     assert.equal(toolErrorResponse.body.id, "batch-1")
-    assert.equal(toolErrorResponse.body.error.message, "subagent failed")
-    assert.equal(rejectedResponse.body.id, "batch-2")
+    assert.equal(toolErrorResponse.body.result.isError, true)
     assert.equal(
-      rejectedResponse.body.error.message,
+      toolErrorResponse.body.result.content[0].text,
+      "subagent failed",
+    )
+    assert.equal(rejectedResponse.body.id, "batch-2")
+    assert.equal(rejectedResponse.body.result.isError, true)
+    assert.equal(
+      rejectedResponse.body.result.content[0].text,
       "broker call rejecting as orphaned by test",
     )
     assert.equal(getPendingProxyCalls(brokerSession).length, 0)

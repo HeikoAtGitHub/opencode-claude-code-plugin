@@ -345,6 +345,7 @@ export async function createProxyMcpServer(
       return
     }
     let requestId: number | string | null = null
+    let requestMethod: string | null = null
     try {
       const body = await readBody(req)
       const request = JSON.parse(body) as {
@@ -354,6 +355,7 @@ export async function createProxyMcpServer(
         params?: Record<string, unknown>
       }
       requestId = request?.id ?? null
+      requestMethod = typeof request?.method === "string" ? request.method : null
 
       if (request?.jsonrpc !== "2.0" || typeof request.method !== "string") {
         writeJson(res, {
@@ -412,12 +414,16 @@ export async function createProxyMcpServer(
         const input = (params.arguments ?? {}) as Record<string, unknown>
 
         if (!tools.some((t) => t.name === toolName)) {
+          // tools/call failures MUST be MCP results with isError, never
+          // JSON-RPC error envelopes: Claude CLI validates every tools/call
+          // response against the MCP result schema and rejects JSON-RPC
+          // errors as malformed (@jknlsn, seen live 2026-07-04).
           writeJson(res, {
             jsonrpc: "2.0",
             id: requestId,
-            error: {
-              code: -32601,
-              message: `Unknown proxy tool: ${toolName}`,
+            result: {
+              content: [{ type: "text", text: `Unknown proxy tool: ${toolName}` }],
+              isError: true,
             },
           })
           return
@@ -468,12 +474,14 @@ export async function createProxyMcpServer(
         })
 
         if (result.kind === "error") {
+          // MCP result with isError, not a JSON-RPC error — see the unknown-
+          // tool comment above.
           writeJson(res, {
             jsonrpc: "2.0",
             id: requestId,
-            error: {
-              code: -32000,
-              message: result.message,
+            result: {
+              content: [{ type: "text", text: result.message }],
+              isError: true,
             },
           })
           return
@@ -501,6 +509,28 @@ export async function createProxyMcpServer(
       logFn("proxy-mcp error handling request", {
         error: errorMessage,
       })
+      // Broker rejections (timeouts, orphans, server close) surface here for
+      // tools/call requests. Same rule as above: respond with an MCP result
+      // carrying isError, never a JSON-RPC error envelope, or Claude CLI
+      // rejects the response as schema-invalid.
+      if (requestMethod === "tools/call") {
+        try {
+          writeJson(res, {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: {
+              content: [{ type: "text", text: errorMessage }],
+              isError: true,
+            },
+          })
+        } catch {
+          try {
+            res.statusCode = 500
+            res.end()
+          } catch {}
+        }
+        return
+      }
       try {
         writeJson(res, {
           jsonrpc: "2.0",
