@@ -285,10 +285,11 @@ By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. 
 dispatch tool of their own (verified on 2.1.211), while they *do* expose
 `TaskCreate` — a todo tool. So "use a subagent" requests get mis-resolved:
 a todo appears, nothing runs, and the model may still narrate a successful
-dispatch. Two spawn-time countermeasures prevent that. The plugin overlays
-opencode's live `task` description (including the "Available agent types"
-list, so the model doesn't grep config files to check a subagent exists) onto
-the proxy def, and appends a system-prompt note naming
+dispatch. Two spawn-time countermeasures prevent that. The plugin injects
+opencode's live agent-type list into the `task` proxy description (so the model
+picks a real `subagent_type` instead of guessing a Claude Code name like
+`general-purpose`, and doesn't grep configs to check a subagent exists), and
+appends a system-prompt note naming
 `mcp__opencode_proxy__task` as the only dispatch path — with the ToolSearch
 recovery step for harnesses that defer MCP tool schemas. Both apply per Claude
 process at spawn, and provider options are read once at opencode startup, so

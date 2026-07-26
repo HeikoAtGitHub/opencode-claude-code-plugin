@@ -2030,13 +2030,24 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // block; a reused process keeps its original defs.
             const taskProxyEnabled =
               resolvedProxy?.some((t) => t.name === "task") ?? false
-            const enrichedProxy =
-              resolvedProxy && taskProxyEnabled
-                ? overlayTaskProxyDescription(
-                    resolvedProxy,
-                    await self.fetchLiveTaskDescription(),
-                  )
-                : resolvedProxy
+            let enrichedProxy = resolvedProxy
+            if (resolvedProxy && taskProxyEnabled) {
+              const liveTaskDescription = await self.fetchLiveTaskDescription()
+              enrichedProxy = overlayTaskProxyDescription(
+                resolvedProxy,
+                liveTaskDescription,
+              )
+              // Whether the model will see opencode's agent list is the
+              // difference between a dispatch and an "Unknown agent type"
+              // guess, so say so out loud.
+              log.info("task proxy description overlay", {
+                applied: Boolean(liveTaskDescription),
+                liveDescriptionLength: liveTaskDescription?.length ?? 0,
+                listsAgentTypes: Boolean(
+                  liveTaskDescription?.includes("Available agent types"),
+                ),
+              })
+            }
 
             const combinedProxyTools: ProxyToolDef[] | null =
               enrichedProxy || proxyMcpTools

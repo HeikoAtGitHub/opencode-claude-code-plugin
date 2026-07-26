@@ -203,22 +203,68 @@ export const TASK_PROXY_NOTE =
   " get a 60-minute proxy deadline by default (configurable via" +
   " proxyToolTimeoutMs)."
 
+const AGENT_TYPES_HEADING = "Available agent types"
+
+/** Longest per-agent blurb we keep; enough to choose, short enough to survive. */
+const AGENT_BLURB_LIMIT = 140
+
 /**
- * Overlay opencode's live `task` tool description (which includes the
- * "Available agent types" list opencode's registry renders for native
- * models) onto the static proxy def. No-op when the live description is
- * unavailable (SDK client missing, older opencode) or the `task` def is
- * not among the tools.
+ * Pull *only* the agent-type list out of opencode's live `task` description.
+ *
+ * jknlsn's original overlaid the whole live description (2.8 KB here) in front
+ * of the static def. Live check 2026-07-26 showed that backfires: Claude Code
+ * truncates long MCP tool descriptions, and opencode puts the agent list at
+ * the *end* (char 2306 of 2858), so the one part the model needs is exactly
+ * what gets cut — haiku then guessed `general-purpose`, `default`, and
+ * `code-reviewer` (Claude Code's own agent names) and every dispatch failed
+ * with "Unknown agent type". So: keep the list, drop opencode's preamble
+ * (generic delegation advice the model already has), trim each blurb, and let
+ * the caller put it first.
+ *
+ * Returns undefined when the description carries no parsable list, so callers
+ * leave the static def alone.
+ */
+export function extractAgentTypeList(
+  liveDescription: string | undefined,
+): string | undefined {
+  const live = liveDescription?.trim()
+  if (!live) return undefined
+  const start = live.indexOf(AGENT_TYPES_HEADING)
+  if (start === -1) return undefined
+  const entries: string[] = []
+  for (const raw of live.slice(start).split("\n")) {
+    const match = /^-\s*([^:]+):\s*(.+)$/.exec(raw.trim())
+    if (!match) continue
+    const name = match[1].trim()
+    const blurb = match[2].trim()
+    entries.push(
+      `- ${name}: ${
+        blurb.length > AGENT_BLURB_LIMIT
+          ? `${blurb.slice(0, AGENT_BLURB_LIMIT).trimEnd()}…`
+          : blurb
+      }`,
+    )
+  }
+  if (entries.length === 0) return undefined
+  return `Valid subagent_type values, from opencode's live registry — anything else fails:\n${entries.join("\n")}`
+}
+
+/**
+ * Front-load opencode's live agent-type list onto the static `task` proxy def
+ * so the model picks a real `subagent_type` instead of guessing a Claude Code
+ * name. First, not last: see `extractAgentTypeList` for why position matters.
+ * No-op when no list can be extracted (SDK client missing, older opencode) or
+ * the `task` def is not among the tools.
  */
 export function overlayTaskProxyDescription(
   tools: ProxyToolDef[],
   liveDescription: string | undefined,
 ): ProxyToolDef[] {
-  const live = liveDescription?.trim()
-  if (!live) return tools
+  const agentTypes = extractAgentTypeList(liveDescription)
+  if (!agentTypes) return tools
   return tools.map((t) =>
     t.name === "task"
-      ? { ...t, description: `${live}\n\n${TASK_PROXY_NOTE}` }
+      ? { ...t, description: `${agentTypes}\n\n${t.description}` }
       : t,
   )
 }
