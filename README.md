@@ -456,7 +456,9 @@ Set `permissionMode: "plan"` to forward `--permission-mode plan` to Claude. The 
 
 opencode ships a built-in `question` tool (`packages/opencode/src/tool/question.ts`) that renders a real TUI form with options and a custom-answer field — near-identical to Claude Code's `AskUserQuestion` (`multiSelect` → `multiple`). The plugin can route `AskUserQuestion` through it so the prompt becomes an actual form instead of plain text. Two modes:
 
-### With `"Question"` in `proxyTools` (recommended on supported opencode)
+### With `"Question"` in `proxyTools` (currently blocked upstream — leave it off)
+
+> **Known upstream breakage (opencode 1.15.x through at least 1.18.5).** opencode's `question` TUI form does not render, so the tool blocks until you interrupt the turn. This is not specific to this plugin: native providers hit it identically, and a `--pure` headless server drives the same question end to end successfully (`question.asked` → `GET /question` → `POST /question/{id}/reply` → tool completes), which isolates the fault to the TUI. Tracked upstream as [anomalyco/opencode#36604](https://github.com/anomalyco/opencode/issues/36604) with fix [PR #36603](https://github.com/anomalyco/opencode/pull/36603) (unmerged). Until that lands, enabling `"Question"` trades the working fallback below for a hang. The instructions here describe the intended behavior for when it is fixed.
 
 Add `"Question"` to `proxyTools` and grant `permission.question: allow` to the calling agent. Claude's built-in `AskUserQuestion` is disabled via `--disallowedTools`, and the plugin exposes `mcp__opencode_proxy__question` in its place. The model calls the proxy, opencode renders the form, and the operator's answers come back as arrays of selected labels. On builds that lack the `question` registry entry the def is silently dropped at spawn (version gate), and the deny/markdown fallback below applies instead.
 
