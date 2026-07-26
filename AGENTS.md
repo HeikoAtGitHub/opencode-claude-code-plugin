@@ -90,4 +90,4 @@ Current state (refreshed 2026-07-26 after the fork/PR sweep):
 
 Open work is tracked in issues: #20 (remaining jknlsn absorption: question proxy tool + task-steering evaluation — timeouts and respawn-when-silent landed in v0.10.0), #21 (flupkede + CollieIsCute ports), #22 (Sonnet 5 standard-pricing bump, merge just before 2026-09-01).
 
-Recommendation: do #3 (startup diagnostics) next — it would have cut hours off the v0.4.20-v0.4.23 and timeout investigations.
+Recommendation: do #4 (subagent todo docs + `permission.todowrite` example) next — it's the last self-contained item; everything else is either waiting on a contributor (#15, remainder of #20), on the calendar (#22), or on a bug report (#5 / issue #4).
