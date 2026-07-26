@@ -304,6 +304,48 @@ Without `"Task"` in `proxyTools`, Claude's built-in `Agent` tool stays enabled a
 "options": { "proxyTools": [] }
 ```
 
+### Subagent todos
+
+When Claude works through a multi-step task it emits `TaskCreate` / `TaskUpdate` calls. The plugin translates those into opencode's full-list `todowrite` so the todo panel populates. Inside a **subagent** that translation is blocked unless you say otherwise: opencode's task tool injects `todowrite: false` into the tools dict for any subagent without an explicit rule, so the plugin's synthetic emissions surface as `⚙ invalid todowrite` rows instead of todos. The built-in `general` subagent denies it by default.
+
+Grant it per subagent definition in `opencode.json`:
+
+```json
+{
+  "agent": {
+    "multistep": {
+      "description": "Multi-step worker whose progress should be visible as todos",
+      "mode": "subagent",
+      "model": "claude-code-default/claude-opus-5",
+      "permission": {
+        "todowrite": "allow",
+        "todoread": "allow",
+        "task": "deny"
+      }
+    }
+  }
+}
+```
+
+Notes on that example:
+
+- `todowrite: "allow"` is the load-bearing line. Without it you get `⚙ invalid` rows, not a broken run.
+- `todoread` is worth allowing too so the subagent can re-read its own list across turns.
+- `task: "deny"` is explicit rather than implied. Leave it denied unless this subagent should itself delegate, in which case set `"allow"` and raise the top-level `subagent_depth` (opencode defaults it to `1`, so a child cannot spawn a grandchild).
+- Provider and agent config are read at startup, so restart opencode fully after editing.
+
+The todos render in the **subagent's own session view**, not the parent's panel. Navigate to it in the TUI with `session.child.next` (and back with `session.parent`); run `opencode --print-logs` or check the keybindings if those actions are unbound in your setup.
+
+To confirm the data actually landed rather than trusting the UI:
+
+```bash
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "select id, parent_id from session order by rowid desc limit 5;"
+# then, with the child session id:
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "select tool, state from part where session_id='<child-id>' and tool='todowrite';"
+```
+
 ### What you get with proxying on
 
 - opencode's **permission prompts** for every Bash/Edit/Write/WebFetch call (the default `claude --dangerously-skip-permissions` is NOT applied to proxied tools).
@@ -418,13 +460,17 @@ opencode ships a built-in `question` tool (`packages/opencode/src/tool/question.
 
 Add `"Question"` to `proxyTools` and grant `permission.question: allow` to the calling agent. Claude's built-in `AskUserQuestion` is disabled via `--disallowedTools`, and the plugin exposes `mcp__opencode_proxy__question` in its place. The model calls the proxy, opencode renders the form, and the operator's answers come back as arrays of selected labels. On builds that lack the `question` registry entry the def is silently dropped at spawn (version gate), and the deny/markdown fallback below applies instead.
 
+`proxyTools` replaces the default list rather than adding to it, so repeat the defaults you still want:
+
 ```json
 "options": {
-  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Question"]
+  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task", "Question"]
 }
 ```
 
-The same spawn-time caveats as `"Task"` apply: provider options are read once at opencode startup, so restart opencode fully after adding it. The proxy timeout is a hard 10 minutes — an operator AFK longer than that gets the call rejected mid-answer (per-tool timeouts are roadmap work).
+To turn it back off, drop `"Question"` from the list. It is **not** in the default list, so no configuration means the deny/markdown fallback below stays in force.
+
+The same spawn-time caveat as `"Task"` applies: provider options are read once at opencode startup, so restart opencode fully after adding it. Question calls get a 30-minute proxy deadline (raise it with `proxyToolTimeoutMs` if you expect to be AFK longer; an expired call comes back as an error, not an answer).
 
 ### Without the proxy (default fallback)
 
@@ -633,8 +679,8 @@ Workaround for autonomous compression: trigger it manually with `/dcp compress` 
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
 - Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
 - Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
-- **Foreground Task calls have a 30-minute proxy timeout.** The same timeout is written into Claude's generated HTTP MCP configuration so long-running opencode subagents are not cut off by Claude's 60-second default. For independent longer work, use `background: true` after enabling opencode's experimental background-subagent flag.
-- **Subagent todos require explicit permission.** opencode's task tool gates `todowrite` per subagent: without a `permission: { todowrite: "allow" }` rule on the subagent definition, opencode injects `todowrite: false` into the tools dict and the plugin's synthetic `todowrite` emissions surface as `⚙ invalid todowrite` rows. The built-in `general` subagent denies `todowrite` by default; use a custom subagent for parallel work that needs todo visibility. Subagent todos render inline in the **subagent's** session view (navigate with the TUI's `session.child.next` / `session.parent` commands), not in the parent session's panel.
+- **Foreground Task calls have a 60-minute proxy deadline** (configurable via [`proxyToolTimeoutMs`](#per-tool-proxy-timeouts)). A ceiling covering the longest configured deadline is written into Claude's generated HTTP MCP configuration so long-running opencode subagents are not cut off by Claude's 60-second default. For independent longer work, use `background: true` after enabling opencode's experimental background-subagent flag.
+- **Subagent todos require explicit permission.** See [Subagent todos](#subagent-todos) for the rule and a working config.
 
 ---
 
