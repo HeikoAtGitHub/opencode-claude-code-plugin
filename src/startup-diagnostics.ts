@@ -1,5 +1,7 @@
+import { execFile } from "node:child_process"
 import * as fs from "node:fs"
 import * as path from "node:path"
+import { promisify } from "node:util"
 import { fileURLToPath } from "node:url"
 
 import { detectCliVersion } from "./cli-version.js"
@@ -53,12 +55,13 @@ export function pluginVersion(): string {
 }
 
 /**
- * Best-effort opencode version from the plugin input. As of opencode 1.17.18
- * nothing reachable from a plugin carries it: `PluginInput` has no version
- * field and the SDK client's `app` namespace exposes only `log`/`agents`. So
- * this probes a couple of plausible shapes for future opencode releases and
- * otherwise reports "unknown" rather than guessing. Do not replace it with a
- * `client.app.get()` call — that method does not exist.
+ * Best-effort opencode version from the plugin input. Re-verified on opencode
+ * 1.18.5: nothing on the plugin surface carries it. `PluginInput` has no
+ * version field, the SDK client's `app` namespace exposes only `log`/`agents`,
+ * and the server has no `/version` route. So this probes a couple of plausible
+ * shapes for future opencode releases and otherwise returns undefined, leaving
+ * the binary probe (`detectOpencodeVersion`) as the fallback. Do not replace it
+ * with a `client.app.get()` call — that method does not exist.
  */
 export function pickOpencodeVersion(input: unknown): string | undefined {
   if (!input || typeof input !== "object") return undefined
@@ -70,6 +73,48 @@ export function pickOpencodeVersion(input: unknown): string | undefined {
   const direct = (input as { version?: unknown }).version
   if (typeof direct === "string" && direct.length > 0) return direct
   return undefined
+}
+
+const execFileAsync = promisify(execFile)
+
+let opencodeVersionProbe: Promise<string | undefined> | undefined
+
+/**
+ * The plugin runs *inside* opencode's process, so `process.execPath` is the
+ * opencode binary itself — asking it for `--version` is the only reliable way
+ * to name the version, since the plugin API exposes it nowhere (see
+ * `pickOpencodeVersion`). Guarded on the basename: when opencode is run from
+ * source (`bun run packages/opencode/src/index.ts`) execPath is the Bun binary,
+ * and reporting Bun's version as opencode's would be worse than "unknown".
+ * Cached, 5s timeout, never throws.
+ */
+export function detectOpencodeVersion(
+  execPath: string = process.execPath,
+): Promise<string | undefined> {
+  if (opencodeVersionProbe) return opencodeVersionProbe
+  opencodeVersionProbe = (async (): Promise<string | undefined> => {
+    if (!path.basename(execPath).toLowerCase().includes("opencode")) {
+      log.debug("skipping opencode version probe: execPath is not opencode", { execPath })
+      return undefined
+    }
+    try {
+      const { stdout } = await execFileAsync(execPath, ["--version"], { timeout: 5000 })
+      const match = /\d+\.\d+\.\d+\S*/.exec(stdout.trim())
+      return match ? match[0] : undefined
+    } catch (err) {
+      log.debug("opencode version probe failed", {
+        execPath,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return undefined
+    }
+  })()
+  return opencodeVersionProbe
+}
+
+/** Test seam: drop the cached probe so a fresh execPath is honored. */
+export function resetOpencodeVersionProbe(): void {
+  opencodeVersionProbe = undefined
 }
 
 /**
@@ -165,10 +210,11 @@ export function logStartupDiagnostics(
   logged = true
   void (async () => {
     try {
-      const { claudeCliPath, ...rest } = collectStartupDiagnostics(
-        providers,
-        opencodeVersion,
-      )
+      // Probe the binary only when the plugin input and env gave us nothing,
+      // so a future opencode that reports its version costs no spawn.
+      const version =
+        opencodeVersion ?? process.env.OPENCODE_VERSION ?? (await detectOpencodeVersion())
+      const { claudeCliPath, ...rest } = collectStartupDiagnostics(providers, version)
       const cli = await detectCliVersion(claudeCliPath)
       const diagnostics: StartupDiagnostics = {
         ...rest,

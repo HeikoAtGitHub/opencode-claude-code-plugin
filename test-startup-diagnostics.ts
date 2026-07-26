@@ -1,12 +1,17 @@
 import assert from "node:assert/strict"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 import { test } from "node:test"
 import { claudeCodeProviders } from "./src/index.js"
 import { resolveSpawnCwdFrom } from "./src/runtime-status.js"
 import {
   collectStartupDiagnostics,
   describeSpawnCwd,
+  detectOpencodeVersion,
   pickOpencodeVersion,
   pluginVersion,
+  resetOpencodeVersionProbe,
 } from "./src/startup-diagnostics.js"
 
 test("pluginVersion reads the real package manifest", () => {
@@ -140,5 +145,41 @@ test("collectStartupDiagnostics reports interactive transport from env", () => {
   } finally {
     if (previous === undefined) delete process.env.CLAUDE_CODE_INTERACTIVE_TRANSPORT
     else process.env.CLAUDE_CODE_INTERACTIVE_TRANSPORT = previous
+  }
+})
+
+test("detectOpencodeVersion reads the version from the opencode binary", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-version-probe-"))
+  const fake = path.join(dir, "opencode")
+  fs.writeFileSync(fake, '#!/bin/sh\necho "1.18.5"\n')
+  fs.chmodSync(fake, 0o755)
+  try {
+    resetOpencodeVersionProbe()
+    assert.equal(await detectOpencodeVersion(fake), "1.18.5")
+    // Cached: a second call with a different path reuses the first probe.
+    assert.equal(await detectOpencodeVersion("/nonexistent/opencode"), "1.18.5")
+  } finally {
+    resetOpencodeVersionProbe()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("detectOpencodeVersion refuses to report a non-opencode execPath", async () => {
+  try {
+    // Running from source means execPath is Bun; reporting Bun's version as
+    // opencode's would be actively misleading, so the probe declines.
+    resetOpencodeVersionProbe()
+    assert.equal(await detectOpencodeVersion("/opt/homebrew/bin/bun"), undefined)
+  } finally {
+    resetOpencodeVersionProbe()
+  }
+})
+
+test("detectOpencodeVersion returns undefined when the binary fails", async () => {
+  try {
+    resetOpencodeVersionProbe()
+    assert.equal(await detectOpencodeVersion("/nonexistent/dir/opencode"), undefined)
+  } finally {
+    resetOpencodeVersionProbe()
   }
 })

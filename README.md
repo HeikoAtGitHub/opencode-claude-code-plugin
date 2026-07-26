@@ -544,8 +544,8 @@ grep "plugin ready" ~/.local/share/opencode-claude-code/plugin.log
 
 ```json
 {
-  "plugin": "0.10.0",
-  "opencode": "unknown",
+  "plugin": "0.11.1",
+  "opencode": "1.18.5",
   "cwd": { "resolved": "/Users/you/code/app", "source": "process" },
   "providers": ["claude-code-default", "claude-code-work"],
   "accounts": ["default", "work"],
@@ -568,8 +568,9 @@ Reading it:
   flags like `--thinking-display`.
 - **`mcpServers`** is the on-disk merge, before opencode's runtime toggles
   are applied (those aren't settled yet at startup).
-- **`opencode`** reads `unknown` on current opencode: as of 1.17.18 it does
-  not expose its own version to plugins.
+- **`opencode`** is read from the running opencode binary (`--version`), since
+  opencode still does not hand its version to plugins. It reads `unknown` when
+  opencode is run from source rather than as the packaged binary.
 
 ### Default behavior (no config, no env)
 
