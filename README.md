@@ -70,17 +70,17 @@ The plugin auto-registers the following. They appear in the model picker without
 
 | ID | Display name | Context | Output | Reasoning variants | Price × |
 |---|---|---|---|---|---|
-| `claude-haiku-4-5` | Claude Haiku 4.5 | 200k | 8,192 | – | 1× |
-| `claude-sonnet-4-5` | Claude Sonnet 4.5 | 1M | 16,384 | low/medium/high/xhigh/max | 3× |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 1M | 16,384 | low/medium/high/xhigh/max | 3× |
+| `claude-haiku-4-5` | Claude Haiku 4.5 | 200k | 64,000 | – | 1× |
+| `claude-sonnet-4-5` | Claude Sonnet 4.5 | 200k | 64,000 | low/medium/high/xhigh/max | 3× |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 1M | 128,000 | low/medium/high/xhigh/max | 3× |
 | `claude-sonnet-5` | Claude Sonnet 5 | 1M | 128,000 | low/medium/high/xhigh/max | 2×* |
-| `claude-opus-4-5` | Claude Opus 4.5 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-6` | Claude Opus 4.6 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-7` | Claude Opus 4.7 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-8` | Claude Opus 4.8 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-5` | Claude Opus 4.5 | 200k | 64,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-6` | Claude Opus 4.6 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-7` | Claude Opus 4.7 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-8` | Claude Opus 4.8 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
 | `claude-opus-5` | Claude Opus 5 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
-| `claude-fable-5` | Claude Fable 5 | 1M | 16,384 | low/medium/high/xhigh/max | 10× |
-| `claude-mythos-5` | Claude Mythos 5 | 1M | 16,384 | low/medium/high/xhigh/max | 10× |
+| `claude-fable-5` | Claude Fable 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
+| `claude-mythos-5` | Claude Mythos 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 
 `claude-mythos-5` is Mythos-class like Fable 5 but without safety classifiers, and is **limited availability via [Project Glasswing](https://anthropic.com/glasswing)**. It's registered unconditionally; if your Claude account lacks access, `claude --model claude-mythos-5` just errors. Use `claude-fable-5` (generally available) otherwise.
 

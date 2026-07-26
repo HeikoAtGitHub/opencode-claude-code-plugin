@@ -60,7 +60,16 @@ function defineModel(opts: {
   }
 }
 
-// Per-token costs derived from Anthropic per-million-token pricing
+// Per-token costs derived from Anthropic per-million-token pricing.
+//
+// There is no long-context premium to model. Anthropic's pricing page states
+// that Claude 4.6 and later ship the full 1M-token context window at standard
+// pricing ("a 900k-token request is billed at the same per-token rate as a
+// 9k-token request"), and caching/batch discounts apply unchanged across it.
+// opencode 1.18.5 added optional `cost.tiers` / `cost.experimentalOver200K`
+// fields for above-200K pricing; they stay unset here deliberately, because a
+// tier would misreport the real price. Re-check only if Anthropic introduces
+// one. Verified against the pricing docs 2026-07-26.
 const haikuCost = { input: 1e-6, output: 5e-6, cacheRead: 1e-7, cacheWrite: 1.25e-6 }
 const sonnetCost = { input: 3e-6, output: 15e-6, cacheRead: 3e-7, cacheWrite: 3.75e-6 }
 // Introductory pricing through August 31, 2026. Standard pricing from September
@@ -123,21 +132,21 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "haiku",
     reasoning: false,
     context: 200_000,
-    output: 8_192,
+    output: 64_000,
     cost: haikuCost,
     multiplier: 1,
-    releaseDate: "2024-10-22",
+    releaseDate: "2025-10-01",
   }),
   "claude-sonnet-4-5": defineModel({
     id: "claude-sonnet-4-5",
     name: "Claude Sonnet 4.5",
     family: "sonnet",
     reasoning: true,
-    context: 1_000_000,
-    output: 16_384,
+    context: 200_000,
+    output: 64_000,
     cost: sonnetCost,
     multiplier: 3,
-    releaseDate: "2025-04-14",
+    releaseDate: "2025-09-29",
   }),
   "claude-sonnet-4-6": defineModel({
     id: "claude-sonnet-4-6",
@@ -145,7 +154,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "sonnet",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: sonnetCost,
     multiplier: 3,
     releaseDate: "2025-06-19",
@@ -166,11 +175,11 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     name: "Claude Opus 4.5",
     family: "opus",
     reasoning: true,
-    context: 1_000_000,
-    output: 16_384,
+    context: 200_000,
+    output: 64_000,
     cost: opusCost,
     multiplier: 5,
-    releaseDate: "2025-04-14",
+    releaseDate: "2025-11-01",
   }),
   "claude-opus-4-6": defineModel({
     id: "claude-opus-4-6",
@@ -178,7 +187,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "opus",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: opusCost,
     multiplier: 5,
     releaseDate: "2025-06-19",
@@ -189,7 +198,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "opus",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: opusCost,
     multiplier: 5,
     releaseDate: "2025-07-16",
@@ -200,7 +209,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "opus",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: opusCost,
     multiplier: 5,
     releaseDate: "2026-05-28",
@@ -222,7 +231,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "fable",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: fableCost,
     multiplier: 10,
     releaseDate: "2026-06-09",
@@ -237,7 +246,7 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     family: "mythos",
     reasoning: true,
     context: 1_000_000,
-    output: 16_384,
+    output: 128_000,
     cost: fableCost,
     multiplier: 10,
     releaseDate: "2026-06-09",

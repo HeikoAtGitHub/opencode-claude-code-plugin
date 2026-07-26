@@ -111,6 +111,34 @@ test("configModelsForProvider registers Sonnet 5 and Opus 5 metadata", () => {
   assert.ok("max" in (opus.variants as Record<string, unknown>))
 })
 
+// Context and max-output values are published per model and had drifted: the
+// 4.5-generation entries claimed a 1M context they never had, and every
+// pre-Sonnet-5 entry carried a placeholder 16,384 output cap. Pin the real
+// numbers so a future edit can't quietly reintroduce either.
+test("configModelsForProvider reports the published context and output limits", () => {
+  const models = configModelsForProvider({}, "claude-code")
+  const limitOf = (id: string) => (models[id] as Record<string, unknown>).limit
+
+  // 4.5 generation: 200k context, 64k output. Not 1M.
+  assert.deepEqual(limitOf("claude-haiku-4-5"), { context: 200_000, output: 64_000 })
+  assert.deepEqual(limitOf("claude-sonnet-4-5"), { context: 200_000, output: 64_000 })
+  assert.deepEqual(limitOf("claude-opus-4-5"), { context: 200_000, output: 64_000 })
+
+  // 4.6 and later: full 1M context, 128k output.
+  for (const id of [
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+  ]) {
+    assert.deepEqual(limitOf(id), { context: 1_000_000, output: 128_000 }, id)
+  }
+})
+
 test("configModelsForProvider preserves user-defined variants for default models", () => {
   const userConfig = {
     "claude-opus-4-8": { variants: { custom: { reasoningEffort: "low" } } },
