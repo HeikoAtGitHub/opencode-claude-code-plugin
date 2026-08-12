@@ -70,21 +70,23 @@ The plugin auto-registers the following. They appear in the model picker without
 
 | ID | Display name | Context | Output | Reasoning variants | Price × |
 |---|---|---|---|---|---|
-| `claude-haiku-4-5` | Claude Haiku 4.5 | 200k | 8,192 | – | 1× |
-| `claude-sonnet-4-5` | Claude Sonnet 4.5 | 1M | 16,384 | low/medium/high/xhigh/max | 3× |
-| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 1M | 16,384 | low/medium/high/xhigh/max | 3× |
-| `claude-opus-4-5` | Claude Opus 4.5 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-6` | Claude Opus 4.6 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-7` | Claude Opus 4.7 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-opus-4-8` | Claude Opus 4.8 | 1M | 16,384 | low/medium/high/xhigh/max | 5× |
-| `claude-fable-5` | Claude Fable 5 | 1M | 16,384 | low/medium/high/xhigh/max | 10× |
-| `claude-mythos-5` | Claude Mythos 5 | 1M | 16,384 | low/medium/high/xhigh/max | 10× |
+| `claude-haiku-4-5` | Claude Haiku 4.5 | 200k | 64,000 | – | 1× |
+| `claude-sonnet-4-5` | Claude Sonnet 4.5 | 200k | 64,000 | low/medium/high/xhigh/max | 3× |
+| `claude-sonnet-4-6` | Claude Sonnet 4.6 | 1M | 128,000 | low/medium/high/xhigh/max | 3× |
+| `claude-sonnet-5` | Claude Sonnet 5 | 1M | 128,000 | low/medium/high/xhigh/max | 2×* |
+| `claude-opus-4-5` | Claude Opus 4.5 | 200k | 64,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-6` | Claude Opus 4.6 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-7` | Claude Opus 4.7 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-8` | Claude Opus 4.8 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-5` | Claude Opus 5 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-fable-5` | Claude Fable 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
+| `claude-mythos-5` | Claude Mythos 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 
 `claude-mythos-5` is Mythos-class like Fable 5 but without safety classifiers, and is **limited availability via [Project Glasswing](https://anthropic.com/glasswing)**. It's registered unconditionally; if your Claude account lacks access, `claude --model claude-mythos-5` just errors. Use `claude-fable-5` (generally available) otherwise.
 
 Capabilities for every model: text + image input, text output, tool use, attachments. No temperature control, no PDF/audio/video, no interleaved streaming.
 
-**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing — input and output ratios both come out the same (Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus 4.8 $5/$25 = 5×, Fable 5 / Mythos 5 $10/$50 = 10×), so **Fable 5 and Mythos 5 cost 2× Opus 4.8**. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
+**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing — input and output ratios both come out the same (Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus $5/$25 = 5×, Fable 5 / Mythos 5 $10/$50 = 10×), so **Fable 5 and Mythos 5 cost 2× Opus 5**. Sonnet 5's `2×` uses its introductory $2/$10 pricing through August 31, 2026; standard $3/$15 pricing begins September 1. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
 
 The model ID is passed straight through to `claude --model`, so anything Claude Code accepts works.
 
@@ -94,36 +96,10 @@ Variants set the underlying reasoning effort. They're regular opencode model var
 
 ---
 
-## Billing change: June 15, 2026 (Agent SDK credit)
+## Billing
 
-This plugin drives Claude Code headlessly (`claude --print`), which Anthropic bills as [`claude -p` / Agent SDK usage](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan). Starting **June 15, 2026**, on subscription plans that usage no longer counts toward your normal plan limits — it draws from a separate monthly **Agent SDK credit**:
-
-| Plan | Monthly credit |
-|---|---|
-| Pro | $20 |
-| Max 5x | $100 |
-| Max 20x | $200 |
-| Team (Standard seats) | $20 |
-| Team (Premium seats) | $100 |
-| Enterprise (usage-based) | $20 |
-| Enterprise (seat-based Premium seats) | $200 |
-
-Credits are **per user, not pooled** across a team, and Standard seats on seat-based Enterprise plans aren't eligible. See Anthropic's [Agent SDK credit article](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan) for the authoritative table.
-
-What this means for plugin users:
-
-- **Claim the credit once.** It's a one-time opt-in via your Claude account; eligible users get an email with claim instructions before June 15, 2026. After that it refreshes every billing cycle, and unused credit does not roll over.
-- **Agent SDK usage drains the credit first**, before any other source.
-- **When the credit runs out, plugin requests stop** until the next billing cycle — unless you enable usage credits in your Claude account, in which case overflow is billed at standard API rates.
-- **The credit is denominated in dollars at standard API rates**, so the Price × column above maps directly to how fast each model drains it — Fable 5 / Mythos 5 burn it 10× faster than Haiku, 2× faster than Opus 4.8.
-- **API-key auth is unaffected.** If your `claude` CLI authenticates with an Anthropic API key / Console billing instead of a subscription, nothing changes — pay-as-you-go as before.
-- **Watch for a stray `ANTHROPIC_API_KEY`.** If that variable (or `ANTHROPIC_AUTH_TOKEN`) is present in your environment, Claude Code uses it and bills pay-as-you-go — silently bypassing the subscription credit even when `claude` is logged into a plan. The plugin logs a one-time warning when it detects a key. To force subscription auth, set `ignoreAnthropicApiKey: true`, which strips the key from the `claude` spawn environment.
-- **Interactive Claude Code in your terminal is unaffected.** The change targets programmatic usage only: the Agent SDK, `claude -p`, Claude Code GitHub Actions, and third-party apps like this plugin.
-
-Two related dates:
-
-- **June 15, 2026** also retires the original Claude 4 model IDs `claude-sonnet-4-20250514` and `claude-opus-4-20250514` from the API. The plugin doesn't register either, but model IDs pass straight through to `claude --model` — if you've configured one of these as an override, migrate to `claude-sonnet-4-6` / `claude-opus-4-8` before then.
-- **June 22, 2026** is the last day [Fable 5 is included at no extra cost](https://platform.claude.com/docs/en/about-claude/models/introducing-claude-fable-5-and-claude-mythos-5) on Pro, Max, Team, and seat-based Enterprise plans. From June 23, `claude-fable-5` requires usage credits (Anthropic says it aims to fold it back into plans once capacity allows). `claude-mythos-5` is unaffected — it's Glasswing access-gated either way.
+This plugin drives Claude Code headlessly (Agent SDK > `claude --print`)
+check out this page for updated information about billing: https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan
 
 ---
 
@@ -187,8 +163,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
     "claude-code": {
       "options": {
         "cliPath": "claude",
-        "proxyTools": ["Bash", "Edit", "Write", "WebFetch"],
-        "proxyToolTimeoutMs": { "submit_plan": 86400000 },
+        "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task"],
         "skipPermissions": true,
         "permissionMode": "default",
         "bridgeOpencodeMcp": true,
@@ -206,8 +181,8 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `cwd` | string | `process.cwd()` | Working directory for the spawned CLI. Resolved **lazily per request**, so opencode's project switching works. |
 | `skipPermissions` | boolean | `true` | Pass `--dangerously-skip-permissions` to `claude`. Ignored when `proxyTools` is set — the proxy handles permissions through opencode instead. |
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
-| `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
-| `proxyToolTimeoutMs` | number \| `Record<string, number>` | normal tools: `600000`, `task`: `1800000`, `submit_plan`: `86400000` | How long a proxy MCP call may wait for opencode to return the tool result. Env overrides: `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS` globally or `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_<TOOL>_MS` per tool, e.g. `OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS`. |
+| `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
+| `proxyToolTimeoutMs` | `Record<string, number>` | – | Per-tool proxy call deadline in ms, keyed by proxy tool name. Defaults: 10 min flat, `task` → 60 min, `question` → 30 min, `submit_plan` → 24h. For `bash`, `input.timeout` raises the deadline (`max(resolved, input.timeout)`). See [Selective tool proxy](#selective-tool-proxy). |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
@@ -285,7 +260,7 @@ Set `interactiveSystemPrompt: false` only for diagnostics. While disabled, the i
 
 This is the core feature.
 
-By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it executes them itself — bypassing opencode's permission UI, audit trail, and policy rules entirely. With `proxyTools`, you tell the plugin to disable Claude's built-in version of a tool and expose an equivalent through an in-process MCP server. Claude calls the MCP version, which blocks until opencode runs the tool through its own executor.
+By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. It disables Claude's corresponding built-in tool and exposes an equivalent through an in-process MCP server. Claude calls the MCP version, which blocks until opencode runs the tool through its own executor and permission system.
 
 ### Default proxied tools
 
@@ -297,17 +272,81 @@ By default, when Claude Code's CLI uses `Bash`, `Edit`, `Write`, etc., it execut
 | `"WebFetch"` | `WebFetch` | `mcp__opencode_proxy__webfetch` |
 | `"Task"` | `Agent` | `mcp__opencode_proxy__task` |
 | `"submit_plan"` | – | `mcp__opencode_proxy__submit_plan` |
+| `"Question"` | `AskUserQuestion` | `mcp__opencode_proxy__question` |
 
-The `Task` proxy is the way to let Claude orchestrate opencode's configured subagents (`build`, `general`, custom subagents defined in `opencode.json`) instead of Claude CLI's internal-only general-purpose / Explore / Plan options. With `"Task"` in `proxyTools` and `permission.task: allow` granted to the calling agent, a Claude session can invoke `task(subagent_type="build", prompt="...")` and the subagent runs natively under opencode (with its own permission UI, lifecycle, model assignment, and Tab visibility). Without `"Task"`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode visibility.
+### OpenCode-native subagents
 
-Only those values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI.
+`Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits an unexecuted `task` call; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming the child session, selecting the configured subagent, and foreground/background lifecycle.
 
-`submit_plan` is a Plannotator/opencode-specific proxy tool rather than a Claude built-in. It is useful when a Claude Code headless session is embedded inside opencode and must call opencode's `submit_plan` instead of Claude Code's native `ExitPlanMode` hook. Because browser approval can legitimately take much longer than a shell command, its default proxy wait timeout is 24 hours. While `submit_plan` is pending, later proxied calls in the same Claude session are rejected with a clear error instead of being left as orphaned pending calls.
+Only listed values are proxied; unknown `proxyTools` values are ignored. `submit_plan` is an OpenCode-specific proxy tool for Plannotator review. It waits up to 24 hours and sends SSE keepalives while browser approval is pending.
 
-To turn off proxying entirely:
+- **Permissions:** the calling agent's `permission.task` rule applies to the target `subagent_type`. Grant `task: "allow"` on agents that should delegate without a prompt; an `ask` or `deny` rule remains authoritative. The plugin never bypasses this decision.
+- **Resume:** pass the child session ID back as `task_id` to continue that subagent session. Omit it to create a fresh child.
+- **Nested tasks:** current opencode defaults `subagent_depth` to `1`, so a first-level child cannot launch another child. Increase top-level `subagent_depth` to permit deeper nesting, and explicitly grant `permission.task` on every subagent that should delegate; opencode otherwise adds a task deny to spawned subagent sessions.
+- **Background:** `background: true` returns after starting the child and lets opencode notify the parent when it finishes. Current opencode requires `OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true` in the environment of the opencode process. Foreground is the default.
+
+**Steering models to it.** Headless Claude Code CLIs expose no `Agent`/`Task`
+dispatch tool of their own (verified on 2.1.211), while they *do* expose
+`TaskCreate` — a todo tool. So "use a subagent" requests get mis-resolved:
+a todo appears, nothing runs, and the model may still narrate a successful
+dispatch. Two spawn-time countermeasures prevent that. The plugin injects
+opencode's live agent-type list into the `task` proxy description (so the model
+picks a real `subagent_type` instead of guessing a Claude Code name like
+`general-purpose`, and doesn't grep configs to check a subagent exists), and
+appends a system-prompt note naming
+`mcp__opencode_proxy__task` as the only dispatch path — with the ToolSearch
+recovery step for harnesses that defer MCP tool schemas. Both apply per Claude
+process at spawn, and provider options are read once at opencode startup, so
+`proxyTools` changes need a full opencode restart.
+
+Only those six values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI. The `"Question"` proxy is version-gated on opencode's built-in `question` tool: on builds that lack the registry entry the def is silently dropped (a forwarded call would otherwise render as `⚙ invalid`), so add it only on opencode versions that ship the `question` tool.
+
+Without `"Task"` in `proxyTools`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode child-session visibility. To opt out of all proxying, including Task, use an explicit empty list:
 
 ```json
 "options": { "proxyTools": [] }
+```
+
+### Subagent todos
+
+When Claude works through a multi-step task it emits `TaskCreate` / `TaskUpdate` calls. The plugin translates those into opencode's full-list `todowrite` so the todo panel populates. Inside a **subagent** that translation is blocked unless you say otherwise: opencode's task tool injects `todowrite: false` into the tools dict for any subagent without an explicit rule, so the plugin's synthetic emissions surface as `⚙ invalid todowrite` rows instead of todos. The built-in `general` subagent denies it by default.
+
+Grant it per subagent definition in `opencode.json`:
+
+```json
+{
+  "agent": {
+    "multistep": {
+      "description": "Multi-step worker whose progress should be visible as todos",
+      "mode": "subagent",
+      "model": "claude-code-default/claude-opus-5",
+      "permission": {
+        "todowrite": "allow",
+        "todoread": "allow",
+        "task": "deny"
+      }
+    }
+  }
+}
+```
+
+Notes on that example:
+
+- `todowrite: "allow"` is the load-bearing line. Without it you get `⚙ invalid` rows, not a broken run.
+- `todoread` is worth allowing too so the subagent can re-read its own list across turns.
+- `task: "deny"` is explicit rather than implied. Leave it denied unless this subagent should itself delegate, in which case set `"allow"` and raise the top-level `subagent_depth` (opencode defaults it to `1`, so a child cannot spawn a grandchild).
+- Provider and agent config are read at startup, so restart opencode fully after editing.
+
+The todos render in the **subagent's own session view**, not the parent's panel. Navigate to it in the TUI with `session.child.next` (and back with `session.parent`); run `opencode --print-logs` or check the keybindings if those actions are unbound in your setup.
+
+To confirm the data actually landed rather than trusting the UI:
+
+```bash
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "select id, parent_id from session order by rowid desc limit 5;"
+# then, with the child session id:
+sqlite3 ~/.local/share/opencode/opencode.db \
+  "select tool, state from part where session_id='<child-id>' and tool='todowrite';"
 ```
 
 ### What you get with proxying on
@@ -320,6 +359,24 @@ To turn off proxying entirely:
 
 - A small per-call latency hop through `127.0.0.1:<random>/mcp`.
 - Batched-edit ergonomics: with `Edit` proxied, Claude can no longer use `MultiEdit`, so a refactor that would have been one tool call becomes N single `Edit` calls.
+
+### Per-tool proxy timeouts
+
+Every proxied tool call has a deadline: if opencode hasn't resolved it (run the underlying tool and returned a result) within that many milliseconds, the call is rejected and Claude receives a timeout error. Deadlines are resolved per tool, most-specific layer winning:
+
+1. flat default — 10 min (matches Claude CLI's own Bash ceiling)
+2. per-tool default — **`task`: 60 min**, **`question`: 30 min**, everything else: 10 min
+3. your `proxyToolTimeoutMs` override (case-insensitive key)
+4. for `bash` only, the call's own `input.timeout` — the proxy never undercuts a build the caller explicitly asked to run long (`max(resolved, input.timeout)`)
+
+The `task` and `question` defaults are deliberately generous. Subagents routinely run 20–40 min, and a question can sit on a slow operator; under the old flat 10-minute ceiling the proxy fired mid-call, Claude believed its dispatch had failed, and the subagent's eventual result was dropped (the parent turn had already ended on the timeout error). If a `task` call *does* time out, the error tells Claude not to "schedule a wake-up" — that is a Claude Code affordance which cannot fire in this headless/proxy context, so deferring silently loses the work.
+
+```json
+"options": {
+  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task"],
+  "proxyToolTimeoutMs": { "Task": 5400000, "bash": 1800000 }
+}
+```
 
 ---
 
@@ -400,7 +457,29 @@ Set `permissionMode: "plan"` to forward `--permission-mode plan` to Claude. The 
 
 ## AskUserQuestion
 
-opencode has no native structured ask-question executor to proxy through (unlike `Bash`/`Task`), so the plugin handles `AskUserQuestion` specially:
+opencode ships a built-in `question` tool (`packages/opencode/src/tool/question.ts`) that renders a real TUI form with options and a custom-answer field — near-identical to Claude Code's `AskUserQuestion` (`multiSelect` → `multiple`). The plugin can route `AskUserQuestion` through it so the prompt becomes an actual form instead of plain text. Two modes:
+
+### With `"Question"` in `proxyTools` (currently blocked upstream — leave it off)
+
+> **Known upstream breakage (opencode 1.15.x through at least 1.18.5).** opencode's `question` TUI form does not render, so the tool blocks until you interrupt the turn. This is not specific to this plugin: native providers hit it identically, and a `--pure` headless server drives the same question end to end successfully (`question.asked` → `GET /question` → `POST /question/{id}/reply` → tool completes), which isolates the fault to the TUI. Tracked upstream as [anomalyco/opencode#36604](https://github.com/anomalyco/opencode/issues/36604) with fix [PR #36603](https://github.com/anomalyco/opencode/pull/36603) (unmerged). Until that lands, enabling `"Question"` trades the working fallback below for a hang. The instructions here describe the intended behavior for when it is fixed.
+
+Add `"Question"` to `proxyTools` and grant `permission.question: allow` to the calling agent. Claude's built-in `AskUserQuestion` is disabled via `--disallowedTools`, and the plugin exposes `mcp__opencode_proxy__question` in its place. The model calls the proxy, opencode renders the form, and the operator's answers come back as arrays of selected labels. On builds that lack the `question` registry entry the def is silently dropped at spawn (version gate), and the deny/markdown fallback below applies instead.
+
+`proxyTools` replaces the default list rather than adding to it, so repeat the defaults you still want:
+
+```json
+"options": {
+  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task", "Question"]
+}
+```
+
+To turn it back off, drop `"Question"` from the list. It is **not** in the default list, so no configuration means the deny/markdown fallback below stays in force.
+
+The same spawn-time caveat as `"Task"` applies: provider options are read once at opencode startup, so restart opencode fully after adding it. Question calls get a 30-minute proxy deadline (raise it with `proxyToolTimeoutMs` if you expect to be AFK longer; an expired call comes back as an error, not an answer).
+
+### Without the proxy (default fallback)
+
+When `"Question"` is not in `proxyTools` (or the opencode version lacks the `question` tool), the plugin handles `AskUserQuestion` as follows:
 
 1. **It renders the full question.** The tool's payload — every question, header, option label, and option description — is emitted as readable markdown into the assistant stream so the user actually sees the choices (same approach as `ExitPlanMode`).
 2. **It is never auto-allowed at the CLI gate.** Allowing it would let the headless Claude CLI resolve its own question (no TTY → fabricated/empty answer) and proceed on a guess. `controlRequestBehaviorForTool` hard-denies `AskUserQuestion` and returns a message telling the model to **stop and wait for the operator's answer** — end the turn, call no further tools, and never self-answer. (Before v0.7.0 this message also offered an "if the run is non-interactive, proceed with a reasonable guess" fallback. The model could not reliably tell interactive opencode from a headless run and routinely took it, so questions appeared to be skipped — [issue #8](https://github.com/khalilgharbaoui/opencode-claude-code-plugin/issues/8). For genuinely unattended runs, use the `controlRequestToolBehaviors` override below instead.)
@@ -472,7 +551,7 @@ The plugin respects the standard Claude Code thinking env vars. If you set them 
 
 - **Empty text blocks are dropped.** Claude sometimes opens a `content_block_start` for text but never sends a delta. The plugin no longer emits the empty block (which was triggering Anthropic 400s like `cache_control cannot be set for empty text blocks`).
 - **Smart incomplete-turn continuation.** By default, the plugin keeps the current opencode stream open and feeds Claude CLI a small internal continuation message when Claude emits a `result` after reasoning/tool activity without a useful visible answer. It still stops normally on final-looking answers, questions, blockers, errors, aborts, or internal safety-budget exhaustion. Disable with `"autoContinueIncompleteTurns": false`.
-- **`AskUserQuestion`** from the CLI is converted into plain text content rather than forwarded as a tool call.
+- **`AskUserQuestion`** from the CLI is converted into plain text content rather than forwarded as a tool call — unless `"Question"` is in `proxyTools`, in which case it is routed through opencode's native `question` tool (see [AskUserQuestion](#askuserquestion)).
 - **Wire-inactivity watchdog.** Once the CLI has produced any content, the stream closes gracefully if stdout goes silent for 60 seconds without a `result` message arriving. Resets on every line received, so long mid-turn pauses (Sonnet between text-end and the next tool_use, for example) are tolerated. On a user-initiated abort, the watchdog shortens to 5 seconds.
 - **Per-iteration usage.** When the CLI internally retries with tools, the plugin only counts the last iteration's usage so opencode's context accounting stays accurate.
 - **Lazy `cwd`.** The working directory is re-resolved at every request, so opencode's project-aware behavior works without restarting the plugin.
@@ -534,6 +613,47 @@ Boolean env vars accept `1/true/on/yes` for on and `0/false/no/off` for
 off; empty / unset falls through to config. Invalid `level` values fall
 through to config.
 
+### Startup diagnostics
+
+Once per process, right after the provider(s) register, the plugin logs a
+single `NOTICE: claude-code plugin ready` line summarizing everything worth
+knowing before you start debugging anything else:
+
+```bash
+OPENCODE_CLAUDE_CODE_LOG_FILE=1 opencode
+grep "plugin ready" ~/.local/share/opencode-claude-code/plugin.log
+```
+
+```json
+{
+  "plugin": "0.11.1",
+  "opencode": "1.18.5",
+  "cwd": { "resolved": "/Users/you/code/app", "source": "process" },
+  "providers": ["claude-code-default", "claude-code-work"],
+  "accounts": ["default", "work"],
+  "proxyTools": ["Bash", "Edit", "Write", "WebFetch", "Task"],
+  "mcpServers": ["github", "slack"],
+  "interactiveTransport": false,
+  "anthropicApiKeyInEnv": false,
+  "claudeCli": { "path": "claude", "version": "2.1.211 (Claude Code)" }
+}
+```
+
+Reading it:
+
+- **`cwd.source`** is which rule picked the working directory Claude will be
+  spawned in — `configured` (you pinned `options.cwd`), `process` (normal),
+  `captured` (`process.cwd()` was unusable and opencode's project directory
+  rescued it, the macOS GUI-launch case), or `unresolved` (neither worked).
+- **`claudeCli.version`** reading `not detected` means the `claude` binary at
+  that path didn't answer `--version`, which also disables version-gated
+  flags like `--thinking-display`.
+- **`mcpServers`** is the on-disk merge, before opencode's runtime toggles
+  are applied (those aren't settled yet at startup).
+- **`opencode`** is read from the running opencode binary (`--version`), since
+  opencode still does not hand its version to plugins. It reads `unknown` when
+  opencode is run from source rather than as the packaged binary.
+
 ### Default behavior (no config, no env)
 
 Nothing persists; only WARN and ERROR bubble in the TUI. The plugin
@@ -564,7 +684,8 @@ Workaround for autonomous compression: trigger it manually with `/dcp compress` 
 - No streaming of tool inputs as they're being constructed (Anthropic's `input_json_delta`); the plugin emits them once complete.
 - Raw chain-of-thought is not available. Claude 4 family models ship summarized thinking only. See [Extended thinking](#extended-thinking) for the full picture.
 - Recommended Claude Code CLI: **2.1.142+**. Older CLIs work for everything else but skip the `--thinking-display` flag, so Claude Opus 4.7 turns may render empty Thinking rows. If something breaks after a Claude Code update, the CLI version is the first thing to check.
-- **Subagent todos require explicit permission.** opencode's task tool gates `todowrite` per subagent: without a `permission: { todowrite: "allow" }` rule on the subagent definition, opencode injects `todowrite: false` into the tools dict and the plugin's synthetic `todowrite` emissions surface as `⚙ invalid todowrite` rows. The built-in `general` subagent denies `todowrite` by default; use a custom subagent for parallel work that needs todo visibility. Subagent todos render inline in the **subagent's** session view (navigate with the TUI's `session.child.next` / `session.parent` commands), not in the parent session's panel.
+- **Foreground Task calls have a 60-minute proxy deadline** (configurable via [`proxyToolTimeoutMs`](#per-tool-proxy-timeouts)). A ceiling covering the longest configured deadline is written into Claude's generated HTTP MCP configuration so long-running opencode subagents are not cut off by Claude's 60-second default. For independent longer work, use `background: true` after enabling opencode's experimental background-subagent flag.
+- **Subagent todos require explicit permission.** See [Subagent todos](#subagent-todos) for the rule and a working config.
 
 ---
 

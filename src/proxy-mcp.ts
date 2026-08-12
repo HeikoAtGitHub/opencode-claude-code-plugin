@@ -41,7 +41,6 @@ export interface ProxyToolCall {
   id: string
   toolName: string
   input: Record<string, unknown>
-  timeoutMs?: number
   resolve: (result: ProxyToolResult) => void
   reject: (err: Error) => void
 }
@@ -56,75 +55,291 @@ export type ProxyToolResult =
 // echo the client's requested version in `initialize` to keep negotiation
 // correct across CLI versions.
 const PROTOCOL_VERSION = "2025-06-18"
+const PROXY_HEARTBEAT_MS = 60 * 1000
+export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
+
+/** Rejections that fire on normal lifecycle transitions: AFK-permission
+ * timeouts, orphan rejections at turn boundaries, stream aborts, and server
+ * close while its owning Claude process exits or is replaced. None are
+ * user-actionable — file-log them at NOTICE. Anything else stays WARN so
+ * genuine bugs remain visible in the TUI. */
+export function isExpectedCleanupError(message: string): boolean {
+  return (
+    (message.includes("timed out after") &&
+      message.includes("waiting for opencode to resolve")) ||
+    message.includes("rejecting as orphaned") ||
+    message.includes("was orphaned by a new user turn") ||
+    message.includes("stream was aborted") ||
+    message.includes(SERVER_CLOSED_MESSAGE)
+  )
+}
+
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
-
-export type ProxyToolTimeoutConfig = number | Record<string, number | undefined>
-
-export interface ProxyMcpServerOptions {
-  /** Per-tool or global proxy wait timeout in milliseconds. */
-  toolTimeoutMs?: ProxyToolTimeoutConfig
-}
-
-// Cap on how long a proxy tool call may wait for opencode to resolve it. Most
-// tools keep the historical 10-minute default. Interactive/user-driven tools
-// get longer defaults because they legitimately wait for browser approval or a
-// subagent run.
-const DEFAULT_PROXY_CALL_TIMEOUT_MS = 10 * 60 * 1000
-const DEFAULT_PROXY_TOOL_TIMEOUT_MS: Record<string, number> = {
-  task: 30 * 60 * 1000,
-  submit_plan: 24 * 60 * 60 * 1000,
-}
 
 // Interval between SSE heartbeats (MCP progress notifications) emitted while a
 // proxy tool call is pending. Must stay well under the Claude CLI's ~296s HTTP
 // transport timeout and 300s MCP idle timeout, which otherwise abort a
 // long-pending interactive call (e.g. submit_plan during human plan review).
-const PROXY_HEARTBEAT_MS = 60 * 1000
+// Flat fallback cap on how long a proxy tool call may wait for opencode to
+// resolve it. Matches Claude CLI's hard upper bound for Bash (10 min). The
+// effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
+export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
-function parsePositiveTimeoutMs(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
-    return Math.trunc(value)
+// Per-tool default deadlines, keyed by lowercase proxy tool name. `task`
+// dispatches an opencode subagent that routinely runs 20-40 min; the old
+// flat ceiling fired mid-subagent, made Claude believe its dispatch had
+// failed, and (because the proxy had already returned a timeout error) the
+// late subagent result was dropped on the floor -- the operator had to
+// nudge "please check now, it seems the task succeeded" (@jknlsn, live
+// session ses_0cfc0da6, 2026-07-05).
+//
+// `question` blocks on a human reading a TUI form, so the flat ceiling is
+// the wrong unit entirely: a question posed just before the operator steps
+// away would be rejected mid-answer. 30 min is jknlsn's original figure and
+// matches the "prefer fewer, high-signal questions" guidance in the def.
+export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
+  task: 60 * 60 * 1000, // 60 min
+  question: 30 * 60 * 1000, // 30 min
+  submit_plan: 24 * 60 * 60 * 1000, // interactive Plannotator review
+}
+
+// Node's setTimeout delay is a signed 32-bit int; values above 2^31-1 ms
+// (~24.85 days) trigger TimeoutOverflowWarning and fire at ~1ms instead.
+// Clamp absurd overrides / input.timeouts so a misconfigured deadline
+// can't collapse to "fires immediately".
+export const MAX_PROXY_TIMEOUT_MS = 2 ** 31 - 1
+
+/**
+ * Resolve the proxy deadline for a tool call. Layers, most-specific last:
+ *  1. flat default (`PROXY_DEFAULT_TIMEOUT_MS`, 10 min)
+ *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`)
+ *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key)
+ *  4. for `bash`, the call's own `input.timeout` -- the proxy must never
+ *     undercut a build the caller explicitly asked to run long. The bash
+ *     proxy def advertises a `timeout` field; before this fix the proxy
+ *     ignored it and killed the call at the flat ceiling anyway.
+ * Finally clamped to `MAX_PROXY_TIMEOUT_MS` to stay within Node's timer range.
+ */
+export function resolveProxyCallTimeoutMs(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  overrides: Record<string, number> | undefined,
+): number {
+  const key = toolName.toLowerCase()
+  let ms = PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS[key] ?? PROXY_DEFAULT_TIMEOUT_MS
+  if (overrides) {
+    const ov = lookupCaseInsensitive(overrides, key)
+    if (typeof ov === "number" && ov > 0) ms = ov
   }
-  if (typeof value === "string" && value.trim()) {
-    const parsed = Number(value.trim())
-    if (Number.isFinite(parsed) && parsed > 0) return Math.trunc(parsed)
+  if (key === "bash") {
+    const requested = input?.timeout
+    if (typeof requested === "number" && requested > ms) ms = requested
+  }
+  return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+function lookupCaseInsensitive(
+  map: Record<string, number>,
+  key: string,
+): number | undefined {
+  if (Object.prototype.hasOwnProperty.call(map, key)) return map[key]
+  for (const k of Object.keys(map)) {
+    if (k.toLowerCase() === key) return map[k]
   }
   return undefined
 }
 
-function envTimeoutForTool(toolName: string): number | undefined {
-  const normalized = toolName.replace(/[^a-zA-Z0-9]+/g, "_").toUpperCase()
-  return parsePositiveTimeoutMs(
-    process.env[`OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_${normalized}_MS`],
-  )
-}
-
-function configuredTimeoutForTool(
-  toolName: string,
-  configured: ProxyToolTimeoutConfig | undefined,
-): number | undefined {
-  if (configured === undefined) return undefined
-  if (typeof configured === "number") return parsePositiveTimeoutMs(configured)
-  const lower = toolName.toLowerCase()
-  return (
-    parsePositiveTimeoutMs(configured[toolName]) ??
-    parsePositiveTimeoutMs(configured[lower]) ??
-    parsePositiveTimeoutMs(configured[toolName.toUpperCase()])
-  )
-}
-
-export function resolveProxyToolTimeoutMs(
-  toolName: string,
-  configured?: ProxyToolTimeoutConfig,
+/**
+ * Client-side abort ceiling written into Claude's `--mcp-config` entry for
+ * the proxy server. Without a `timeout` there, Claude CLI's remote-HTTP MCP
+ * client aborts each call at its 60-second default even while an opencode
+ * subagent is still running (@broskees, PR #18). It must be >= the largest
+ * server-side deadline or the client gives up before the broker does, so it
+ * tracks the max of the flat default, per-tool defaults, and user overrides.
+ * (A bash call raising its own `input.timeout` above this ceiling is a known
+ * edge; Claude CLI caps bash at 10 min anyway.)
+ */
+export function resolveProxyClientCeilingMs(
+  overrides: Record<string, number> | undefined,
 ): number {
-  return (
-    envTimeoutForTool(toolName) ??
-    parsePositiveTimeoutMs(process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS) ??
-    configuredTimeoutForTool(toolName, configured) ??
-    DEFAULT_PROXY_TOOL_TIMEOUT_MS[toolName.toLowerCase()] ??
-    DEFAULT_PROXY_CALL_TIMEOUT_MS
+  let ms = PROXY_DEFAULT_TIMEOUT_MS
+  for (const v of Object.values(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
+    if (v > ms) ms = v
+  }
+  if (overrides) {
+    for (const v of Object.values(overrides)) {
+      if (typeof v === "number" && v > ms) ms = v
+    }
+  }
+  return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+/**
+ * Build the timeout error surfaced to Claude. Keeps the substrings
+ * `"timed out after"` and `"waiting for opencode to resolve"` that the
+ * proxy-mcp catch block classifies as expected cleanup (notice, not warn).
+ * For `task` we append guidance: a Task timeout means the subagent may
+ * still be running but its result is now unreachable, and the model must
+ * neither declare the dispatch failed nor "schedule a wake-up" -- that is a
+ * Claude Code affordance which cannot fire in this headless/proxy context,
+ * so deferring silently drops the work.
+ */
+export function buildProxyTimeoutError(toolName: string, ms: number): Error {
+  const key = toolName.toLowerCase()
+  const base = `Proxy tool '${toolName}' timed out after ${ms}ms waiting for opencode to resolve the call`
+  if (key === "task") {
+    return new Error(
+      base +
+        " (the subagent). The subagent may still be running but its result" +
+        " is no longer reachable in this session. Do not declare the dispatch" +
+        " failed, and do not 'schedule a wake-up' or defer -- that mechanism" +
+        " does not apply here. If the result is required, re-dispatch or" +
+        " verify it directly now.",
+    )
+  }
+  return new Error(base)
+}
+
+/**
+ * Disambiguation appended to the `task` proxy def (both the static
+ * fallback and the live overlay). Models routinely resolve opencode's
+ * "call the task tool with subagent: X" mention hint to Claude Code's
+ * native TaskCreate (a todo tool) — creating a todo, dispatching nothing,
+ * and then narrating a successful dispatch. Others burn turns grepping
+ * config files to verify a subagent exists before daring to call it.
+ * Both failure modes are addressed here, at the tool the model reads.
+ */
+export const TASK_PROXY_NOTE =
+  "This is the ONLY tool that dispatches opencode subagents (including" +
+  " user @-mentions). Claude Code's built-in TaskCreate/TaskUpdate manage" +
+  " a local todo list and cannot dispatch subagents. Do not search config" +
+  " files to verify a subagent type exists — invalid types fail fast with" +
+  " a clear error. Foreground calls block until the subagent finishes; set" +
+  " `background` to request opencode's background execution mode. Task calls" +
+  " get a 60-minute proxy deadline by default (configurable via" +
+  " proxyToolTimeoutMs)."
+
+const AGENT_TYPES_HEADING = "Available agent types"
+
+/** Longest per-agent blurb we keep; enough to choose, short enough to survive. */
+const AGENT_BLURB_LIMIT = 140
+
+/**
+ * Disambiguation appended to the `question` proxy def. Claude Code ships
+ * a built-in `AskUserQuestion` that, when proxied, is disabled via
+ * `--disallowedTools`; without an explicit hand-off note models keep
+ * reaching for the disabled built-in or fall back to plain text. This
+ * states that the proxy is the structured-questions path and summarises
+ * the answer shape so the model can act on the result without a second
+ * round-trip.
+ */
+export const QUESTION_PROXY_NOTE =
+  "This routes structured questions through opencode's native `question`" +
+  " tool, which renders a TUI form with the options you provide and" +
+  " blocks until the operator answers. Claude Code's built-in" +
+  " AskUserQuestion is disabled in this environment; this proxy is the" +
+  " ONLY way to ask the operator for a decision or clarification." +
+  " Answers come back as arrays of selected labels (set `multiple: true`" +
+  " to allow more than one). If the operator dismisses the form the call" +
+  " returns an error — treat that as 'no answer' and stop, do not guess." +
+  " Question calls get a 30-minute proxy deadline by default (configurable" +
+  " via proxyToolTimeoutMs); for long-AFK scenarios prefer fewer," +
+  " high-signal questions."
+
+/**
+ * Pull *only* the agent-type list out of opencode's live `task` description.
+ *
+ * jknlsn's original overlaid the whole live description (2.8 KB here) in front
+ * of the static def. Live check 2026-07-26 showed that backfires: Claude Code
+ * truncates long MCP tool descriptions, and opencode puts the agent list at
+ * the *end* (char 2306 of 2858), so the one part the model needs is exactly
+ * what gets cut — haiku then guessed `general-purpose`, `default`, and
+ * `code-reviewer` (Claude Code's own agent names) and every dispatch failed
+ * with "Unknown agent type". So: keep the list, drop opencode's preamble
+ * (generic delegation advice the model already has), trim each blurb, and let
+ * the caller put it first.
+ *
+ * Returns undefined when the description carries no parsable list, so callers
+ * leave the static def alone.
+ */
+export function extractAgentTypeList(
+  liveDescription: string | undefined,
+): string | undefined {
+  const live = liveDescription?.trim()
+  if (!live) return undefined
+  const start = live.indexOf(AGENT_TYPES_HEADING)
+  if (start === -1) return undefined
+  const entries: string[] = []
+  for (const raw of live.slice(start).split("\n")) {
+    const match = /^-\s*([^:]+):\s*(.+)$/.exec(raw.trim())
+    if (!match) continue
+    const name = match[1].trim()
+    const blurb = match[2].trim()
+    entries.push(
+      `- ${name}: ${
+        blurb.length > AGENT_BLURB_LIMIT
+          ? `${blurb.slice(0, AGENT_BLURB_LIMIT).trimEnd()}…`
+          : blurb
+      }`,
+    )
+  }
+  if (entries.length === 0) return undefined
+  return `Valid subagent_type values, from opencode's live registry — anything else fails:\n${entries.join("\n")}`
+}
+
+/**
+ * Front-load opencode's live agent-type list onto the static `task` proxy def
+ * so the model picks a real `subagent_type` instead of guessing a Claude Code
+ * name. First, not last: see `extractAgentTypeList` for why position matters.
+ * No-op when no list can be extracted (SDK client missing, older opencode) or
+ * the `task` def is not among the tools.
+ */
+export function overlayTaskProxyDescription(
+  tools: ProxyToolDef[],
+  liveDescription: string | undefined,
+): ProxyToolDef[] {
+  const agentTypes = extractAgentTypeList(liveDescription)
+  if (!agentTypes) return tools
+  return tools.map((t) =>
+    t.name === "task"
+      ? { ...t, description: `${agentTypes}\n\n${t.description}` }
+      : t,
   )
+}
+
+/**
+ * Overlay opencode's live `question` tool description onto the static
+ * proxy def, then append the disambiguation note. No-op when the live
+ * description is unavailable (older opencode, SDK client missing) — the
+ * static def + note stands. Mirrors `overlayTaskProxyDescription`.
+ */
+export function overlayQuestionProxyDescription(
+  tools: ProxyToolDef[],
+  liveDescription: string | undefined,
+): ProxyToolDef[] {
+  const live = liveDescription?.trim()
+  if (!live) return tools
+  return tools.map((t) =>
+    t.name === "question"
+      ? { ...t, description: `${live}\n\n${QUESTION_PROXY_NOTE}` }
+      : t,
+  )
+}
+
+/**
+ * Version gate for the `question` proxy. opencode added a built-in
+ * `question` tool (registry id `question`) — on older builds that entry
+ * is absent and a forwarded `mcp__opencode_proxy__question` call would
+ * resolve to `⚙ invalid` in opencode. Drop the def silently when the
+ * live registry does not contain it so the model never sees a dead tool.
+ */
+export function filterQuestionProxyByOpencodeSupport(
+  tools: ProxyToolDef[],
+  opencodeHasQuestion: boolean,
+): ProxyToolDef[] {
+  if (opencodeHasQuestion) return tools
+  return tools.filter((t) => t.name !== "question")
 }
 
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
@@ -233,8 +448,8 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " orchestration, permission, and lifecycle are handled by opencode." +
       " Use `subagent_type` to pick which configured subagent runs (e.g." +
       " `build`, `general`, `explore`, or any custom subagent declared in" +
-      " opencode.json). The call blocks until the subagent finishes; the" +
-      " 10-minute proxy timeout applies.",
+      " opencode.json). " +
+      TASK_PROXY_NOTE,
     inputSchema: {
       type: "object",
       properties: {
@@ -260,6 +475,11 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
         command: {
           type: "string",
           description: "The command that triggered this task",
+        },
+        background: {
+          type: "boolean",
+          description:
+            "Run the task in the background when supported by opencode",
         },
       },
       required: ["description", "prompt", "subagent_type"],
@@ -305,11 +525,69 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       required: ["edits"],
     },
   },
+  {
+    name: "question",
+    description:
+      "Ask the operator structured questions with options and receive" +
+      " their answers back. Routed through opencode's native `question`" +
+      " tool so the prompt renders as a real TUI form (with options and a" +
+      " custom-answer field) instead of a plain text turn. Use this when" +
+      " you need a decision, clarification, or preference from the" +
+      " operator mid-task. " +
+      QUESTION_PROXY_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          description: "Questions to ask.",
+          items: {
+            type: "object",
+            properties: {
+              question: {
+                type: "string",
+                description: "Complete question.",
+              },
+              header: {
+                type: "string",
+                description: "Very short label (max 30 chars).",
+              },
+              options: {
+                type: "array",
+                description: "Available choices.",
+                items: {
+                  type: "object",
+                  properties: {
+                    label: {
+                      type: "string",
+                      description: "Display text (1-5 words, concise).",
+                    },
+                    description: {
+                      type: "string",
+                      description: "Explanation of choice.",
+                    },
+                  },
+                  required: ["label", "description"],
+                },
+              },
+              multiple: {
+                type: "boolean",
+                description:
+                  "Allow selecting multiple choices. Defaults to false.",
+              },
+            },
+            required: ["question", "header", "options"],
+          },
+        },
+      },
+      required: ["questions"],
+    },
+  },
 ]
 
 export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
-  options: ProxyMcpServerOptions = {},
+  timeoutOverrides?: Record<string, number>,
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
@@ -320,6 +598,16 @@ export async function createProxyMcpServer(
       res.end()
       return
     }
+    // Hoist the request id and method so the catch block can echo them
+    // in error responses. Without this, a broker rejection (timeout /
+    // orphan) on a tools/call lands in the catch with no visible id, and
+    // the response goes back with `id: null` which Claude CLI cannot
+    // match to the original request. The method is also needed because
+    // tools/call errors must be returned as MCP results with isError
+    // (not JSON-RPC errors) or Claude CLI rejects them as a "malformed
+    // result that failed schema validation" (seen live 2026-07-04).
+    let requestId: number | string | null = null
+    let requestMethod: string | null = null
     try {
       const body = await readBody(req)
       const request = JSON.parse(body) as {
@@ -328,11 +616,13 @@ export async function createProxyMcpServer(
         method?: string
         params?: Record<string, unknown>
       }
+      requestId = request?.id ?? null
+      requestMethod = typeof request?.method === "string" ? request.method : null
 
       if (request?.jsonrpc !== "2.0" || typeof request.method !== "string") {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request?.id ?? null,
+          id: requestId,
           error: { code: -32600, message: "Invalid request" },
         })
         return
@@ -349,7 +639,7 @@ export async function createProxyMcpServer(
         )?.protocolVersion
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request.id ?? null,
+          id: requestId,
           result: {
             protocolVersion: clientProtocol ?? PROTOCOL_VERSION,
             capabilities: { tools: {} },
@@ -371,7 +661,7 @@ export async function createProxyMcpServer(
       if (request.method === "tools/list") {
         writeJson(res, {
           jsonrpc: "2.0",
-          id: request.id ?? null,
+          id: requestId,
           result: {
             tools: tools.map((t) => ({
               name: t.name,
@@ -389,28 +679,38 @@ export async function createProxyMcpServer(
         const input = (params.arguments ?? {}) as Record<string, unknown>
 
         if (!tools.some((t) => t.name === toolName)) {
+          // tools/call failures MUST be MCP results with isError, never
+          // JSON-RPC error envelopes: Claude CLI validates every tools/call
+          // response against the MCP result schema and rejects JSON-RPC
+          // errors as malformed (@jknlsn, seen live 2026-07-04).
           writeJson(res, {
             jsonrpc: "2.0",
-            id: request.id ?? null,
-            error: {
-              code: -32601,
-              message: `Unknown proxy tool: ${toolName}`,
+            id: requestId,
+            result: {
+              content: [{ type: "text", text: `Unknown proxy tool: ${toolName}` }],
+              isError: true,
             },
           })
           return
         }
 
         const callId = crypto.randomUUID()
-        const timeoutMs = resolveProxyToolTimeoutMs(toolName, options.toolTimeoutMs)
+        const deadlineMs = resolveProxyCallTimeoutMs(
+          toolName,
+          input,
+          timeoutOverrides,
+        )
         log.info("proxy-mcp tool call received", {
           callId,
           toolName,
           hasInput: input != null,
-          timeoutMs,
+          deadlineMs,
         })
 
-        // Respond as SSE (Streamable HTTP) rather than a single buffered JSON
-        // body. A long-pending interactive call — notably submit_plan during
+        // Only submit_plan needs Streamable HTTP. Keep upstream's buffered MCP
+        // responses for ordinary proxy tools.
+        const useSse = toolName.toLowerCase() === "submit_plan"
+        // A long-pending interactive call — submit_plan during
         // human plan review — otherwise dies at the Claude CLI's ~296s HTTP
         // transport timeout (byte-silent connection) and its 300s MCP idle
         // timeout, neither of which MCP_TOOL_TIMEOUT covers. Periodic progress
@@ -420,18 +720,24 @@ export async function createProxyMcpServer(
         const progressToken = (
           params as { _meta?: { progressToken?: unknown } }
         )._meta?.progressToken
-        res.statusCode = 200
-        res.setHeader("Content-Type", "text/event-stream")
-        res.setHeader("Cache-Control", "no-cache")
-        res.setHeader("Connection", "keep-alive")
-        res.flushHeaders?.()
+        if (useSse) {
+          res.statusCode = 200
+          res.setHeader("Content-Type", "text/event-stream")
+          res.setHeader("Cache-Control", "no-cache")
+          res.setHeader("Connection", "keep-alive")
+          res.flushHeaders?.()
+        }
         const sendSse = (msg: unknown) => {
           try {
             res.write(`event: message\ndata: ${JSON.stringify(msg)}\n\n`)
           } catch {}
         }
+        const sendResponse = (msg: unknown) => {
+          if (useSse) sendSse(msg)
+          else writeJson(res, msg)
+        }
         let progressN = 0
-        const heartbeat = setInterval(() => {
+        const heartbeat = useSse ? setInterval(() => {
           progressN += 1
           if (progressToken !== undefined) {
             sendSse({
@@ -444,95 +750,45 @@ export async function createProxyMcpServer(
               res.write(`: keepalive ${progressN}\n\n`)
             } catch {}
           }
-        }, PROXY_HEARTBEAT_MS)
-        ;(heartbeat as { unref?: () => void }).unref?.()
+        }, PROXY_HEARTBEAT_MS) : null
+        heartbeat?.unref?.()
 
         let timer: ReturnType<typeof setTimeout> | null = null
-        let result: ProxyToolResult
         try {
-          result = await new Promise<ProxyToolResult>(
-            (resolve, reject) => {
-              const entry: ProxyToolCall = {
-                id: callId,
-                toolName,
-                input,
-                timeoutMs,
-                resolve,
-                reject,
-              }
-              pending.set(callId, entry)
-              timer = setTimeout(() => {
-                if (!pending.has(callId)) return
-                pending.delete(callId)
-                // v0.4.13: demoted from warn to notice. Timeouts are usually
-                // permission-pending while the user is AFK — surfacing each as
-                // a yellow UI bubble produces a wall of noise on return. The
-                // file log still captures the event for diagnostics.
-                log.notice("proxy-mcp tool call timed out", {
-                  callId,
-                  toolName,
-                  timeoutMs,
-                })
-                reject(
-                  new Error(
-                    `Proxy tool '${toolName}' timed out after ${timeoutMs}ms waiting for opencode to resolve the call`,
-                  ),
-                )
-              }, timeoutMs)
-              calls.emit("call", entry)
-            },
-          ).finally(() => {
+          const result = await new Promise<ProxyToolResult>((resolve, reject) => {
+            const entry: ProxyToolCall = { id: callId, toolName, input, resolve, reject }
+            pending.set(callId, entry)
+            timer = setTimeout(() => {
+              if (!pending.has(callId)) return
+              pending.delete(callId)
+              log.notice("proxy-mcp tool call timed out", { callId, toolName, deadlineMs })
+              reject(buildProxyTimeoutError(toolName, deadlineMs))
+            }, deadlineMs)
+            calls.emit("call", entry)
+          }).finally(() => {
             if (timer) clearTimeout(timer)
             pending.delete(callId)
           })
+          const text = result.kind === "error" ? result.message : result.text
+          const isError = result.kind === "error" || result.isError === true
+          sendResponse({
+            jsonrpc: "2.0",
+            id: requestId,
+            result: { content: [{ type: "text", text }], isError },
+          })
         } catch (error) {
-          clearInterval(heartbeat)
-          const message =
-            error instanceof Error ? error.message : String(error)
+          const message = error instanceof Error ? error.message : String(error)
           log.notice("proxy-mcp tool call rejected; sending error over SSE", {
-            callId,
-            toolName,
-            error: message,
+            callId, toolName, error: message,
           })
-          // Terminal error over SSE with the request's REAL id (never null),
-          // so the CLI matches it and fails just this call instead of
-          // desyncing the JSON-RPC transport.
-          sendSse({
+          sendResponse({
             jsonrpc: "2.0",
-            id: request.id ?? null,
-            error: { code: -32000, message },
+            id: requestId,
+            result: { content: [{ type: "text", text: message }], isError: true },
           })
-          try {
-            res.end()
-          } catch {}
-          return
+        } finally {
+          if (heartbeat) clearInterval(heartbeat)
         }
-
-        clearInterval(heartbeat)
-
-        if (result.kind === "error") {
-          sendSse({
-            jsonrpc: "2.0",
-            id: request.id ?? null,
-            error: {
-              code: -32000,
-              message: result.message,
-            },
-          })
-          try {
-            res.end()
-          } catch {}
-          return
-        }
-
-        sendSse({
-          jsonrpc: "2.0",
-          id: request.id ?? null,
-          result: {
-            content: [{ type: "text", text: result.text }],
-            isError: result.isError === true,
-          },
-        })
         try {
           res.end()
         } catch {}
@@ -541,32 +797,44 @@ export async function createProxyMcpServer(
 
       writeJson(res, {
         jsonrpc: "2.0",
-        id: request.id ?? null,
+        id: requestId,
         error: { code: -32601, message: `Unknown method: ${request.method}` },
       })
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      // v0.4.13 + v0.4.19: cleanup rejections from the broker propagate up
-      // here. None are user-actionable — they fire on AFK-permission timeouts,
-      // orphan-rejections after a turn boundary, stream closes, etc. File-log
-      // them at NOTICE; other error shapes stay as WARN so genuine bugs remain
-      // visible in the TUI.
-      const isExpectedCleanup =
-        (errorMessage.includes("timed out after") &&
-          errorMessage.includes("waiting for opencode to resolve")) ||
-        errorMessage.includes("rejecting as orphaned") ||
-        errorMessage.includes("was orphaned by a new user turn") ||
-        errorMessage.includes("cannot run while interactive proxy tool") ||
-        (errorMessage.includes("cannot run while") &&
-          errorMessage.includes("proxy call(s) are pending"))
-      const logFn = isExpectedCleanup ? log.notice : log.warn
+      const logFn = isExpectedCleanupError(errorMessage) ? log.notice : log.warn
       logFn("proxy-mcp error handling request", {
         error: errorMessage,
       })
+      // Broker rejections (timeouts, orphans, server close) surface here for
+      // tools/call requests. Same rule as above: respond with an MCP result
+      // carrying isError, never a JSON-RPC error envelope, or Claude CLI
+      // rejects the response as schema-invalid.
+      if (requestMethod === "tools/call") {
+        try {
+          writeJson(res, {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: {
+              content: [{ type: "text", text: errorMessage }],
+              isError: true,
+            },
+          })
+        } catch {
+          try {
+            res.statusCode = 500
+            res.end()
+          } catch {}
+        }
+        return
+      }
       try {
+        // tools/call already returned above with an MCP result; anything
+        // reaching here is a protocol-level method (initialize, tools/list)
+        // where a JSON-RPC error is the correct shape.
         writeJson(res, {
           jsonrpc: "2.0",
-          id: null,
+          id: requestId,
           error: {
             code: -32603,
             message: error instanceof Error ? error.message : "Internal error",
@@ -617,6 +885,7 @@ export async function createProxyMcpServer(
             [SERVER_NAME]: {
               type: "http",
               url,
+              timeout: resolveProxyClientCeilingMs(timeoutOverrides),
             },
           },
         },
@@ -638,7 +907,7 @@ export async function createProxyMcpServer(
     },
     async close() {
       for (const entry of pending.values()) {
-        entry.reject(new Error("proxy MCP server closed"))
+        entry.reject(new Error(SERVER_CLOSED_MESSAGE))
       }
       pending.clear()
       await new Promise<void>((resolve) => {
@@ -677,6 +946,12 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
     grep: ["Grep"],
     webfetch: ["WebFetch"],
     task: ["Agent"],
+    // `question` disables Claude Code's built-in `AskUserQuestion` so the
+    // structured-questions path flows through opencode's native `question`
+    // tool instead — same UI/permission/audit benefits as the other
+    // proxies. Without this, the model can call both and the two paths
+    // diverge (opencode's form vs the headless deny-and-render fallback).
+    question: ["AskUserQuestion"],
   }
   const out: string[] = []
   const seen = new Set<string>()

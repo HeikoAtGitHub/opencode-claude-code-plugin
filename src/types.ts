@@ -28,7 +28,7 @@ export interface ClaudeCodeConfig {
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
   proxyTools?: string[]
-  proxyToolTimeoutMs?: number | Record<string, number | undefined>
+  proxyToolTimeoutMs?: Record<string, number>
   webSearch?: WebSearchRouting
   hotReloadMcp?: boolean
   proxyOpencodeMcpTools?: boolean
@@ -131,28 +131,48 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `submit_plan`.
-   * Leave empty or unset to disable proxying.
-   *
-   * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
-   * opencode's `task` tool, so subagent calls run under opencode's
-   * configured subagent set (build/general/custom) with opencode's
-   * permission and lifecycle handling, instead of Claude CLI's
-   * internal-only general-purpose / Explore / Plan options. The calling
-   * agent must have `permission.task: allow` for the target subagent
-   * (see opencode's agent docs).
-   */
+    * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`, `submit_plan`. Leave empty or unset to disable proxying.
+    *
+    * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
+    * opencode's `task` tool, so subagent calls run under opencode's
+    * configured subagent set (build/general/custom) with opencode's
+    * permission and lifecycle handling, instead of Claude CLI's
+    * internal-only general-purpose / Explore / Plan options. The calling
+    * agent must have `permission.task: allow` for the target subagent
+    * (see opencode's agent docs).
+    *
+    * `submit_plan` proxies the Plannotator approval tool and may wait for
+    * browser review. Its default deadline is 24 hours.
+    *
+    * `question` proxies Claude CLI's `AskUserQuestion` through opencode's
+    * native `question` tool (TUI form with options + custom answer). The
+    * calling agent must have `permission.question: allow`. Version-gated:
+    * silently dropped on opencode builds that lack the `question` registry
+    * entry, in which case the deny/markdown fallback applies.
+    */
   proxyTools?: string[]
 
   /**
-   * Proxy tool wait timeout(s) in milliseconds. A number applies to every
-   * proxied tool; an object may override individual proxy MCP tool names
-   * such as `bash`, `task`, or `submit_plan`.
+   * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool
+    * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`, `submit_plan` —
+   * case-insensitive). When a proxied tool call waits longer than its
+   * deadline for opencode to resolve it, the call is rejected and Claude
+   * receives a timeout error.
+   *
+   * Defaults (used when a tool is absent here): `bash`/`edit`/`write`/
+    * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` →
+    * 60 min (subagents routinely run 20–40 min); `question` → 30 min
+    * (operator AFK); `submit_plan` → 24 hours (browser plan review).
+    * Setting a key here replaces the default for that tool.
+   *
+   * For `bash` specifically the call's own `input.timeout` is honoured on
+   * top: the effective deadline is `max(resolved, input.timeout)`, so a
+   * long build the caller explicitly asked to run is never undercut.
    */
-  proxyToolTimeoutMs?: number | Record<string, number | undefined>
+  proxyToolTimeoutMs?: Record<string, number>
 
   /**
-   * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of
+    * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of
    * every spawned `claude` process. When an API key is present, Claude Code
    * authenticates with it (pay-as-you-go Console billing) instead of the
    * logged-in Pro/Max subscription — silently bypassing the Agent SDK plan

@@ -18,6 +18,11 @@ import {
   setOpencodeClient,
   setOpencodeProjectDirectory,
 } from "./runtime-status.js"
+import {
+  logStartupDiagnostics,
+  pickOpencodeVersion,
+  type DiagnosticsProviderEntry,
+} from "./startup-diagnostics.js"
 
 export interface ClaudeCodeProvider {
   specificationVersion: "v3"
@@ -38,6 +43,20 @@ function pickOpencodeDirectory(input: unknown): string | undefined {
 }
 
 let warnedAnthropicApiKey = false
+
+// `Question` is deliberately absent: enabling it disables Claude Code's
+// built-in AskUserQuestion (via --disallowedTools) and replaces the
+// stop-and-wait deny/markdown path with an in-turn blocking form. That is a
+// behavior trade against the issue-#8 guarantee, so it stays opt-in until it
+// has the same live mileage Task had before v0.10.0 flipped it on. Users opt
+// in by listing it in `proxyTools`; see README "Question proxy tool".
+const DEFAULT_PROXY_TOOL_NAMES = [
+  "Bash",
+  "Edit",
+  "Write",
+  "WebFetch",
+  "Task",
+]
 
 // One-time heads-up: an API key in the environment makes Claude Code bill
 // pay-as-you-go (Console) instead of the logged-in Pro/Max subscription, which
@@ -72,7 +91,7 @@ export function createClaudeCode(
   const cliPath =
     settings.cliPath ?? process.env.CLAUDE_CLI_PATH ?? "claude"
   const providerName = settings.providerID ?? settings.name ?? "claude-code"
-  const proxyTools = settings.proxyTools ?? ["Bash", "Edit", "Write", "WebFetch"]
+  const proxyTools = settings.proxyTools ?? [...DEFAULT_PROXY_TOOL_NAMES]
 
   const createModel = (modelId: string): LanguageModelV3 => {
     return new ClaudeCodeLanguageModel(modelId, {
@@ -233,7 +252,7 @@ async function providerConfig(
 ) {
   const mergedOptions: Record<string, unknown> = {
     cliPath: "claude",
-    proxyTools: ["Bash", "Edit", "Write", "WebFetch"],
+    proxyTools: [...DEFAULT_PROXY_TOOL_NAMES],
     ...optionDefaults,
     ...cleanProviderOptions(existing?.options),
     providerID,
@@ -257,6 +276,21 @@ async function providerConfig(
     // configModelsForProvider(), which emits the flat config schema
     // opencode's config-path loader parses (and merges user variants).
   }
+}
+
+/**
+ * Narrow opencode's full provider map down to the ones this plugin owns
+ * (`claude-code` plus every `claude-code-<account>` expansion) so startup
+ * diagnostics never report another provider's options.
+ */
+export function claudeCodeProviders(
+  providers: Record<string, DiagnosticsProviderEntry> | undefined,
+): Record<string, DiagnosticsProviderEntry> {
+  const out: Record<string, DiagnosticsProviderEntry> = {}
+  for (const [id, entry] of Object.entries(providers ?? {})) {
+    if (id === PROVIDER_ID || id.startsWith(`${PROVIDER_ID}-`)) out[id] = entry
+  }
+  return out
 }
 
 async function expandAccountProviders(config: {
@@ -323,6 +357,8 @@ async function expandAccountProviders(config: {
 const server: OpenCodePlugin = async (input) => {
   cleanupStaleUnscopedInstall()
 
+  const opencodeVersion = pickOpencodeVersion(input)
+
   // Capture the SDK client so the language model can query opencode's
   // in-memory MCP state per-turn for the runtime overlay. `input` is
   // `unknown` here (kept loose since opencode adds fields over time);
@@ -344,14 +380,10 @@ const server: OpenCodePlugin = async (input) => {
 
       const expanded = await expandAccountProviders(config)
       if (expanded) {
-        const registered = Object.entries(config.provider)
-          .filter(([id]) => id === PROVIDER_ID || id.startsWith(`${PROVIDER_ID}-`))
-          .map(([id, p]) => ({
-            id,
-            name: p?.name ?? id,
-            cwd: (p?.options as { cwd?: unknown } | undefined)?.cwd,
-          }))
-        log.notice("registered claude-code providers", { providers: registered })
+        logStartupDiagnostics(
+          claudeCodeProviders(config.provider),
+          opencodeVersion,
+        )
         return
       }
 
@@ -364,11 +396,10 @@ const server: OpenCodePlugin = async (input) => {
           PROVIDER_ID,
         ),
       }
-      log.notice("registered claude-code provider", {
-        id: PROVIDER_ID,
-        name: config.provider[PROVIDER_ID]?.name ?? PROVIDER_ID,
-        cwd: (config.provider[PROVIDER_ID]?.options as { cwd?: unknown } | undefined)?.cwd,
-      })
+      logStartupDiagnostics(
+        claudeCodeProviders(config.provider),
+        opencodeVersion,
+      )
     },
     // No `event` hook: MCP config drift is detected at turn start by the
     // hot-reload check in `claude-code-language-model.ts`, which respawns

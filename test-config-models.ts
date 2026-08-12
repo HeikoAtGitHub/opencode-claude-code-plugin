@@ -78,6 +78,67 @@ test("configModelsForProvider registers claude-mythos-5 with real metadata", () 
   assert.ok(variants && "max" in variants, "reasoning variants must be carried")
 })
 
+test("configModelsForProvider registers Sonnet 5 and Opus 5 metadata", () => {
+  const models = configModelsForProvider({}, "claude-code")
+
+  const sonnet = models["claude-sonnet-5"] as Record<string, unknown>
+  assert.equal(sonnet.name, "Claude Sonnet 5 (2×)")
+  assert.equal(sonnet.family, "sonnet")
+  assert.equal(sonnet.release_date, "2026-06-30")
+  assert.equal(sonnet.reasoning, true)
+  assert.deepEqual(sonnet.limit, { context: 1_000_000, output: 128_000 })
+  assert.deepEqual(sonnet.cost, {
+    input: 2e-6,
+    output: 10e-6,
+    cache_read: 2e-7,
+    cache_write: 2.5e-6,
+  })
+
+  const opus = models["claude-opus-5"] as Record<string, unknown>
+  assert.equal(opus.name, "Claude Opus 5 (5×)")
+  assert.equal(opus.family, "opus")
+  assert.equal(opus.release_date, "2026-07-24")
+  assert.equal(opus.reasoning, true)
+  assert.deepEqual(opus.limit, { context: 1_000_000, output: 128_000 })
+  assert.deepEqual(opus.cost, {
+    input: 5e-6,
+    output: 25e-6,
+    cache_read: 0.5e-6,
+    cache_write: 6.25e-6,
+  })
+
+  assert.ok("max" in (sonnet.variants as Record<string, unknown>))
+  assert.ok("max" in (opus.variants as Record<string, unknown>))
+})
+
+// Context and max-output values are published per model and had drifted: the
+// 4.5-generation entries claimed a 1M context they never had, and every
+// pre-Sonnet-5 entry carried a placeholder 16,384 output cap. Pin the real
+// numbers so a future edit can't quietly reintroduce either.
+test("configModelsForProvider reports the published context and output limits", () => {
+  const models = configModelsForProvider({}, "claude-code")
+  const limitOf = (id: string) => (models[id] as Record<string, unknown>).limit
+
+  // 4.5 generation: 200k context, 64k output. Not 1M.
+  assert.deepEqual(limitOf("claude-haiku-4-5"), { context: 200_000, output: 64_000 })
+  assert.deepEqual(limitOf("claude-sonnet-4-5"), { context: 200_000, output: 64_000 })
+  assert.deepEqual(limitOf("claude-opus-4-5"), { context: 200_000, output: 64_000 })
+
+  // 4.6 and later: full 1M context, 128k output.
+  for (const id of [
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+  ]) {
+    assert.deepEqual(limitOf(id), { context: 1_000_000, output: 128_000 }, id)
+  }
+})
+
 test("configModelsForProvider preserves user-defined variants for default models", () => {
   const userConfig = {
     "claude-opus-4-8": { variants: { custom: { reasoningEffort: "low" } } },

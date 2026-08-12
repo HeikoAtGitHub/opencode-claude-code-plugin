@@ -32,6 +32,8 @@ import {
   getClaudeSessionId,
   deleteClaudeSessionId,
   deleteActiveProcess,
+  deleteActiveProcessAndWait,
+  respawnActiveProcess,
   claudeSpawnEnv,
   isClaudeThinkingDisabled,
   sessionKey,
@@ -43,6 +45,9 @@ import {
   createProxyMcpServer,
   disallowedToolFlags,
   DEFAULT_PROXY_TOOLS,
+  overlayTaskProxyDescription,
+  overlayQuestionProxyDescription,
+  filterQuestionProxyByOpencodeSupport,
   PROXY_TOOL_PREFIX,
   type ProxyMcpServer,
   type ProxyToolCall,
@@ -197,6 +202,7 @@ export function hasNewUserContent(
 const AUTO_CONTINUE_MAX_ATTEMPTS = 8
 const AUTO_CONTINUE_MAX_ELAPSED_MS = 10 * 60 * 1000
 const AUTO_CONTINUE_NO_PROGRESS_LIMIT = 2
+const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
 
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
@@ -298,12 +304,16 @@ export function denyMessageForTool(
 /**
  * Render Claude Code's `AskUserQuestion` tool input as visible markdown.
  *
- * opencode has no native structured ask-question executor to proxy this
- * through (unlike bash/task), so the question + every option is rendered
- * as readable assistant text and the user answers in the next turn —
- * same approach as the `ExitPlanMode` handling. The previous behavior
- * collapsed the whole payload to a single faint `_Asking: <q>_` line,
- * dropping all options and any question past the first.
+ * This is the fallback path used when the `Question` proxy is off or the
+ * opencode build lacks the `question` registry entry. When the proxy is
+ * enabled, `AskUserQuestion` is disabled via `--disallowedTools` and the
+ * model calls `mcp__opencode_proxy__question` instead (opencode's native
+ * `question` tool renders the TUI form). Here, the question + every
+ * option is rendered as readable assistant text and the user answers in
+ * the next turn — same approach as the `ExitPlanMode` handling. The
+ * previous behavior collapsed the whole payload to a single faint
+ * `_Asking: <q>_` line, dropping all options and any question past the
+ * first.
  */
 function formatAskUserQuestion(input: Record<string, unknown>): string {
   const anyInput = input as any
@@ -524,6 +534,45 @@ than pausing for user confirmation between subtasks. End the turn only
 when the task is done, you need clarification on intent, or you hit a real
 blocker. The user can interrupt or abort at any time; turn endings should
 mark meaningful checkpoints, not every completed substep.`
+
+/**
+ * Appended to the system prompt whenever the `task` proxy tool is
+ * enabled. Live sessions (2026-07-04) showed models resolving opencode's
+ * "call the task tool with subagent: X" mention hint to Claude Code's
+ * native TaskCreate: haiku created a todo and narrated a dispatch that
+ * never happened; sonnet probed TaskCreate's schema before recovering.
+ * The proxy tool can also be deferred behind ToolSearch, in which case
+ * "the task tool" is invisible while TaskCreate is not. Name the exact
+ * tool, the recovery path, and the failure mode.
+ */
+export const SUBAGENT_DISPATCH_HINT = `## opencode subagents
+
+Subagent dispatch in this environment goes through exactly one tool: \`mcp__opencode_proxy__task\`.
+
+- When the user mentions \`@<agent>\` or an instruction says "call the task tool with subagent: <name>", call \`mcp__opencode_proxy__task\` with \`subagent_type: "<name>"\`.
+- If that tool is not in your visible tool list it is deferred — load it with ToolSearch (\`select:mcp__opencode_proxy__task\`), then call it.
+- Claude Code's built-in TaskCreate/TaskUpdate/TaskList manage a local todo list. They cannot dispatch subagents; creating a task there runs nothing. Never report a subagent as dispatched unless \`mcp__opencode_proxy__task\` returned its result.
+- Do not verify a subagent's existence by searching config files — the tool's description lists the available agent types, and invalid types fail fast with a clear error.`
+
+/**
+ * Appended to the system prompt whenever the `question` proxy tool is
+ * enabled. Live testing (2026-07-05, haiku) showed the model's reasoning
+ * correctly identified `mcp__opencode_proxy__question` as the tool to use,
+ * but then emitted a tool call for bare `question` — stripping the MCP
+ * prefix. opencode's AI SDK bridge has no bare `question` tool, so the
+ * call rendered as `⚙ invalid`. Same near-miss pattern the task proxy
+ * hit (TaskCreate vs mcp__opencode_proxy__task); the fix is the same:
+ * name the exact tool in the system prompt so the model doesn't
+ * abbreviate.
+ */
+export const QUESTION_PROXY_HINT = `## Asking the operator questions
+
+Structured questions in this environment go through exactly one tool: \`mcp__opencode_proxy__question\`.
+
+- When you need to ask the operator a question with options, call \`mcp__opencode_proxy__question\` with a \`questions\` array (each item has \`question\`, \`header\`, \`options\` of \`{label, description}\`, and optional \`multiple\`).
+- If that tool is not in your visible tool list it is deferred — load it with ToolSearch (\`select:mcp__opencode_proxy__question\`), then call it by its FULL name.
+- Do NOT call bare \`question\` — that is not a tool. Always use the full \`mcp__opencode_proxy__question\` name when invoking it.
+- Claude Code's built-in \`AskUserQuestion\` is disabled in this environment; the proxy is the only way to ask structured questions.`
 
 /**
  * Prepended to every appended system prompt so Claude knows which
@@ -784,6 +833,40 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
   }
 
   /**
+   * Live tool info derived from a single `client.tool.list()` fetch:
+   *
+   * - `taskDescription`: opencode's `task` tool description exactly as the
+   *   registry renders it for native models, including the "Available
+   *   agent types" list. Overlaid onto the static `task` proxy def so
+   *   Claude sees the same subagent catalog native models see, instead
+   *   of hunting through config files.
+   * - `questionDescription` / `hasQuestion`: opencode's `question` tool
+   *   description and whether the registry has the entry at all. Older
+   *   builds lack it, in which case a `mcp__opencode_proxy__question`
+   *   call resolves to `⚙ invalid`; the version gate drops the def.
+   *
+   * Returns undefined/false when the SDK client is unavailable (direct
+   * AI-SDK use, tests) so the static defs stand.
+   */
+  private async fetchLiveToolInfo(): Promise<{
+    taskDescription: string | undefined
+    questionDescription: string | undefined
+    hasQuestion: boolean
+  }> {
+    const items = await fetchOpencodeToolList(
+      this.config.provider,
+      this.modelId,
+      this.config.cwd,
+    )
+    const question = items?.find((item) => item.id === "question")
+    return {
+      taskDescription: items?.find((item) => item.id === "task")?.description,
+      questionDescription: question?.description,
+      hasQuestion: !!question,
+    }
+  }
+
+  /**
    * Create a proxy MCP server for a single active Claude process/session.
    * The process lifecycle owns the server lifecycle via session-manager.
    */
@@ -791,11 +874,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     tools: ProxyToolDef[],
     sessionKeyForCalls: string,
   ): Promise<ProxyMcpServer> {
-    const srv = await createProxyMcpServer(tools, {
-      toolTimeoutMs: this.config.proxyToolTimeoutMs,
-    })
+    const timeoutOverrides = this.config.proxyToolTimeoutMs
+    const srv = await createProxyMcpServer(tools, timeoutOverrides)
     srv.calls.on("call", (call: ProxyToolCall) => {
-      queuePendingProxyCall(sessionKeyForCalls, call)
+      queuePendingProxyCall(sessionKeyForCalls, call, timeoutOverrides)
     })
     return srv
   }
@@ -1846,34 +1928,41 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         let activeProcess = getActiveProcess(sk)
         let proc: import("child_process").ChildProcess
         let lineEmitter: import("events").EventEmitter
+        let cliArgs: string[]
         let proxyServer: ProxyMcpServer | null = activeProcess?.proxyServer ?? null
 
-        // Hot reload: evict cached subprocess if the bridged opencode MCP
-        // config has drifted since spawn. Only checked between turns (here,
-        // before setup() runs), never mid tool-call. The stored claude
-        // session id is preserved so the respawn resumes the conversation
-        // via `--session-id` (handled by buildCliArgs).
-        if (
-          !compactionMode &&
-          activeProcess &&
-          self.config.hotReloadMcp !== false &&
-          self.config.bridgeOpencodeMcp !== false
-        ) {
-          const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
-          const previousHash = activeProcess.mcpHash ?? null
-          if (previousHash !== probe.bridgedHash) {
-            log.info("opencode MCP config changed, respawning claude", {
-              sk,
-              previousHash,
-              currentHash: probe.bridgedHash,
-            })
-            deleteActiveProcess(sk)
-            activeProcess = undefined
-            proxyServer = null
-          }
-        }
-
         const setup = async () => {
+          // Wait for the old owner to exit before resuming its session ID in
+          // the replacement, so two processes never append to one transcript.
+          if (
+            !compactionMode &&
+            activeProcess &&
+            self.config.hotReloadMcp !== false &&
+            self.config.bridgeOpencodeMcp !== false
+          ) {
+            const probe = self.effectiveMcpConfig(cwd, undefined, runtimeStatus!)
+            const previousHash = activeProcess.mcpHash ?? null
+            if (previousHash !== probe.bridgedHash) {
+              if (previousPendingProxyCalls.length > 0) {
+                log.info("deferring MCP hot reload until proxy calls resolve", {
+                  sk,
+                  previousHash,
+                  currentHash: probe.bridgedHash,
+                  pendingCalls: previousPendingProxyCalls.length,
+                })
+              } else {
+                log.info("opencode MCP config changed, respawning claude", {
+                  sk,
+                  previousHash,
+                  currentHash: probe.bridgedHash,
+                })
+                await deleteActiveProcessAndWait(sk)
+                activeProcess = undefined
+                proxyServer = null
+              }
+            }
+          }
+
           if (useInteractive && !compactionMode) {
             // Interactive Bun-ConPTY transport. Reuse the live session if one
             // exists for this key; else spawn a new interactive claude. The
@@ -1943,7 +2032,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
             }
           } else {
-          let cliArgs: string[]
           let spawnSystemPromptFile: string | undefined
           let spawnProxyServer: ProxyMcpServer | null = null
           let spawnMcpHash: string | null = null
@@ -1953,7 +2041,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // appended system prompt, no disallowed-tools list. The model
             // is asked for text output only on a single turn — all the
             // normal tool wiring is pure overhead and adds latency.
-            // Explicitly opt out of `--session-id` so a stale id can never
+            // Explicitly opt out of `--resume` so a stale id can never
             // resume into the lean spawn.
             cliArgs = buildCliArgs({
               sessionKey: sk,
@@ -1985,16 +2073,105 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               ? new Set(discovery.allEnabledServerNames)
               : undefined
 
+            // Overlay opencode's live tool info onto the static proxy defs.
+            // Both the `task` description (with the "Available agent types"
+            // list, so the model sees which subagents exist instead of
+            // grepping configs) and the `question` version gate (older
+            // opencode builds lack the `question` registry entry; the def
+            // must be dropped or a forwarded call renders `⚙ invalid`)
+            // derive from a single tool-list fetch. Spawn-time only, like
+            // the rest of this block; a reused process keeps its defs.
+            const taskProxyEnabled =
+              resolvedProxy?.some((t) => t.name === "task") ?? false
+            const questionProxyEnabled =
+              resolvedProxy?.some((t) => t.name === "question") ?? false
+            const liveToolInfo =
+              taskProxyEnabled || questionProxyEnabled
+                ? await self.fetchLiveToolInfo()
+                : {
+                    taskDescription: undefined,
+                    questionDescription: undefined,
+                    hasQuestion: false,
+                  }
+            let enrichedProxy = resolvedProxy
+            if (enrichedProxy && taskProxyEnabled) {
+              enrichedProxy = overlayTaskProxyDescription(
+                enrichedProxy,
+                liveToolInfo.taskDescription,
+              )
+              // Whether the model will see opencode's agent list is the
+              // difference between a dispatch and an "Unknown agent type"
+              // guess, so say so out loud.
+              log.info("task proxy description overlay", {
+                applied: Boolean(liveToolInfo.taskDescription),
+                liveDescriptionLength: liveToolInfo.taskDescription?.length ?? 0,
+                listsAgentTypes: Boolean(
+                  liveToolInfo.taskDescription?.includes(
+                    "Available agent types",
+                  ),
+                ),
+              })
+            }
+            if (enrichedProxy && questionProxyEnabled) {
+              // When the version gate is about to drop the def
+              // (`hasQuestion === false`) the live description is moot,
+              // so only overlay when the entry actually exists.
+              enrichedProxy = overlayQuestionProxyDescription(
+                enrichedProxy,
+                liveToolInfo.hasQuestion
+                  ? liveToolInfo.questionDescription
+                  : undefined,
+              )
+              enrichedProxy = filterQuestionProxyByOpencodeSupport(
+                enrichedProxy,
+                liveToolInfo.hasQuestion,
+              )
+              // Same reasoning as the task overlay log: when the gate drops
+              // the def the model silently falls back to the deny/markdown
+              // path, which looks from the outside like the feature is off.
+              log.info("question proxy version gate", {
+                opencodeHasQuestion: liveToolInfo.hasQuestion,
+                kept: liveToolInfo.hasQuestion,
+              })
+            }
+
+            // Combine the static proxy defs with any MCP-bridged proxy
+            // tools. Guard against the empty case: a version gate can
+            // drop every configured def (e.g. `proxyTools: ["Question"]`
+            // on an opencode build that lacks the `question` registry
+            // entry), and spinning up an MCP server with zero tools is
+            // wasteful and wrong shape.
+            const combinedList = [
+              ...(enrichedProxy ?? []),
+              ...(proxyMcpTools ?? []),
+            ]
             const combinedProxyTools: ProxyToolDef[] | null =
-              resolvedProxy || proxyMcpTools
-                ? [...(resolvedProxy ?? []), ...(proxyMcpTools ?? [])]
-                : null
+              combinedList.length > 0 ? combinedList : null
 
             if (!proxyServer && combinedProxyTools) {
               proxyServer = await self.ensureProxyServer(combinedProxyTools, sk)
             }
 
-            const proxyDisallowed = resolvedProxy ? disallowedToolFlags(resolvedProxy) : []
+            // Whether the question proxy actually survived the version
+            // gate (post-filter). Used to decide whether to inject the
+            // QUESTION_PROXY_HINT — if the gate dropped the def, the
+            // model must fall back to AskUserQuestion (the deny/markdown
+            // path) and must NOT be told to call a proxy tool that does
+            // not exist.
+            const questionProxyActive =
+              enrichedProxy?.some((t) => t.name === "question") ?? false
+
+            // Compute disallowed flags from the POST-FILTER proxy list
+            // (enrichedProxy), not the pre-filter one (resolvedProxy).
+            // When the version gate drops `question` on an older opencode
+            // build, AskUserQuestion must NOT be added to
+            // --disallowedTools — otherwise the native tool is disabled
+            // while the proxy replacement is absent, leaving the model
+            // with no way to ask questions at all (neither proxy nor the
+            // deny/markdown fallback path fires).
+            const proxyDisallowed = enrichedProxy
+              ? disallowedToolFlags(enrichedProxy)
+              : []
             const extraDisallowed: string[] = []
             if (self.config.webSearch === "disabled") extraDisallowed.push("WebSearch")
             const allDisallowed = [...proxyDisallowed, ...extraDisallowed]
@@ -2009,7 +2186,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               : buildAppendedSystemPrompt(
                   cwd,
                   self.config.multiStepContinuation !== false,
-                  extractSystemMessages(options.prompt),
+                  [
+                    ...extractSystemMessages(options.prompt),
+                    ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
+                    ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
+                  ],
                 )
             cliArgs = buildCliArgs({
               sessionKey: sk,
@@ -2079,6 +2260,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           let controllerClosed = false
           let pendingProxyUnsubscribe: (() => void) | null = null
           let resultFallbackTimer: ReturnType<typeof setTimeout> | null = null
+          let pendingResultCompletion: (() => void) | null = null
           let hasReceivedContent = false
           let visibleTextSinceContinue = ""
           let lastVisibleTextSinceContinue = ""
@@ -2119,6 +2301,111 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
               closeHandler()
             }, delayMs)
+          }
+
+          // Start watchdog: complementary to the inactivity watchdog above.
+          // That one only arms once content has arrived; this one covers the
+          // gap the other explicitly skips — a reused process that produces
+          // NO stdout at all after a fresh-turn envelope write. Seen after a
+          // very long proxy-blocked tool call resumed successfully (the child
+          // stays silent on stdout). On first fire we respawn the child with
+          // --session-id to resume the conversation transparently; on a
+          // second fire (respawn also silent) we end the turn cleanly so the
+          // next opencode turn spawns fresh. Tunable via env for reproduces.
+          const START_WATCHDOG_MS = (() => {
+            const env = process.env.CLAUDE_CODE_START_WATCHDOG_MS
+            const parsed = env ? Number.parseInt(env, 10) : NaN
+            return Number.isFinite(parsed) && parsed > 0 ? parsed : 90_000
+          })()
+          let startWatchdog: ReturnType<typeof setTimeout> | null = null
+          let respawnAttempted = false
+          const clearStartWatchdog = () => {
+            if (startWatchdog) {
+              clearTimeout(startWatchdog)
+              startWatchdog = null
+            }
+          }
+          const onStartWatchdogFire = () => {
+            startWatchdog = null
+            if (controllerClosed || hasReceivedContent) return
+            if (respawnAttempted) {
+              log.error(
+                "claude process still silent after respawn; ending turn",
+                { sessionKey: sk },
+              )
+              deleteActiveProcess(sk)
+              deleteClaudeSessionId(sk)
+              controllerClosed = true
+              cleanupTurn()
+              controller.enqueue({
+                type: "error",
+                error: new Error(
+                  "Claude process produced no output after the envelope write (start watchdog timeout).",
+                ),
+              })
+              try {
+                controller.close()
+              } catch {}
+              return
+            }
+            respawnAttempted = true
+            log.warn(
+              "no stdout after envelope write; respawning claude process to resume conversation",
+              { sessionKey: sk, startWatchdogMs: START_WATCHDOG_MS },
+            )
+            lineEmitter.off("line", lineHandler)
+            lineEmitter.off("close", closeHandler)
+            proc.off("error", procErrorHandler)
+            const newAp = respawnActiveProcess(
+              sk,
+              cliPath,
+              cliArgs,
+              cwd,
+              self.config.ignoreAnthropicApiKey,
+            )
+            if (!newAp) {
+              log.error(
+                "no active process to respawn (start watchdog); ending turn",
+                { sessionKey: sk },
+              )
+              controllerClosed = true
+              cleanupTurn()
+              controller.enqueue({
+                type: "error",
+                error: new Error(
+                  "No active claude process to respawn after start watchdog timeout.",
+                ),
+              })
+              try {
+                controller.close()
+              } catch {}
+              return
+            }
+            proc = newAp.proc
+            lineEmitter = newAp.lineEmitter
+            activeProcess = newAp
+            lineEmitter.on("line", lineHandler)
+            lineEmitter.on("close", closeHandler)
+            proc.on("error", procErrorHandler)
+            try {
+              proc.stdin?.write(userMsg + "\n")
+              log.debug("re-sent user message after respawn", {
+                textLength: userMsg.length,
+              })
+            } catch (err) {
+              log.error("failed to re-send envelope after respawn", {
+                error: err instanceof Error ? err.message : String(err),
+              })
+            }
+            startWatchdog = setTimeout(
+              onStartWatchdogFire,
+              START_WATCHDOG_MS,
+            )
+          }
+          const armStartWatchdog = () => {
+            clearStartWatchdog()
+            if (controllerClosed) return
+            startWatchdog = setTimeout(onStartWatchdogFire, START_WATCHDOG_MS)
           }
 
           const toolCallMap = new Map<
@@ -2199,6 +2486,34 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           finishWithToolCalls(batch)
         }
 
+        const settleResultBoundary = () => {
+          drainTimer = null
+          const completeResult = pendingResultCompletion
+          pendingResultCompletion = null
+          if (!completeResult || controllerClosed) return
+          if (drainBuffer.length > 0) {
+            drainNow()
+            return
+          }
+          completeResult()
+        }
+
+        const scheduleResultBoundary = (
+          completeResult: () => void,
+          delayMs: number,
+        ) => {
+          pendingResultCompletion = completeResult
+          if (drainTimer) clearTimeout(drainTimer)
+          drainTimer = setTimeout(settleResultBoundary, delayMs)
+        }
+
+        const noteResultBoundaryCall = (): boolean => {
+          if (!pendingResultCompletion) return false
+          if (drainTimer) clearTimeout(drainTimer)
+          drainTimer = setTimeout(settleResultBoundary, DRAIN_QUIET_MS)
+          return true
+        }
+
         const noteVisibleText = (text: string) => {
           visibleTextSinceContinue += text
           lastVisibleTextSinceContinue += text
@@ -2229,6 +2544,114 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           lastStopReason = null
         }
 
+        const completeResult = (msg: ClaudeStreamMessage) => {
+          if (controllerClosed) return
+          if (drainBuffer.length > 0) {
+            drainNow()
+            return
+          }
+
+          const pendingSiblings = getPendingProxyCalls(sk)
+          if (pendingSiblings.length > 0) {
+            log.info("leaving parallel proxy calls pending at result boundary", {
+              sessionKey: sk,
+              count: pendingSiblings.length,
+            })
+          }
+
+          const autoDecision = shouldAutoContinueIncompleteTurn(
+            autoContinueState,
+            {
+              text: visibleTextSinceContinue,
+              lastVisibleText: lastVisibleTextSinceContinue,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+              isError: msg.is_error,
+              stopReason: lastStopReason,
+            },
+          )
+          if (autoDecision.continue) {
+            const signature = continuationSignature({
+              text: visibleTextSinceContinue,
+              lastVisibleText: lastVisibleTextSinceContinue,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+              isError: msg.is_error,
+            })
+            autoContinueState.noProgressCount =
+              signature === autoContinueState.lastSignature
+                ? autoContinueState.noProgressCount + 1
+                : 0
+            autoContinueState.lastSignature = signature
+            autoContinueState.attempts++
+            log.notice("auto-continuing incomplete claude result", {
+              sessionKey: sk,
+              reason: autoDecision.reason,
+              attempts: autoContinueState.attempts,
+              textLength: visibleTextSinceContinue.length,
+              lastTextLength: lastVisibleTextSinceContinue.length,
+              hadReasoning: hadReasoningSinceContinue,
+              hadToolActivity: hadToolActivitySinceContinue,
+              hadProxyActivity: hadProxyActivitySinceContinue,
+            })
+            turnCompleted = false
+            resetAutoContinueWindow()
+            proc.stdin?.write(makeAutoContinueMessage() + "\n")
+            return
+          }
+          log.notice("auto-continuation stopped", {
+            sessionKey: sk,
+            reason: autoDecision.reason,
+            stopReason: lastStopReason,
+            attempts: autoContinueState.attempts,
+            textLength: visibleTextSinceContinue.length,
+            lastTextLength: lastVisibleTextSinceContinue.length,
+            hadReasoning: hadReasoningSinceContinue,
+            hadToolActivity: hadToolActivitySinceContinue,
+            hadProxyActivity: hadProxyActivitySinceContinue,
+          })
+
+          for (const [idx, reasoningId] of reasoningIds) {
+            if (reasoningStarted.get(idx)) {
+              controller.enqueue({
+                type: "reasoning-end",
+                id: reasoningId,
+              } as any)
+            }
+          }
+
+          controller.enqueue({
+            type: "finish",
+            finishReason: toFinishReason("stop"),
+            usage: toUsage(msg.usage),
+            providerMetadata: {
+              "claude-code": {
+                ...resultMeta,
+                ...(compactionMode
+                  ? { compactionModel: effectiveModelId }
+                  : {}),
+              },
+              ...(typeof msg.usage?.cache_creation_input_tokens === "number"
+                ? {
+                    anthropic: {
+                      cacheCreationInputTokens:
+                        msg.usage.cache_creation_input_tokens,
+                    },
+                  }
+                : {}),
+            },
+          })
+
+          controllerClosed = true
+          cleanupTurn()
+
+          try {
+            controller.close()
+          } catch {}
+        }
+
         // Set true once we observe a `stream_event` envelope. When on, the
         // top-level `assistant` message is a duplicate of what we already
         // streamed via content_block_* deltas — skip its content.
@@ -2241,6 +2664,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           // Any line from the CLI counts as activity — reset the inactivity
           // watchdog so mid-turn pauses between blocks don't get killed.
           startResultFallback()
+          // First stdout line means the child is alive and responding —
+          // disarm the start watchdog (covers the "no output at all" gap).
+          clearStartWatchdog()
 
           try {
             const outer: ClaudeStreamMessage = JSON.parse(line)
@@ -2490,6 +2916,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   })
                   endTextBlock()
                 } else if (tc.name.startsWith(PROXY_TOOL_PREFIX)) {
+                  noteProxyActivity()
                   log.debug("ignoring proxy tool_use block; broker handles it", {
                     name: tc.name,
                     id: tc.id,
@@ -2701,6 +3128,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     })
                     endTextBlock()
                   } else if (block.name.startsWith(PROXY_TOOL_PREFIX)) {
+                    noteProxyActivity()
                     log.debug("ignoring proxy tool_use from assistant message", {
                       name: block.name,
                       id: block.id,
@@ -2885,135 +3313,46 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
               endTextBlock()
 
-              // Drain race / abandoned-call guard. If Claude CLI emitted
-              // `result` while a proxy tool call is still pending — either
-              // because the 100ms drain timer hasn't fired yet, or because
-              // Claude CLI gave up on its MCP HTTP request after an internal
-              // timeout — drain it through the normal tool-calls flow so
-              // opencode executes the tool; otherwise reject any orphan
-              // pending calls so proxy-mcp returns to the HTTP caller
-              // immediately instead of hanging until the broker's 10-minute
-              // timeout (which surfaces as a hard 2-minute "operation timed
-              // out" on the SDK side).
-              if (drainBuffer.length > 0) {
+              const shouldDeferResult =
+                !msg.is_error &&
+                !autoContinueState.aborted &&
+                !autoContinueState.sawAskUserQuestion
+
+              if (drainBuffer.length > 0 && shouldDeferResult) {
                 log.info(
-                  "draining pending proxy calls at turn-result boundary",
+                  "waiting for parallel proxy calls at turn-result boundary",
                   {
                     sessionKey: sk,
                     count: drainBuffer.length,
                   },
                 )
-                drainNow()
+                scheduleResultBoundary(
+                  () => completeResult(msg),
+                  DRAIN_QUIET_MS,
+                )
                 return
               }
-              const orphanPending = getPendingProxyCalls(sk)
-              if (orphanPending.length > 0) {
-                log.warn(
-                  "rejecting orphan pending proxy calls at turn-result boundary",
+
+              if (
+                drainBuffer.length === 0 &&
+                hadProxyActivitySinceContinue &&
+                shouldDeferResult
+              ) {
+                log.info(
+                  "waiting for delayed proxy call at turn-result boundary",
                   {
                     sessionKey: sk,
-                    count: orphanPending.length,
+                    graceMs: PROXY_RESULT_BOUNDARY_GRACE_MS,
                   },
                 )
-                rejectAllPendingProxyCallsForSession(
-                  sk,
-                  new Error(
-                    "Claude CLI emitted result with pending proxy calls not in drain buffer",
-                  ),
+                scheduleResultBoundary(
+                  () => completeResult(msg),
+                  PROXY_RESULT_BOUNDARY_GRACE_MS,
                 )
-              }
-
-              const autoDecision = shouldAutoContinueIncompleteTurn(
-                autoContinueState,
-                {
-                  text: visibleTextSinceContinue,
-                  lastVisibleText: lastVisibleTextSinceContinue,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                  isError: msg.is_error,
-                  stopReason: lastStopReason,
-                },
-              )
-              if (autoDecision.continue) {
-                const signature = continuationSignature({
-                  text: visibleTextSinceContinue,
-                  lastVisibleText: lastVisibleTextSinceContinue,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                  isError: msg.is_error,
-                })
-                autoContinueState.noProgressCount =
-                  signature === autoContinueState.lastSignature
-                    ? autoContinueState.noProgressCount + 1
-                    : 0
-                autoContinueState.lastSignature = signature
-                autoContinueState.attempts++
-                log.notice("auto-continuing incomplete claude result", {
-                  sessionKey: sk,
-                  reason: autoDecision.reason,
-                  attempts: autoContinueState.attempts,
-                  textLength: visibleTextSinceContinue.length,
-                  lastTextLength: lastVisibleTextSinceContinue.length,
-                  hadReasoning: hadReasoningSinceContinue,
-                  hadToolActivity: hadToolActivitySinceContinue,
-                  hadProxyActivity: hadProxyActivitySinceContinue,
-                })
-                turnCompleted = false
-                resetAutoContinueWindow()
-                proc.stdin?.write(makeAutoContinueMessage() + "\n")
                 return
               }
-              log.notice("auto-continuation stopped", {
-                sessionKey: sk,
-                reason: autoDecision.reason,
-                stopReason: lastStopReason,
-                attempts: autoContinueState.attempts,
-                textLength: visibleTextSinceContinue.length,
-                lastTextLength: lastVisibleTextSinceContinue.length,
-                hadReasoning: hadReasoningSinceContinue,
-                hadToolActivity: hadToolActivitySinceContinue,
-                hadProxyActivity: hadProxyActivitySinceContinue,
-              })
 
-              for (const [idx, reasoningId] of reasoningIds) {
-                if (reasoningStarted.get(idx)) {
-                  controller.enqueue({
-                    type: "reasoning-end",
-                    id: reasoningId,
-                  } as any)
-                }
-              }
-
-              controller.enqueue({
-                type: "finish",
-                finishReason: toFinishReason("stop"),
-                usage: toUsage(msg.usage),
-                providerMetadata: {
-                  "claude-code": {
-                    ...resultMeta,
-                    ...(compactionMode
-                      ? { compactionModel: effectiveModelId }
-                      : {}),
-                  },
-                  ...(typeof msg.usage?.cache_creation_input_tokens === "number"
-                    ? {
-                        anthropic: {
-                          cacheCreationInputTokens:
-                            msg.usage.cache_creation_input_tokens,
-                        },
-                      }
-                    : {}),
-                },
-              })
-
-              controllerClosed = true
-              cleanupTurn()
-
-              try {
-                controller.close()
-              } catch {}
+              completeResult(msg)
             }
           } catch (e) {
             log.debug("failed to parse line", {
@@ -3066,6 +3405,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           if (cleanedUp) return
           cleanedUp = true
           clearFallbackTimer()
+          pendingResultCompletion = null
+          clearStartWatchdog()
           if (drainTimer) {
             clearTimeout(drainTimer)
             drainTimer = null
@@ -3134,6 +3475,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           noteProxyActivity()
           noteToolActivity()
           drainBuffer.push(call)
+          if (noteResultBoundaryCall()) return
           if (drainTimer) clearTimeout(drainTimer)
           drainTimer = setTimeout(drainNow, DRAIN_QUIET_MS)
         })
@@ -3151,6 +3493,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 "abort signal received before content, closing stream immediately",
                 { cwd },
               )
+              if (
+                drainBuffer.length > 0 ||
+                getPendingProxyCalls(sk).length > 0
+              ) {
+                rejectAllPendingProxyCallsForSession(
+                  sk,
+                  new Error(
+                    "Provider stream was aborted before pending proxy calls were emitted",
+                  ),
+                )
+                drainBuffer.length = 0
+              }
               controllerClosed = true
               cleanupTurn()
               try {
@@ -3172,9 +3526,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           // Tool-result turn: the prompt carries opencode's results for the
           // proxy tool calls we drained on the previous turn. Resolve each
           // matched call (claude CLI's HTTP handlers wake up and continue).
-          // Any pending calls without a matching tool-result are orphans
-          // (rare protocol anomaly); reject them so claude CLI doesn't hang
-          // on those HTTP requests.
+          // Parallel tools may complete in separate opencode turns. Keep
+          // unmatched siblings pending until their own result, an explicit
+          // abort/new user turn, or the proxy deadline.
           for (const { call, result } of previousPendingProxyMatches) {
             if (result) {
               log.info("resolving pending proxy call from tool result prompt", {
@@ -3184,19 +3538,13 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               })
               resolvePendingProxyCallById(call.toolCallId, result)
             } else {
-              log.notice(
-                "pending proxy call had no matching tool-result; rejecting as orphan",
+              log.info(
+                "leaving unmatched parallel proxy call pending",
                 {
                   sessionKey: sk,
                   toolCallId: call.toolCallId,
                   toolName: call.toolName,
                 },
-              )
-              rejectPendingProxyCallById(
-                call.toolCallId,
-                new Error(
-                  `Pending proxy call '${call.toolName}' (${call.toolCallId}) was not matched in tool-result turn; rejecting as orphaned`,
-                ),
               )
             }
           }
@@ -3221,6 +3569,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         // Send the user message for a fresh turn.
         proc.stdin?.write(userMsg + "\n")
         log.debug("sent user message", { textLength: userMsg.length })
+        // Arm the start watchdog so a reused child that goes silent after
+        // the envelope write (seen after a long proxy-blocked tool call)
+        // is respawned with --session-id instead of hanging the turn.
+        armStartWatchdog()
         }
 
         void setup().catch((err) => {

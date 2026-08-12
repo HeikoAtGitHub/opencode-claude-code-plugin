@@ -1,6 +1,6 @@
 {
   "name": "@khalilgharbaoui/opencode-claude-code-plugin",
-  "version": "0.9.2",
+  "version": "0.12.0",
   "description": "Claude Code CLI provider plugin for opencode",
   "author": "Khalil Gharbaoui",
   "type": "module",
@@ -20,11 +20,12 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test-bridge.ts test-broker.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-compaction-model.ts test-tool-mapping.ts test-proxy-mcp.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts"
+    "test": "tsx --test test-bridge.ts test-broker.ts test-proxy-mcp.ts test-proxy-task.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-session-manager.ts test-compaction-model.ts test-tool-mapping.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts test-respawn.ts test-startup-diagnostics.ts test-subagent-hint.ts"
   },
   "dependencies": {
     "@ai-sdk/provider": "^3.0.8",
-    "@ai-sdk/provider-utils": "^3.0.8"
+    "@ai-sdk/provider-utils": "^3.0.8",
+    "jsonc-parser": "3.3.1"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",

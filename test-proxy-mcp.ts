@@ -1,148 +1,499 @@
+/**
+ * Integration tests for src/proxy-mcp.ts — the in-process MCP HTTP server.
+ *
+ * These stand up a real `createProxyMcpServer` on an ephemeral port and
+ * drive it over plain HTTP, so they exercise the actual JSON-RPC framing
+ * (including the catch-block error envelope).
+ *
+ * Usage:
+ *   npx tsx --test test-proxy-mcp.ts
+ */
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import * as http from "node:http"
 import {
   createProxyMcpServer,
+  buildProxyTimeoutError,
+  resolveProxyCallTimeoutMs,
+  resolveProxyClientCeilingMs,
+  overlayQuestionProxyDescription,
+  filterQuestionProxyByOpencodeSupport,
   DEFAULT_PROXY_TOOLS,
-  resolveProxyToolTimeoutMs,
+  PROXY_DEFAULT_TIMEOUT_MS,
+  MAX_PROXY_TIMEOUT_MS,
+  type ProxyMcpServer,
+  type ProxyToolCall,
+  type ProxyToolResult,
 } from "./src/proxy-mcp.js"
 
-test("DEFAULT_PROXY_TOOLS includes Plannotator submit_plan proxy schema", () => {
-  const submitPlan = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "submit_plan")
+function post(url: string, body: unknown): Promise<{
+  status: number
+  json: any
+}> {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body)
+    const req = http.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload).toString(),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = []
+        res.on("data", (c: Buffer) => chunks.push(c))
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8")
+          try {
+            const json = res.headers["content-type"]?.includes("text/event-stream")
+              ? JSON.parse(
+                  text
+                    .split("\n")
+                    .filter((line) => line.startsWith("data:"))
+                    .at(-1)!
+                    .slice(5)
+                    .trim(),
+                )
+              : JSON.parse(text)
+            resolve({ status: res.statusCode ?? 0, json })
+          } catch {
+            resolve({ status: res.statusCode ?? 0, json: text })
+          }
+        })
+      },
+    )
+    req.on("error", reject)
+    req.write(payload)
+    req.end()
+  })
+}
 
-  assert.ok(submitPlan, "submit_plan proxy tool should be registered")
-  assert.match(submitPlan.description, /Plannotator submit_plan/)
-
-  const schema = submitPlan.inputSchema as any
-  assert.equal(schema.type, "object")
-  assert.deepEqual(schema.required, ["edits"])
-
-  const edits = schema.properties?.edits
-  assert.equal(edits?.type, "array")
-  assert.deepEqual(edits?.items?.required, ["start", "content"])
-  assert.equal(edits?.items?.properties?.start?.type, "number")
-  assert.equal(edits?.items?.properties?.end?.type, "number")
-  assert.equal(edits?.items?.properties?.content?.type, "string")
-})
-
-test("proxy MCP server lists and dispatches submit_plan", async () => {
+test("submit_plan proxy has schema and 24-hour deadline", () => {
   const submitPlan = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "submit_plan")
   assert.ok(submitPlan)
+  assert.match(submitPlan.description, /Plannotator submit_plan/)
+  const schema = submitPlan.inputSchema as any
+  assert.deepEqual(schema.required, ["edits"])
+  assert.deepEqual(schema.properties.edits.items.required, ["start", "content"])
+  assert.equal(
+    resolveProxyCallTimeoutMs("submit_plan", undefined, undefined),
+    24 * 60 * 60 * 1000,
+  )
+  assert.equal(resolveProxyClientCeilingMs(undefined), 24 * 60 * 60 * 1000)
+})
 
+test("submit_plan dispatches through proxy as an MCP result", async () => {
+  const submitPlan = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "submit_plan")
+  assert.ok(submitPlan)
   const srv = await createProxyMcpServer([submitPlan])
   try {
-    const list = await rpc(srv.url, "tools/list", {})
-    assert.deepEqual(
-      list.result.tools.map((tool: any) => tool.name),
-      ["submit_plan"],
-    )
+    srv.calls.once("call", (call: ProxyToolCall) => {
+      assert.equal(call.toolName, "submit_plan")
+      call.resolve({ kind: "text", text: "approved-by-test" })
+    })
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "submit-plan-1",
+      method: "tools/call",
+      params: { name: "submit_plan", arguments: { edits: [{ start: 1, content: "# Plan" }] } },
+    })
+    assert.equal(res.json.id, "submit-plan-1")
+    assert.equal(res.json.result.isError, false)
+    assert.equal(res.json.result.content[0].text, "approved-by-test")
+  } finally {
+    await srv.close()
+  }
+})
 
-    const seen = new Promise<any>((resolve) => {
-      srv.calls.once("call", (call) => {
-        call.resolve({ kind: "text", text: "approved-by-test" })
-        resolve(call)
-      })
+async function withServer<T>(
+  fn: (srv: ProxyMcpServer) => Promise<T>,
+): Promise<T> {
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS)
+  try {
+    return await fn(srv)
+  } finally {
+    await srv.close()
+  }
+}
+
+// Regression for the 2026-07-04 "malformed result that failed schema
+// validation" bug: Claude CLI validates tools/call responses against the
+// MCP result schema and rejects JSON-RPC error envelopes. Every tools/call
+// error path (broker rejection, error result, unknown tool) must return
+// an MCP result with `isError: true`, and must echo the request id.
+test("tools/call broker rejection returns an MCP result with isError, echoing the id", async () => {
+  await withServer(async (srv) => {
+    // Reject every incoming call immediately, simulating a broker
+    // rejection (the same path a 10-min timeout takes).
+    srv.calls.on("call", (call: ProxyToolCall) => {
+      call.reject(new Error("simulated broker rejection"))
     })
 
-    const callPromise = rpc(srv.url, "tools/call", {
-      name: "submit_plan",
-      arguments: {
-        edits: [{ start: 1, content: "# Smoke Plan" }],
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: 42,
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "echo hi" } },
+    })
+
+    assert.equal(res.status, 200)
+    assert.equal(res.json.jsonrpc, "2.0")
+    assert.equal(res.json.id, 42, "response must echo the request id")
+    assert.equal(res.json.error, undefined, "must not be a JSON-RPC error envelope")
+    assert.ok(res.json.result, "expected an MCP result envelope")
+    assert.equal(res.json.result.isError, true)
+    assert.match(
+      res.json.result.content[0].text,
+      /simulated broker rejection/,
+    )
+  })
+})
+
+test("tools/call with kind:error result returns an MCP result with isError", async () => {
+  await withServer(async (srv) => {
+    srv.calls.on("call", (call: ProxyToolCall) => {
+      const result: ProxyToolResult = {
+        kind: "error",
+        message: "opencode tool execution failed",
+      }
+      call.resolve(result)
+    })
+
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "req-7",
+      method: "tools/call",
+      params: { name: "bash", arguments: {} },
+    })
+
+    assert.equal(res.json.id, "req-7")
+    assert.equal(res.json.error, undefined)
+    assert.equal(res.json.result.isError, true)
+    assert.match(
+      res.json.result.content[0].text,
+      /opencode tool execution failed/,
+    )
+  })
+})
+
+test("tools/call for an unknown tool returns an MCP result with isError", async () => {
+  await withServer(async (srv) => {
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: 99,
+      method: "tools/call",
+      params: { name: "nonexistent_tool", arguments: {} },
+    })
+    assert.equal(res.json.id, 99)
+    assert.equal(res.json.error, undefined)
+    assert.equal(res.json.result.isError, true)
+    assert.match(res.json.result.content[0].text, /Unknown proxy tool/)
+  })
+})
+
+test("tools/call success preserves isError:false and the result text", async () => {
+  await withServer(async (srv) => {
+    srv.calls.on("call", (call: ProxyToolCall) => {
+      call.resolve({ kind: "text", text: "done" })
+    })
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "bash", arguments: {} },
+    })
+    assert.equal(res.json.result.isError, false)
+    assert.equal(res.json.result.content[0].text, "done")
+  })
+})
+
+test("malformed JSON still responds (with null id when unparseable)", async () => {
+  await withServer(async (srv) => {
+    // Send invalid JSON so parsing throws before requestId is set.
+    const res = await new Promise<{
+      status: number
+      json: any
+    }>((resolve, reject) => {
+      const req = http.request(
+        srv.url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength("{not json").toString(),
+          },
+        },
+        (r) => {
+          const chunks: Buffer[] = []
+          r.on("data", (c: Buffer) => chunks.push(c))
+          r.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8")
+            try {
+              resolve({ status: r.statusCode ?? 0, json: JSON.parse(text) })
+            } catch {
+              resolve({ status: r.statusCode ?? 0, json: text })
+            }
+          })
+        },
+      )
+      req.on("error", reject)
+      req.write("{not json")
+      req.end()
+    })
+
+    // When the body never parsed, null id is the only honest answer and
+    // is correct JSON-RPC (no request id was ever seen).
+    assert.equal(res.json.id, null)
+    assert.ok(res.json.error)
+  })
+})
+
+test("tools/list exposes the default proxy defs", async () => {
+  await withServer(async (srv) => {
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+    })
+    const names = res.json.result.tools.map((t: any) => t.name)
+    assert.ok(names.includes("question"))
+    assert.ok(names.includes("task"))
+    assert.ok(names.includes("bash"))
+  })
+})
+
+// --- per-tool proxy timeouts ------------------------------------------------
+
+const MIN = 60 * 1000
+
+test("resolveProxyCallTimeoutMs: unknown tool uses the flat 10-min default", () => {
+  assert.equal(
+    resolveProxyCallTimeoutMs("edit", undefined, undefined),
+    PROXY_DEFAULT_TIMEOUT_MS,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: task defaults to 60 min", () => {
+  assert.equal(resolveProxyCallTimeoutMs("task", undefined, undefined), 60 * MIN)
+})
+
+test("resolveProxyClientCeilingMs covers the largest deadline", () => {
+  // No overrides: ceiling is the biggest per-tool default (submit_plan, 24 h).
+  assert.equal(resolveProxyClientCeilingMs(undefined), 24 * 60 * MIN)
+  // Overrides above the defaults raise the ceiling so Claude's HTTP MCP
+  // client never aborts before the broker deadline fires.
+  assert.equal(resolveProxyClientCeilingMs({ task: 90 * MIN }), 24 * 60 * MIN)
+  // Overrides below the defaults do not lower it.
+  assert.equal(resolveProxyClientCeilingMs({ bash: 1 * MIN }), 24 * 60 * MIN)
+  // Absurd values are clamped to Node's timer max.
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 2 ** 40 }),
+    MAX_PROXY_TIMEOUT_MS,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: user override replaces the default", () => {
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: 5 * MIN }),
+    5 * MIN,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: override key is case-insensitive", () => {
+  // Users configure proxyTools with capitalised names ("Task", "Bash"); the
+  // override map must match regardless of case.
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { Task: 7 * MIN }),
+    7 * MIN,
+  )
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", undefined, { Bash: 9 * MIN }),
+    9 * MIN,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: bash input.timeout only ever raises", () => {
+  // The bash proxy def advertises a `timeout` field; the proxy must not
+  // undercut a build the caller explicitly asked to run long.
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", { timeout: 25 * MIN }, undefined),
+    25 * MIN,
+  )
+  // A smaller input.timeout never lowers the resolved deadline.
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", { timeout: 1000 }, { bash: 5 * MIN }),
+    5 * MIN,
+  )
+  // And it raises above an override too.
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", { timeout: 12 * MIN }, { bash: 5 * MIN }),
+    12 * MIN,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: invalid overrides are ignored", () => {
+  // 0 / negative / NaN must not replace the default — a misformed config
+  // entry should never collapse the deadline.
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: 0 }),
+    60 * MIN,
+  )
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: -100 }),
+    60 * MIN,
+  )
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: NaN as any }),
+    60 * MIN,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: absurd values are clamped to Node's timer max", () => {
+  // Node setTimeout overflows past 2^31-1 ms (~24.85 days), firing at ~1ms.
+  // Both an override and a bash input.timeout above the cap must clamp.
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: 2 ** 33 }),
+    MAX_PROXY_TIMEOUT_MS,
+  )
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", { timeout: 2 ** 33 }, undefined),
+    MAX_PROXY_TIMEOUT_MS,
+  )
+})
+
+test("buildProxyTimeoutError: generic message keeps the catch-block substrings", () => {
+  // proxy-mcp's catch block classifies "timed out after" + "waiting for
+  // opencode to resolve" as expected cleanup (notice, not warn). The Task
+  // variant must keep both substrings too.
+  const generic = buildProxyTimeoutError("bash", 600000)
+  assert.match(generic.message, /timed out after 600000ms/)
+  assert.match(generic.message, /waiting for opencode to resolve/)
+  assert.doesNotMatch(generic.message, /wake-up/)
+})
+
+test("buildProxyTimeoutError: task message warns against scheduling a wake-up", () => {
+  const task = buildProxyTimeoutError("task", 3600000)
+  assert.match(task.message, /timed out after 3600000ms/)
+  assert.match(task.message, /waiting for opencode to resolve/)
+  assert.match(task.message, /may still be running/)
+  assert.match(task.message, /wake-up/)
+})
+
+test("buildProxyTimeoutError: task guidance is case-insensitive on the tool name", () => {
+  // Config / call sites use mixed casing ("Task"); the matcher lowercases.
+  const task = buildProxyTimeoutError("Task", 60000)
+  assert.match(task.message, /wake-up/)
+  // And a non-task tool with unusual casing stays generic.
+  const generic = buildProxyTimeoutError("BASH", 60000)
+  assert.doesNotMatch(generic.message, /wake-up/)
+})
+
+test("tools/call timeout uses the per-tool override and surfaces the task-specific text", async () => {
+  // Stand up a server with a tiny Task deadline and never resolve the call,
+  // so the proxy-mcp timer fires and we see the real error envelope that
+  // Claude would receive.
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS, { task: 50 })
+  try {
+    // Intentionally do NOT attach a calls listener — let the deadline fire.
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "timeout-1",
+      method: "tools/call",
+      params: {
+        name: "task",
+        arguments: { description: "x", subagent_type: "gpt", prompt: "y" },
       },
     })
-
-    const call = await seen
-    assert.equal(call.toolName, "submit_plan")
-    assert.deepEqual(call.input, {
-      edits: [{ start: 1, content: "# Smoke Plan" }],
-    })
-
-    const result = await callPromise
-    assert.deepEqual(result.result.content, [{ type: "text", text: "approved-by-test" }])
+    assert.equal(res.json.id, "timeout-1")
+    assert.equal(res.json.result.isError, true)
+    const text = res.json.result.content[0].text
+    assert.match(text, /timed out after 50ms/)
+    assert.match(text, /wake-up/)
   } finally {
     await srv.close()
   }
 })
 
-test("resolveProxyToolTimeoutMs uses long defaults for interactive tools", () => {
-  assert.equal(resolveProxyToolTimeoutMs("bash"), 10 * 60 * 1000)
-  assert.equal(resolveProxyToolTimeoutMs("task"), 30 * 60 * 1000)
-  assert.equal(resolveProxyToolTimeoutMs("submit_plan"), 24 * 60 * 60 * 1000)
-})
-
-test("resolveProxyToolTimeoutMs honors config and env precedence", () => {
-  const previousGlobal = process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS
-  const previousSubmit = process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS
+test("tools/call bash timeout honours input.timeout over a shorter override", async () => {
+  // Override says 40ms but the call asks for a 30s bash timeout — the
+  // effective deadline must be 30s, so the call must NOT time out within a
+  // short window. Resolve it ourselves to end the test promptly.
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS, { bash: 40 })
   try {
-    delete process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS
-    delete process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS
-
-    assert.equal(resolveProxyToolTimeoutMs("bash", 1234), 1234)
-    assert.equal(resolveProxyToolTimeoutMs("submit_plan", { submit_plan: 2345 }), 2345)
-
-    process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS = "3456"
-    assert.equal(resolveProxyToolTimeoutMs("bash", 1234), 3456)
-    assert.equal(resolveProxyToolTimeoutMs("webfetch"), 3456)
-
-    process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS = "4567"
-    assert.equal(resolveProxyToolTimeoutMs("submit_plan", { submit_plan: 2345 }), 4567)
-  } finally {
-    if (previousGlobal === undefined) delete process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS
-    else process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_MS = previousGlobal
-    if (previousSubmit === undefined) delete process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS
-    else process.env.OPENCODE_CLAUDE_CODE_PROXY_TIMEOUT_SUBMIT_PLAN_MS = previousSubmit
-  }
-})
-
-test("proxy MCP server passes resolved timeout into calls", async () => {
-  const submitPlan = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "submit_plan")
-  assert.ok(submitPlan)
-
-  const srv = await createProxyMcpServer([submitPlan], {
-    toolTimeoutMs: { submit_plan: 7890 },
-  })
-  try {
-    const seen = new Promise<any>((resolve) => {
-      srv.calls.once("call", (call) => {
-        call.resolve({ kind: "text", text: "approved-by-test" })
-        resolve(call)
-      })
+    let resolved = false
+    srv.calls.on("call", (call: ProxyToolCall) => {
+      // Defer resolution past the 40ms override deadline to prove the
+      // input.timeout (30s) is what governs.
+      setTimeout(() => {
+        resolved = true
+        call.resolve({ kind: "text", text: "built" })
+      }, 120)
     })
-
-    const callPromise = rpc(srv.url, "tools/call", {
-      name: "submit_plan",
-      arguments: { edits: [{ start: 1, content: "# Smoke Plan" }] },
+    const res = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "bash-1",
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "xcodebuild ...", timeout: 30000 } },
     })
-
-    const call = await seen
-    assert.equal(call.timeoutMs, 7890)
-    await callPromise
+    assert.equal(resolved, true, "call should resolve, not time out")
+    assert.equal(res.json.result.isError, false)
+    assert.equal(res.json.result.content[0].text, "built")
   } finally {
     await srv.close()
   }
 })
 
-async function rpc(url: string, method: string, params: Record<string, unknown>) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json, text/event-stream",
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-  })
-  assert.equal(response.status, 200)
-  const contentType = response.headers.get("content-type") ?? ""
-  if (contentType.includes("text/event-stream")) {
-    // tools/call now streams: zero or more progress notifications followed by
-    // the terminal JSON-RPC response, each as an SSE `data:` line. Return the
-    // response message (the one carrying an `id`).
-    const body = await response.text()
-    const messages = body
-      .split("\n")
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => JSON.parse(line.slice(5).trim()))
-    const final = [...messages].reverse().find((msg) => "id" in msg)
-    return (final ?? messages[messages.length - 1]) as any
-  }
-  return response.json() as Promise<any>
-}
+// --- question proxy: version gate + description overlay ---------------------
+
+test("question gets a 30-min default deadline (a human has to read the form)", () => {
+  assert.equal(
+    resolveProxyCallTimeoutMs("question", undefined, undefined),
+    30 * MIN,
+  )
+})
+
+test("resolveProxyClientCeilingMs covers the longest per-tool default", () => {
+  // The ceiling is written into Claude's --mcp-config entry; if it were
+  // below task's 60 min the client would abort before the broker resolved.
+  assert.ok(resolveProxyClientCeilingMs(undefined) >= 60 * MIN)
+})
+
+test("filterQuestionProxyByOpencodeSupport drops the def on older opencode", () => {
+  const tools = DEFAULT_PROXY_TOOLS
+  assert.ok(tools.some((t) => t.name === "question"))
+  const kept = filterQuestionProxyByOpencodeSupport(tools, true)
+  assert.ok(kept.some((t) => t.name === "question"))
+  const dropped = filterQuestionProxyByOpencodeSupport(tools, false)
+  assert.equal(
+    dropped.some((t) => t.name === "question"),
+    false,
+    "no registry entry means a forwarded call would render as invalid",
+  )
+  // Only `question` is gated; everything else survives untouched.
+  assert.ok(dropped.some((t) => t.name === "task"))
+  assert.ok(dropped.some((t) => t.name === "bash"))
+})
+
+test("overlayQuestionProxyDescription prefers opencode's live description", () => {
+  const overlaid = overlayQuestionProxyDescription(
+    DEFAULT_PROXY_TOOLS,
+    "LIVE question description from opencode",
+  )
+  const question = overlaid.find((t) => t.name === "question")
+  assert.ok(question)
+  assert.ok(question.description.startsWith("LIVE question description"))
+  // The disambiguation note must survive, it is what tells the model the
+  // built-in AskUserQuestion is disabled.
+  assert.ok(question.description.includes("AskUserQuestion is disabled"))
+})
+
+test("overlayQuestionProxyDescription is a no-op without a live description", () => {
+  const before = DEFAULT_PROXY_TOOLS.find((t) => t.name === "question")
+  const after = overlayQuestionProxyDescription(
+    DEFAULT_PROXY_TOOLS,
+    undefined,
+  ).find((t) => t.name === "question")
+  assert.equal(after?.description, before?.description)
+})

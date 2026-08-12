@@ -37,6 +37,8 @@ const claudeSessions = new Map<string, string>()
 // one-per-chat, so an unbounded map would leak processes as users open new
 // chats. This caps at a reasonable working-set and evicts the oldest.
 const MAX_ACTIVE_PROCESSES = 16
+const PROCESS_EXIT_TIMEOUT_MS = 1_500
+const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
 
 function envFlagEnabled(value: string | undefined): boolean {
   if (value === undefined) return false
@@ -114,13 +116,71 @@ export function setActiveProcess(key: string, ap: ActiveProcess): void {
   activeProcesses.set(key, ap)
 }
 
-export function deleteActiveProcess(key: string): void {
+function detachActiveProcess(key: string): ActiveProcess | undefined {
   const ap = activeProcesses.get(key)
-  if (ap) {
-    void ap.proxyServer?.close()
-    ap.proc.kill()
-    activeProcesses.delete(key)
-  }
+  if (!ap) return undefined
+  activeProcesses.delete(key)
+  void ap.proxyServer?.close()
+  return ap
+}
+
+export function deleteActiveProcess(key: string): void {
+  const ap = detachActiveProcess(key)
+  ap?.proc.kill()
+}
+
+function hasProcessExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null
+}
+
+function waitForProcessExit(
+  proc: ChildProcess,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (hasProcessExited(proc)) return Promise.resolve(true)
+
+  return new Promise((resolve) => {
+    const onExit = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      proc.off("exit", onExit)
+      resolve(hasProcessExited(proc))
+    }, timeoutMs)
+    proc.once("exit", onExit)
+  })
+}
+
+export async function deleteActiveProcessAndWait(
+  key: string,
+  options: {
+    exitTimeoutMs?: number
+    forceExitTimeoutMs?: number
+  } = {},
+): Promise<boolean> {
+  const ap = detachActiveProcess(key)
+  if (!ap || hasProcessExited(ap.proc)) return true
+
+  const gracefulExit = waitForProcessExit(
+    ap.proc,
+    options.exitTimeoutMs ?? PROCESS_EXIT_TIMEOUT_MS,
+  )
+  ap.proc.kill()
+  if (await gracefulExit) return true
+
+  const forcedExit = waitForProcessExit(
+    ap.proc,
+    options.forceExitTimeoutMs ?? PROCESS_FORCE_EXIT_TIMEOUT_MS,
+  )
+  ap.proc.kill("SIGKILL")
+  if (await forcedExit) return true
+
+  log.warn("claude process did not exit; starting a fresh session", {
+    sessionKey: key,
+  })
+  deleteClaudeSessionId(key)
+  return false
 }
 
 export function getClaudeSessionId(key: string): string | undefined {
@@ -188,8 +248,9 @@ export function spawnClaudeProcess(
     if (systemPromptFile) {
       void unlink(systemPromptFile).catch(() => {})
     }
-    activeProcesses.delete(sessionKey)
-    if (code !== 0 && code !== null) {
+    const ownsSessionKey = activeProcesses.get(sessionKey) === ap
+    if (ownsSessionKey) activeProcesses.delete(sessionKey)
+    if (ownsSessionKey && code !== 0 && code !== null) {
       log.info("process exited with error, clearing session", {
         code,
         sessionKey,
@@ -202,21 +263,107 @@ export function spawnClaudeProcess(
     const stderr = data.toString()
     log.debug("stderr", { data: stderr.slice(0, 200) })
 
+    // "No conversation found with session ID: <uuid>" is what `--resume`
+    // prints for a purged transcript — note the lowercase "session ID",
+    // which the capitalized match below does not catch.
     if (
-      stderr.includes("Session ID") &&
-      (stderr.includes("already in use") ||
-        stderr.includes("not found") ||
-        stderr.includes("invalid"))
+      stderr.includes("No conversation found") ||
+      (stderr.includes("Session ID") &&
+        (stderr.includes("already in use") ||
+          stderr.includes("not found") ||
+          stderr.includes("invalid")))
     ) {
-      log.warn("claude session ID error, clearing session", {
-        sessionKey,
-        error: stderr.slice(0, 200),
-      })
-      claudeSessions.delete(sessionKey)
+      if (activeProcesses.get(sessionKey) === ap) {
+        log.warn("claude session ID error, clearing session", {
+          sessionKey,
+          error: stderr.slice(0, 200),
+        })
+        claudeSessions.delete(sessionKey)
+      } else {
+        log.debug("ignoring session ID error from stale claude process", {
+          sessionKey,
+        })
+      }
     }
   })
 
   return ap
+}
+
+/**
+ * Append `--resume <id>` to an already-built args vector when a Claude
+ * conversation id is known for the session and the args don't already carry
+ * a session flag. Used by `respawnActiveProcess` to resume the conversation
+ * in a fresh child without rebuilding the whole (version-gated) args vector.
+ * `--resume`, not `--session-id`: the latter means "create a NEW session
+ * with this UUID" and the CLI rejects it with "Session ID ... is already in
+ * use" whenever a transcript exists on disk — which is exactly the state a
+ * mid-conversation respawn is in. If the wedged child died before writing
+ * any transcript, `--resume` fails with "No conversation found with session
+ * ID", which the stderr recovery matcher already catches (fresh-session
+ * fallback).
+ */
+export function appendResumeIfNeeded(
+  sessionKey: string,
+  cliArgs: string[],
+): string[] {
+  if (cliArgs.includes("--resume") || cliArgs.includes("--session-id")) {
+    return cliArgs
+  }
+  const sid = claudeSessions.get(sessionKey)
+  if (!sid) return cliArgs
+  return [...cliArgs, "--resume", sid]
+}
+
+/**
+ * Replace a wedged reused process with a fresh one, resuming the same
+ * Claude conversation. Used by the doStream start-watchdog when a reused
+ * process produces no stdout within a grace window after a fresh-turn
+ * envelope write — observed after a very long proxy-blocked tool call
+ * (e.g. a multi-minute `task` subagent). Before the per-tool proxy timeout
+ * fix this was masked because the flat 10-minute ceiling ended the turn
+ * first; now that the task proxy blocks and returns successfully, resuming
+ * a reused child after such a long wait can leave it silent on stdout.
+ *
+ * Reuses the existing proxy server, system-prompt file, and MCP hash (their
+ * handles are already baked into `cliArgs`' `--mcp-config`/append-prompt
+ * paths), so this only swaps the child process. The old child's exit
+ * handler is silenced before kill so it doesn't close the proxy server we
+ * are reusing; the new child gets its own exit handler from
+ * `spawnClaudeProcess`. `claudeSessions` is left intact so the respawn can
+ * add `--resume` (see `appendResumeIfNeeded`).
+ *
+ * Returns the new `ActiveProcess`, or `undefined` if there was no active
+ * process for the key (caller should treat that as "nothing to respawn").
+ */
+export function respawnActiveProcess(
+  sessionKey: string,
+  cliPath: string,
+  cliArgs: string[],
+  cwd: string,
+  ignoreAnthropicApiKey?: boolean,
+): ActiveProcess | undefined {
+  const old = activeProcesses.get(sessionKey)
+  if (!old) return undefined
+  activeProcesses.delete(sessionKey)
+  // Silence the old exit handler so it doesn't close the proxy server,
+  // unlink the system-prompt file, or touch claudeSessions on its way out
+  // — those handles are reused by the new child. spawnClaudeProcess wires
+  // a fresh exit handler for the respawned child.
+  old.proc.removeAllListeners("exit")
+  try {
+    old.proc.kill()
+  } catch {}
+  return spawnClaudeProcess(
+    cliPath,
+    appendResumeIfNeeded(sessionKey, cliArgs),
+    cwd,
+    sessionKey,
+    old.proxyServer,
+    old.mcpHash,
+    old.systemPromptFile,
+    ignoreAnthropicApiKey,
+  )
 }
 
 export function buildCliArgs(opts: {
@@ -265,10 +412,14 @@ export function buildCliArgs(opts: {
     args.push("--permission-mode", permissionMode)
   }
 
+  // `--session-id` means "create a NEW session with this UUID" and the CLI
+  // exits with "Session ID ... is already in use" whenever a transcript for
+  // that ID already exists on disk. Continuing an existing session requires
+  // `--resume` (which keeps the same session ID in print mode).
   if (includeSessionId) {
     const sessionId = claudeSessions.get(sessionKey)
     if (sessionId && !activeProcesses.has(sessionKey)) {
-      args.push("--session-id", sessionId)
+      args.push("--resume", sessionId)
     }
   }
 
