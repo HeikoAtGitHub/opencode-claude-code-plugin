@@ -183,6 +183,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
 | `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Claude built-in tools to route through opencode's executor + permission UI. See [Selective tool proxy](#selective-tool-proxy). |
 | `proxyToolTimeoutMs` | `Record<string, number>` | – | Per-tool proxy call deadline in ms, keyed by proxy tool name (`bash`, `task`, …). Defaults: 10 min flat, `task` → 60 min. For `bash`, the call's own `input.timeout` is honoured on top (`max(resolved, input.timeout)`). See [Selective tool proxy](#selective-tool-proxy). |
+| `planModeQuestion` | boolean | `false` | Route `ExitPlanMode` approval through opencode's native `question` tool instead of a text "(yes/no)" prompt. Off because opencode's question form is currently broken upstream. See [Plan mode](#plan-mode). |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
 | `controlRequestToolBehaviors` | `Record<string, "allow" \| "deny">` | – | Per-tool override for `can_use_tool`. Example: `{ "Bash": "deny", "Read": "allow" }`. |
 | `controlRequestDenyMessage` | string | built-in message | Message returned to Claude on a deny. |
@@ -449,6 +450,25 @@ Each chat keeps a long-lived `claude` subprocess so the model retains its native
 ## Plan mode
 
 Set `permissionMode: "plan"` to forward `--permission-mode plan` to Claude. The plugin handles `ExitPlanMode` specially — instead of forwarding it as a tool call, it converts it to a confirmation prompt that flows through opencode normally.
+
+By default that prompt is text: the plan is rendered as markdown, followed by `**Do you want to proceed with this plan?** (yes/no)`, and you answer in your next message.
+
+### Approval as a real form (`planModeQuestion`, opt-in)
+
+Set `planModeQuestion: true` to route the approval through opencode's native `question` tool instead:
+
+```json
+"options": {
+  "permissionMode": "plan",
+  "planModeQuestion": true
+}
+```
+
+The plan is still rendered, but the turn then ends on `tool-calls` and opencode runs its own `question` tool, so approval is a form rather than prose. Your answer is fed back to the CLI as the `tool_result` for the original `ExitPlanMode` call, which is what actually unlocks plan mode on the Claude side. A "yes" typed as ordinary text never does that. Anything other than picking `yes` (including custom text) comes back as rejection feedback the model is told to act on.
+
+> **Leave this off for now.** It depends on the same opencode `question` form that is [broken upstream](#with-question-in-proxytools-currently-blocked-upstream--leave-it-off): with it on, a plan approval hangs until you interrupt the turn. On opencode builds with no `question` registry entry at all the plugin silently keeps the text path (look for `plan-mode question gate` in the log). Re-test when [anomalyco/opencode#36603](https://github.com/anomalyco/opencode/pull/36603) merges.
+
+Approval bridge contributed by [@CollieIsCute](https://github.com/CollieIsCute).
 
 ---
 
