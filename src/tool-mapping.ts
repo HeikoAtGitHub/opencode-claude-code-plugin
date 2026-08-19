@@ -118,6 +118,20 @@ const CLAUDE_INTERNAL_TOOLS = new Set([
   "TaskStop",
 ])
 
+/**
+ * Wrap model-controlled text as one shell single-quoted word.
+ *
+ * `TaskOutput` is displayed by running a real `bash` call, so its payload
+ * reaches a shell. Double quotes are not enough: inside them `$(…)`,
+ * backticks and `${…}` still expand, so `TaskOutput({content: "X$(id -u)Y"})`
+ * executed `id` while the operator saw a command that read like a print
+ * (issue #27). Single quotes suppress every expansion; the only character
+ * needing care is `'` itself, closed and reopened around an escaped one.
+ */
+export function singleQuoteForShell(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
 function emitTodoWrite(todos: TodoEntry[]) {
   return {
     name: "todowrite",
@@ -193,14 +207,14 @@ export function mapTool(
     return { name: "WebSearch", input: mappedInput, executed: true, skip: true }
   }
 
-  // TaskOutput -> bash echo
+  // TaskOutput -> bash printf
   if (name === "TaskOutput") {
     if (!input) return { name: "bash", executed: false }
     const output = input?.content || input?.output || JSON.stringify(input)
     return {
       name: "bash",
       input: {
-        command: `echo "TASK OUTPUT: ${String(output).replace(/"/g, '\\"')}"`,
+        command: `printf '%s\\n' ${singleQuoteForShell(`TASK OUTPUT: ${String(output)}`)}`,
         description: "Displaying task output",
       },
       executed: false,
