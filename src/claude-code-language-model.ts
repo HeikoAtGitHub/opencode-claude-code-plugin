@@ -45,6 +45,12 @@ import {
   sessionKey,
 } from "./session-manager.js"
 import { spawnInteractiveProcess } from "./claude-session-wrapper.js"
+import {
+  clearCompression,
+  consumeCompressionRestart,
+  getCompressionSummary,
+  storeCompressionSummary,
+} from "./compression-store.js"
 import { log } from "./logger.js"
 import { detectCliVersion } from "./cli-version.js"
 import {
@@ -58,6 +64,7 @@ import {
   type ProxyMcpServer,
   type ProxyToolCall,
   type ProxyToolDef,
+  type ProxyToolInterceptor,
   type ProxyToolResult,
 } from "./proxy-mcp.js"
 import {
@@ -609,6 +616,22 @@ You are running via the Claude Code CLI (not a direct API call). This affects co
 - DCP context injections (AGENTS.md, dynamic state) arrive via the system prompt and are already applied.`
 
 /**
+ * Replaces the note above when `compress` is in the resolved proxy list.
+ * The full MCP name is spelled out for the same reason the question proxy
+ * hint spells its own out: models strip the prefix and call bare
+ * `compress`, which opencode renders as `⚙ invalid`.
+ */
+const CLAUDE_CLI_COMPRESS_NOTE = `## Runtime environment: Claude Code CLI
+
+You are running via the Claude Code CLI (not a direct API call). This affects context management:
+
+- To compress context, call \`mcp__opencode_proxy__compress\` with a \`summary\` argument. Use that exact full name.
+- The reset happens at the start of your NEXT turn: this Claude Code session is discarded and a fresh one starts with your summary as its only prior context. Keep working normally after the call.
+- Everything outside the summary is gone after the reset — tool output, files you read, and the earlier conversation are not replayed. Write the summary as the authoritative record.
+- The \`distill\`, \`prune\`, and \`extract\` tools are NOT available.
+- DCP context injections (AGENTS.md, dynamic state) arrive via the system prompt and are already applied.`
+
+/**
  * Extract text content from all `system`-role messages in the prompt.
  * Standard API providers forward these as the `system` parameter; for
  * Claude CLI, the only equivalent path is --append-system-prompt-file.
@@ -638,13 +661,29 @@ function extractSystemMessages(
   return out
 }
 
+export interface AppendedSystemPromptOptions {
+  /** True when `compress` is in the resolved proxy list for this spawn. */
+  compressEnabled?: boolean
+  /** Summary from a previous `compress` call, if this key has one. */
+  compressionSummary?: string
+}
+
 export function buildAppendedSystemPrompt(
   cwd: string,
   includeMultiStepHint = true,
   extraSystemContent: string[] = [],
+  options: AppendedSystemPromptOptions = {},
 ): string | undefined {
   const parts: string[] = []
-  parts.push(CLAUDE_CLI_CONTEXT_NOTE)
+  // First, so it reads as prior context for everything that follows.
+  if (options.compressionSummary?.trim()) {
+    parts.push(
+      `## Summary of earlier work (context was compressed)\n\n${options.compressionSummary.trim()}`,
+    )
+  }
+  parts.push(
+    options.compressEnabled ? CLAUDE_CLI_COMPRESS_NOTE : CLAUDE_CLI_CONTEXT_NOTE,
+  )
   for (const s of extraSystemContent) {
     if (s.trim()) parts.push(s.trim())
   }
@@ -919,7 +958,33 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     sessionKeyForCalls: string,
   ): Promise<ProxyMcpServer> {
     const timeoutOverrides = this.config.proxyToolTimeoutMs
-    const srv = await createProxyMcpServer(tools, timeoutOverrides)
+    const interceptors = new Map<string, ProxyToolInterceptor>()
+    if (tools.some((t) => t.name === "compress")) {
+      interceptors.set("compress", (input) => {
+        const summary = typeof input.summary === "string" ? input.summary.trim() : ""
+        if (!summary) {
+          return {
+            kind: "error",
+            message:
+              "compress needs a non-empty `summary`: it becomes the only" +
+              " prior context after the reset. Nothing was compressed.",
+          }
+        }
+        storeCompressionSummary(sessionKeyForCalls, summary)
+        log.info("compress stored summary; session resets next turn", {
+          sessionKey: sessionKeyForCalls,
+          summaryLength: summary.length,
+        })
+        return {
+          kind: "text",
+          text:
+            "Summary stored. Finish this turn as normal; the next turn starts" +
+            " a fresh Claude Code session with this summary as its only prior" +
+            " context.",
+        }
+      })
+    }
+    const srv = await createProxyMcpServer(tools, timeoutOverrides, interceptors)
     srv.calls.on("call", (call: ProxyToolCall) => {
       queuePendingProxyCall(sessionKeyForCalls, call, timeoutOverrides)
     })
@@ -1414,10 +1479,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
         .length > 1
 
-    // New session — clear any stale state from a previous session
+    // New session — clear any stale state from a previous session.
+    // A compression summary is scoped to one conversation, so this is the
+    // one place it is dropped: the compress restart itself calls
+    // deleteClaudeSessionId, and clearing there would wipe the summary
+    // just before the fresh spawn reads it.
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearCompression(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -1440,6 +1510,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       cwd,
       this.config.multiStepContinuation !== false,
       extractSystemMessages(options.prompt),
+      // doGenerate has no proxy wiring, so `compress` is not callable here.
+      // An existing summary still carries: it is this key's prior context.
+      { compressEnabled: false, compressionSummary: getCompressionSummary(sk) },
     )
     const cliArgs = buildCliArgs({
       sessionKey: sk,
@@ -1937,10 +2010,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
         .length > 1
 
-    // New session — clear any stale state from a previous session
+    // New session — clear any stale state from a previous session.
+    // A compression summary is scoped to one conversation, so this is the
+    // one place it is dropped: the compress restart itself calls
+    // deleteClaudeSessionId, and clearing there would wipe the summary
+    // just before the fresh spawn reads it.
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearCompression(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -2023,6 +2101,25 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         if (compactionMode) {
           deleteActiveProcess(sk)
           deleteClaudeSessionId(sk)
+        }
+
+        // A compress call lands mid-turn, when the child is still streaming,
+        // so the reset it asks for happens here instead: drop the child and
+        // its session id, and the spawn below starts clean. `userMsg` and
+        // `includeHistoryContext` were resolved above while the session
+        // still existed, so the fresh process is given only this turn's
+        // message — the summary in its system prompt is the whole of its
+        // prior context, exactly as the tool promised.
+        //
+        // Not while this turn carries results for the live child: evicting
+        // it would send a tool_result to a process that never issued the
+        // matching tool_use. The mark survives to the next turn.
+        if (!compactionMode && !hasMatchedPendingResults && consumeCompressionRestart(sk)) {
+          deleteActiveProcess(sk)
+          deleteClaudeSessionId(sk)
+          log.info("compress reset: dropped claude process and session id", {
+            sessionKey: sk,
+          })
         }
 
         let activeProcess = getActiveProcess(sk)
@@ -2292,6 +2389,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
                     ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
                   ],
+                  {
+                    compressEnabled:
+                      enrichedProxy?.some((t) => t.name === "compress") ?? false,
+                    compressionSummary: getCompressionSummary(sk),
+                  },
                 )
             cliArgs = buildCliArgs({
               sessionKey: sk,

@@ -49,6 +49,16 @@ export type ProxyToolResult =
   | { kind: "text"; text: string; isError?: boolean }
   | { kind: "error"; message: string }
 
+/**
+ * Handler that answers a `tools/call` inside this process instead of
+ * queueing it for opencode. Used by tools that act on plugin state rather
+ * than on the workspace (currently only `compress`), so they never reach
+ * the broker, never block on a human, and have no deadline.
+ */
+export type ProxyToolInterceptor = (
+  input: Record<string, unknown>,
+) => Promise<ProxyToolResult> | ProxyToolResult
+
 export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
 
 /** Rejections that fire on normal lifecycle transitions: AFK-permission
@@ -235,6 +245,21 @@ export const QUESTION_PROXY_NOTE =
   " Question calls get a 30-minute proxy deadline by default (configurable" +
   " via proxyToolTimeoutMs); for long-AFK scenarios prefer fewer," +
   " high-signal questions."
+
+/**
+ * Disambiguation appended to the `compress` proxy def. Two things the
+ * model gets wrong without it: when the reset happens (not mid-turn, so
+ * it can keep working after the call), and how much survives it (only
+ * the summary, because the fresh spawn is not given the prior transcript).
+ */
+export const COMPRESS_PROXY_NOTE =
+  "The current turn continues normally after this call — finish what you" +
+  " are doing. The reset happens at the START of the next turn: the" +
+  " Claude Code session is discarded and a fresh one begins with your" +
+  " summary as its only prior context. Everything else, including tool" +
+  " output and files you read, is gone, so write the summary as the" +
+  " authoritative record. Call this once per compression, when older" +
+  " resolved work no longer needs full detail."
 
 /**
  * Pull *only* the agent-type list out of opencode's live `task` description.
@@ -532,11 +557,34 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       required: ["questions"],
     },
   },
+  {
+    name: "compress",
+    description:
+      "Replace older conversation detail with a summary you write, then" +
+      " continue in a fresh Claude Code session. Handled inside the plugin," +
+      " so it never prompts the operator. " +
+      COMPRESS_PROXY_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description:
+            "Dense technical summary of the work being compressed: decisions" +
+            " made, files changed, commands run and their outcomes, and what" +
+            " is still open. This is the ONLY prior context that survives, so" +
+            " anything omitted is lost.",
+        },
+      },
+      required: ["summary"],
+    },
+  },
 ]
 
 export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
   timeoutOverrides?: Record<string, number>,
+  interceptors?: Map<string, ProxyToolInterceptor>,
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
@@ -640,6 +688,28 @@ export async function createProxyMcpServer(
           return
         }
 
+        // Intercepted tools act on plugin state, not on the workspace, so
+        // they are answered here and never queued for opencode. The result
+        // still goes through the shared MCP envelope below — a JSON-RPC
+        // error here would be rejected by Claude CLI exactly like any other
+        // tools/call error envelope.
+        const interceptor = interceptors?.get(toolName)
+        if (interceptor) {
+          let intercepted: ProxyToolResult
+          try {
+            intercepted = await interceptor(input)
+          } catch (interceptorError) {
+            const message =
+              interceptorError instanceof Error
+                ? interceptorError.message
+                : String(interceptorError)
+            log.warn("proxy-mcp interceptor failed", { toolName, error: message })
+            intercepted = { kind: "error", message }
+          }
+          writeToolCallResult(res, requestId, intercepted)
+          return
+        }
+
         const callId = crypto.randomUUID()
         log.info("proxy-mcp tool call received", {
           callId,
@@ -684,21 +754,7 @@ export async function createProxyMcpServer(
           pending.delete(callId)
         })
 
-        // Unify success and error results into one MCP result envelope.
-        // A JSON-RPC error for `kind: "error"` was rejected by Claude
-        // CLI as a "malformed result that failed schema validation"
-        // because tools/call responses are validated as MCP results, so
-        // tool-execution errors must surface as `isError: true` instead.
-        const text = result.kind === "error" ? result.message : result.text
-        const isError = result.kind === "error" || result.isError === true
-        writeJson(res, {
-          jsonrpc: "2.0",
-          id: requestId,
-          result: {
-            content: [{ type: "text", text }],
-            isError,
-          },
-        })
+        writeToolCallResult(res, requestId, result)
         return
       }
 
@@ -880,6 +936,30 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on("data", (chunk: Buffer) => chunks.push(chunk))
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
     req.on("error", reject)
+  })
+}
+
+/**
+ * The single exit for every `tools/call`, broker-backed or intercepted.
+ * Success and failure share one MCP result envelope: a JSON-RPC error for
+ * `kind: "error"` was rejected by Claude CLI as a "malformed result that
+ * failed schema validation", so tool failures must surface as
+ * `isError: true` instead.
+ */
+function writeToolCallResult(
+  res: ServerResponse,
+  requestId: unknown,
+  result: ProxyToolResult,
+): void {
+  const text = result.kind === "error" ? result.message : result.text
+  const isError = result.kind === "error" || result.isError === true
+  writeJson(res, {
+    jsonrpc: "2.0",
+    id: requestId ?? null,
+    result: {
+      content: [{ type: "text", text }],
+      isError,
+    },
   })
 }
 
