@@ -110,6 +110,7 @@ export function createClaudeCode(
       controlRequestToolBehaviors: settings.controlRequestToolBehaviors,
       controlRequestDenyMessage: settings.controlRequestDenyMessage,
       proxyTools,
+      extraDisallowedTools: settings.extraDisallowedTools,
       proxyToolTimeoutMs: settings.proxyToolTimeoutMs,
       planModeQuestion: settings.planModeQuestion ?? false,
       webSearch: settings.webSearch,

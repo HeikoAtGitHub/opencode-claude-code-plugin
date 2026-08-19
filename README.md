@@ -182,6 +182,7 @@ The account model IDs are internally suffixed, for example `claude-sonnet-4-6@wo
 | `skipPermissions` | boolean | `true` | Pass `--dangerously-skip-permissions` to `claude`. Ignored when `proxyTools` is set — the proxy handles permissions through opencode instead. |
 | `permissionMode` | `acceptEdits` \| `auto` \| `bypassPermissions` \| `default` \| `dontAsk` \| `plan` | – | Forwarded to `claude --permission-mode`. |
 | `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Claude built-in tools to route through opencode's executor + permission UI. Opt-in extras: `"Question"`, `"Compress"`. See [Selective tool proxy](#selective-tool-proxy). |
+| `extraDisallowedTools` | string[] | – | Extra Claude built-ins to switch off with `--disallowedTools`, on top of what `proxyTools` implies. Claude's names, e.g. `["NotebookEdit"]`. See [Closing a tool with no proxy](#closing-a-tool-with-no-proxy). |
 | `proxyToolTimeoutMs` | `Record<string, number>` | – | Per-tool proxy call deadline in ms, keyed by proxy tool name (`bash`, `task`, …). Defaults: 10 min flat, `task` → 60 min. For `bash`, the call's own `input.timeout` is honoured on top (`max(resolved, input.timeout)`). See [Selective tool proxy](#selective-tool-proxy). |
 | `planModeQuestion` | boolean | `false` | Route `ExitPlanMode` approval through opencode's native `question` tool instead of a text "(yes/no)" prompt. Off because opencode's question form is currently broken upstream. See [Plan mode](#plan-mode). |
 | `controlRequestBehavior` | `allow` \| `deny` | `allow` | Default response when `skipPermissions: false` and Claude sends a `can_use_tool` control request. |
@@ -297,6 +298,20 @@ appends a system-prompt note naming
 recovery step for harnesses that defer MCP tool schemas. Both apply per Claude
 process at spawn, and provider options are read once at opencode startup, so
 `proxyTools` changes need a full opencode restart.
+
+### Closing a tool with no proxy
+
+`proxyTools` only reaches built-ins the plugin can replace. A built-in with no opencode equivalent, `NotebookEdit` today and whatever Claude Code ships next, stays enabled and unmediated no matter what you put in that list. `extraDisallowedTools` names them directly:
+
+```json
+"options": {
+  "extraDisallowedTools": ["NotebookEdit"]
+}
+```
+
+These go straight to `claude --disallowedTools`, so use Claude's tool names rather than opencode's. There is no replacement: the capability goes away rather than being routed through opencode, which is the point, but the model then has to work without it.
+
+Unknown entries in `proxyTools` are logged as a warning at spawn rather than passing silently, so a typo shows up as "ignoring unknown proxyTools entries" in the plugin log instead of quietly leaving the matching built-in unmediated.
 
 ### Context compression
 

@@ -55,7 +55,7 @@ import { log } from "./logger.js"
 import { detectCliVersion } from "./cli-version.js"
 import {
   createProxyMcpServer,
-  disallowedToolFlags,
+  resolveDisallowedTools,
   DEFAULT_PROXY_TOOLS,
   overlayTaskProxyDescription,
   overlayQuestionProxyDescription,
@@ -820,9 +820,26 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       DEFAULT_PROXY_TOOLS.map((t) => [t.name.toLowerCase(), t]),
     )
     const picked: ProxyToolDef[] = []
+    const unknown: string[] = []
     for (const n of names) {
       const def = defsByName.get(String(n).toLowerCase())
       if (def) picked.push(def)
+      else unknown.push(String(n))
+    }
+    // A typo used to vanish here. Silence is the wrong response: unknown
+    // names are not proxied, so the matching Claude built-in stays enabled
+    // and unmediated, and if *every* name is unknown the whole turn runs
+    // with no proxy at all (issue #26).
+    if (unknown.length > 0) {
+      const known = [...defsByName.keys()].join(", ")
+      if (picked.length === 0) {
+        log.warn(
+          "no proxyTools entry was recognised; nothing will be proxied this turn",
+          { unknown, known },
+        )
+      } else {
+        log.warn("ignoring unknown proxyTools entries", { unknown, known })
+      }
     }
     return picked.length > 0 ? picked : null
   }
@@ -2367,12 +2384,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // while the proxy replacement is absent, leaving the model
             // with no way to ask questions at all (neither proxy nor the
             // deny/markdown fallback path fires).
-            const proxyDisallowed = enrichedProxy
-              ? disallowedToolFlags(enrichedProxy)
-              : []
-            const extraDisallowed: string[] = []
-            if (self.config.webSearch === "disabled") extraDisallowed.push("WebSearch")
-            const allDisallowed = [...proxyDisallowed, ...extraDisallowed]
+            const allDisallowed = resolveDisallowedTools({
+              proxyTools: enrichedProxy,
+              extraDisallowedTools: self.config.extraDisallowedTools,
+              disableWebSearch: self.config.webSearch === "disabled",
+            })
             const mcp = self.effectiveMcpConfig(
               cwd,
               proxyServer?.configPath(),

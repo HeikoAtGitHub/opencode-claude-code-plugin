@@ -28,6 +28,7 @@ export interface ClaudeCodeConfig {
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
   proxyTools?: string[]
+  extraDisallowedTools?: string[]
   proxyToolTimeoutMs?: Record<string, number>
   /**
    * Route `ExitPlanMode` through opencode's native `question` tool so plan
@@ -156,6 +157,21 @@ export interface ClaudeCodeProviderSettings {
     * entry, in which case the deny/markdown fallback applies.
     */
   proxyTools?: string[]
+
+  /**
+   * Extra Claude Code built-ins to switch off with `--disallowedTools`,
+   * on top of the ones implied by `proxyTools`.
+   *
+   * `proxyTools` can only disable built-ins the plugin knows how to
+   * replace, so a built-in with no proxy equivalent (`NotebookEdit`, and
+   * anything Claude Code adds after this release) has no off switch
+   * otherwise. Names are Claude's, not opencode's: `["NotebookEdit"]`.
+   *
+   * Disabling a tool with no replacement removes the capability rather
+   * than routing it through opencode — that is the point, but it does mean
+   * the model has to work without it.
+   */
+  extraDisallowedTools?: string[]
 
   /**
    * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool

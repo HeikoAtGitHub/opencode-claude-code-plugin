@@ -930,6 +930,34 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
   return out
 }
 
+/**
+ * Everything that goes to `--disallowedTools` for one spawn: the built-ins
+ * the proxied tools replace, plus the ones the operator named directly.
+ *
+ * `disallowedToolFlags` can only cover tools the plugin has a proxy for, so
+ * a built-in with no equivalent (`NotebookEdit`, and anything Claude Code
+ * ships next) is unreachable without `extraDisallowedTools` — issue #26.
+ */
+export function resolveDisallowedTools(options: {
+  proxyTools?: ProxyToolDef[] | null
+  extraDisallowedTools?: string[]
+  disableWebSearch?: boolean
+}): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed || seen.has(trimmed)) return
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+
+  for (const name of disallowedToolFlags(options.proxyTools ?? [])) push(name)
+  for (const name of options.extraDisallowedTools ?? []) push(String(name))
+  if (options.disableWebSearch) push("WebSearch")
+  return out
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []

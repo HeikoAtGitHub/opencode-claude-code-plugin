@@ -11,6 +11,7 @@ import {
 } from "./src/cli-version.js"
 import {
   disallowedToolFlags,
+  resolveDisallowedTools,
   type ProxyToolDef,
 } from "./src/proxy-mcp.js"
 
@@ -263,4 +264,52 @@ test("disallowedToolFlags ignores proxy tools with no Claude equivalent", () => 
     disallowedToolFlags([proxyDef("bash"), proxyDef("slack_post_message")]),
     ["Bash"],
   )
+})
+
+// Issue #26: proxyTools is an allowlist by omission. A built-in the plugin
+// has no proxy for (NotebookEdit today, whatever ships next) can only be
+// closed by naming it directly.
+test("resolveDisallowedTools merges proxy-implied and operator-named tools", () => {
+  assert.deepEqual(
+    resolveDisallowedTools({
+      proxyTools: [proxyDef("bash"), proxyDef("edit")],
+      extraDisallowedTools: ["NotebookEdit"],
+    }),
+    ["Bash", "Edit", "MultiEdit", "NotebookEdit"],
+  )
+})
+
+test("resolveDisallowedTools works with no proxy tools at all", () => {
+  assert.deepEqual(
+    resolveDisallowedTools({
+      proxyTools: null,
+      extraDisallowedTools: ["NotebookEdit", "Skill"],
+    }),
+    ["NotebookEdit", "Skill"],
+  )
+})
+
+test("resolveDisallowedTools does not repeat a tool the proxy already disabled", () => {
+  assert.deepEqual(
+    resolveDisallowedTools({
+      proxyTools: [proxyDef("bash")],
+      extraDisallowedTools: ["Bash", " ", "Bash"],
+    }),
+    ["Bash"],
+  )
+})
+
+test("resolveDisallowedTools still appends WebSearch when it is disabled", () => {
+  assert.deepEqual(
+    resolveDisallowedTools({
+      proxyTools: [proxyDef("bash")],
+      extraDisallowedTools: ["NotebookEdit"],
+      disableWebSearch: true,
+    }),
+    ["Bash", "NotebookEdit", "WebSearch"],
+  )
+})
+
+test("resolveDisallowedTools is empty when nothing asks for anything", () => {
+  assert.deepEqual(resolveDisallowedTools({}), [])
 })
