@@ -19,7 +19,6 @@ import { applyTaskCreateToolResult } from "./todo-ledger.js"
 import { getClaudeUserMessage } from "./message-builder.js"
 import {
   QUESTION_TOOL_NAME,
-  clearExitPlanModeQuestions,
   consumeExitPlanModeQuestionResult,
   createExitPlanModeQuestionCall,
   isPlanModeQuestionActive,
@@ -214,7 +213,7 @@ const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
 
-/** One snapshot of opencode's live tool registry. See `fetchLiveToolInfo`. */
+/** One per-turn snapshot of opencode's live tool registry. */
 interface LiveToolInfo {
   /** False when nothing answered (no SDK client, fetch failed). */
   resolved: boolean
@@ -872,34 +871,13 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     }
   }
 
-  /**
-   * `fetchLiveToolInfo` memoized for the lifetime of this model instance.
-   * Every consumer (proxy def overlays, question version gate, plan-mode
-   * approval bridge) wants the same registry snapshot, and the AGENTS.md
-   * rule is one `client.tool.list()` fetch feeding all of them, so they
-   * share this one.
-   *
-   * A fetch that did not resolve is deliberately NOT memoized: opencode's
-   * server may simply not have been up yet, and caching that miss would
-   * silently disable the overlays and gates for the rest of the process.
-   */
-  private liveToolInfoMemo: Promise<LiveToolInfo> | undefined
-
-  private liveToolInfoOnce(): Promise<LiveToolInfo> {
-    if (!this.liveToolInfoMemo) {
-      const pending = this.fetchLiveToolInfo()
-      this.liveToolInfoMemo = pending
-      void pending
-        .then((info) => {
-          if (!info.resolved && this.liveToolInfoMemo === pending) {
-            this.liveToolInfoMemo = undefined
-          }
-        })
-        .catch(() => {
-          if (this.liveToolInfoMemo === pending) this.liveToolInfoMemo = undefined
-        })
+  /** Share one lazy registry request within a turn without making it stale. */
+  private createLiveToolInfoLoader(): () => Promise<LiveToolInfo> {
+    let pending: Promise<LiveToolInfo> | undefined
+    return () => {
+      pending ??= this.fetchLiveToolInfo()
+      return pending
     }
-    return this.liveToolInfoMemo
   }
 
   /**
@@ -908,9 +886,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
    * tool. Without the registry entry the emitted tool-call would render as
    * `⚙ invalid` and wedge the turn, so the plugin keeps the text path.
    */
-  private async resolvePlanModeQuestion(compactionMode: boolean): Promise<boolean> {
+  private async resolvePlanModeQuestion(
+    compactionMode: boolean,
+    loadLiveToolInfo = () => this.fetchLiveToolInfo(),
+  ): Promise<boolean> {
     if (compactionMode || this.config.planModeQuestion !== true) return false
-    const info = await this.liveToolInfoOnce()
+    const info = await loadLiveToolInfo()
     const active = isPlanModeQuestionActive({
       configured: this.config.planModeQuestion,
       opencodeHasQuestion: info.hasQuestion,
@@ -1437,7 +1418,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
-      clearExitPlanModeQuestions(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -1961,7 +1941,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
-      clearExitPlanModeQuestions(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -1985,10 +1964,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         compactionMode,
       })
     const resolvedProxy = compactionMode ? null : this.resolvedProxyTools()
+    const loadLiveToolInfo = this.createLiveToolInfoLoader()
     // Resolved here, not inside the stream body: the ExitPlanMode branches
     // run in a synchronous line handler and a reused process never reaches
     // the spawn block where the registry snapshot is otherwise taken.
-    const planModeQuestionActive = await this.resolvePlanModeQuestion(compactionMode)
+    const planModeQuestionActive = await this.resolvePlanModeQuestion(
+      compactionMode,
+      loadLiveToolInfo,
+    )
     const self = this
 
     const previousPendingProxyCalls = compactionMode
@@ -2204,7 +2187,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               resolvedProxy?.some((t) => t.name === "question") ?? false
             const liveToolInfo =
               taskProxyEnabled || questionProxyEnabled
-                ? await self.liveToolInfoOnce()
+                ? await loadLiveToolInfo()
                 : {
                     resolved: false,
                     taskDescription: undefined,

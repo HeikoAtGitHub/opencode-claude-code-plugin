@@ -5,6 +5,7 @@ import { unlink } from "node:fs/promises"
 import { log } from "./logger.js"
 import type { ProxyMcpServer } from "./proxy-mcp.js"
 import { clearLedger } from "./todo-ledger.js"
+import { clearExitPlanModeQuestions } from "./plan-mode-question.js"
 import {
   cliSupportsThinking,
   cliSupportsThinkingDisplay,
@@ -186,6 +187,7 @@ export function setClaudeSessionId(key: string, sessionId: string): void {
 }
 
 export function deleteClaudeSessionId(key: string): void {
+  clearExitPlanModeQuestions(key)
   const claudeSessionId = claudeSessions.get(key)
   if (claudeSessionId) clearLedger(claudeSessionId)
   claudeSessions.delete(key)

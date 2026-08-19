@@ -6,6 +6,12 @@ export const APPROVED_EXIT_PLAN_MODE_MESSAGE =
 const REJECTED_EXIT_PLAN_MODE_PREFIX =
   "The user doesn't want to proceed with this tool use. The tool use was rejected. To tell you how to proceed, the user said:"
 
+const PLAN_MODE_APPROVAL_QUESTION = "Do you want to proceed with this plan?"
+const OPENCODE_QUESTION_RESULT_PREFIX =
+  `User has answered your questions: "${PLAN_MODE_APPROVAL_QUESTION}"="`
+const OPENCODE_QUESTION_RESULT_SUFFIX =
+  `". You can now continue with the user's answers in mind.`
+
 const KEY_SEPARATOR = "\u0000"
 
 export interface ExitPlanModeQuestionCall {
@@ -73,7 +79,7 @@ export function createExitPlanModeQuestionCall(
       questions: [
         {
           header: "Plan approval",
-          question: "Do you want to proceed with this plan?",
+          question: PLAN_MODE_APPROVAL_QUESTION,
           options: [
             { label: "yes", description: "" },
             { label: "no", description: "" },
@@ -153,8 +159,21 @@ function unwrapToolOutput(part: any): unknown {
   }
 }
 
+function unwrapOpencodeQuestionResult(value: string): string {
+  if (
+    value.startsWith(OPENCODE_QUESTION_RESULT_PREFIX) &&
+    value.endsWith(OPENCODE_QUESTION_RESULT_SUFFIX)
+  ) {
+    return value.slice(
+      OPENCODE_QUESTION_RESULT_PREFIX.length,
+      -OPENCODE_QUESTION_RESULT_SUFFIX.length,
+    )
+  }
+  return value
+}
+
 function collectAnswerStrings(value: unknown): string[] {
-  if (typeof value === "string") return [value]
+  if (typeof value === "string") return [unwrapOpencodeQuestionResult(value)]
   if (Array.isArray(value)) return value.flatMap(collectAnswerStrings)
   if (!value || typeof value !== "object") return []
 
