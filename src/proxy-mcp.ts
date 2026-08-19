@@ -630,7 +630,24 @@ export async function createProxyMcpServer(
    * destroying the socket on `finish` covers the case where the peer never
    * finishes its body.
    */
-  function reject(req: IncomingMessage, res: ServerResponse, statusCode: number): void {
+  function reject(
+    req: IncomingMessage,
+    res: ServerResponse,
+    statusCode: number,
+    reason: string,
+  ): void {
+    // Every guard below is a measured property of the client we spawn, not a
+    // guarantee about future ones. If a later Claude CLI starts sending an
+    // Origin header, or a different Content-Type, every proxy call would
+    // 403/415 with no other symptom than tools mysteriously not working — so
+    // say why, here, once per rejected request. Header VALUES are omitted:
+    // this line must never carry the bearer token.
+    log.notice("proxy-mcp rejected a request", {
+      statusCode,
+      reason,
+      method: req.method,
+      hasAuthorization: typeof req.headers.authorization === "string",
+    })
     res.statusCode = statusCode
     res.setHeader("Connection", "close")
     res.on("finish", () => {
@@ -641,7 +658,7 @@ export async function createProxyMcpServer(
 
   const server = createServer(async (req, res) => {
     if (req.method !== "POST" || !req.url?.startsWith("/mcp")) {
-      reject(req, res, 404)
+      reject(req, res, 404, "not a POST to /mcp")
       return
     }
     // Everything below runs BEFORE readBody: an unauthenticated peer must
@@ -654,7 +671,7 @@ export async function createProxyMcpServer(
     // so it is a rebinding defense specifically, not a browser defense. The
     // Origin and Content-Type guards below, and the token, cover that case.
     if (req.headers.host !== boundAuthority) {
-      reject(req, res, 403)
+      reject(req, res, 403, "host header is not the bound authority")
       return
     }
     // Claude Code 2.1.226 sends no Origin on MCP requests (verified). The MCP
@@ -662,7 +679,7 @@ export async function createProxyMcpServer(
     // clients to omit it, so this is a measured property of the client we
     // spawn rather than a guarantee about all conforming clients.
     if (req.headers.origin !== undefined) {
-      reject(req, res, 403)
+      reject(req, res, 403, "origin header present")
       return
     }
     // Requiring application/json forces a CORS preflight for cross-origin
@@ -673,11 +690,11 @@ export async function createProxyMcpServer(
       .trim()
       .toLowerCase()
     if (contentType !== "application/json") {
-      reject(req, res, 415)
+      reject(req, res, 415, "content-type is not application/json")
       return
     }
     if (!authOk(req)) {
-      reject(req, res, 401)
+      reject(req, res, 401, "missing or invalid bearer token")
       return
     }
     // Hoist the request id and method so the catch block can echo them
