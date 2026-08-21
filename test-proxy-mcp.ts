@@ -18,6 +18,7 @@ import {
   resolveProxyClientCeilingMs,
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
+  validateProxyToolInput,
   DEFAULT_PROXY_TOOLS,
   PROXY_DEFAULT_TIMEOUT_MS,
   MAX_PROXY_TIMEOUT_MS,
@@ -102,6 +103,60 @@ test("submit_plan dispatches through proxy as an MCP result", async () => {
     assert.equal(res.json.id, "submit-plan-1")
     assert.equal(res.json.result.isError, false)
     assert.equal(res.json.result.content[0].text, "approved-by-test")
+  } finally {
+    await srv.close()
+  }
+})
+
+test("workstream_manage proxy exposes only controlled repair actions", () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
+  assert.ok(workstream)
+  const schema = workstream.inputSchema as any
+  assert.equal(schema.additionalProperties, false)
+  assert.deepEqual(schema.required, ["action", "slug"])
+  assert.deepEqual(schema.properties.action.enum, [
+    "repair_preview", "repair_apply", "repair_push",
+  ])
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "repair_preview", slug: "stlk_analyse",
+  }), null)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "sync_apply", slug: "stlk_analyse",
+  })!, /action must be/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "repair_apply", slug: "stlk_analyse", remote: "origin",
+  })!, /exactly action and slug/)
+})
+
+test("workstream_manage dispatches exact input and rejects raw extras", async () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
+  assert.ok(workstream)
+  const srv = await createProxyMcpServer([workstream])
+  try {
+    srv.calls.once("call", (call: ProxyToolCall) => {
+      assert.equal(call.toolName, "workstream_manage")
+      assert.deepEqual(call.input, { action: "repair_preview", slug: "stlk_analyse" })
+      call.resolve({ kind: "text", text: "preview-ok" })
+    })
+    const accepted = await post(srv.url, {
+      jsonrpc: "2.0", id: "repair-1", method: "tools/call",
+      params: {
+        name: "workstream_manage",
+        arguments: { action: "repair_preview", slug: "stlk_analyse" },
+      },
+    })
+    assert.equal(accepted.json.result.isError, false)
+    assert.equal(accepted.json.result.content[0].text, "preview-ok")
+
+    const rejected = await post(srv.url, {
+      jsonrpc: "2.0", id: "repair-2", method: "tools/call",
+      params: {
+        name: "workstream_manage",
+        arguments: { action: "repair_push", slug: "stlk_analyse", force: true },
+      },
+    })
+    assert.equal(rejected.json.result.isError, true)
+    assert.match(rejected.json.result.content[0].text, /exactly action and slug/)
   } finally {
     await srv.close()
   }

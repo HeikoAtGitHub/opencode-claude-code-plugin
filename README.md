@@ -278,7 +278,7 @@ By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. 
 
 `Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits an unexecuted `task` call; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming the child session, selecting the configured subagent, and foreground/background lifecycle.
 
-Only listed values are proxied; unknown `proxyTools` values are ignored. `submit_plan` is an OpenCode-specific proxy tool for Plannotator review. It waits up to 24 hours and sends SSE keepalives while browser approval is pending.
+Only listed values are proxied; unknown `proxyTools` values are ignored. `submit_plan` is an OpenCode-specific proxy tool for Plannotator review. It waits up to 24 hours and sends SSE keepalives while browser approval is pending. `workstream_manage` is an opt-in OpenCode-specific proxy that exposes only `repair_preview`, `repair_apply`, and `repair_push`; OpenCode's native agent authorization and separate approvals remain authoritative.
 
 - **Permissions:** the calling agent's `permission.task` rule applies to the target `subagent_type`. Grant `task: "allow"` on agents that should delegate without a prompt; an `ask` or `deny` rule remains authoritative. The plugin never bypasses this decision.
 - **Resume:** pass the child session ID back as `task_id` to continue that subagent session. Omit it to create a fresh child.
@@ -299,7 +299,7 @@ recovery step for harnesses that defer MCP tool schemas. Both apply per Claude
 process at spawn, and provider options are read once at opencode startup, so
 `proxyTools` changes need a full opencode restart.
 
-Only those six values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI. The `"Question"` proxy is version-gated on opencode's built-in `question` tool: on builds that lack the registry entry the def is silently dropped (a forwarded call would otherwise render as `⚙ invalid`), so add it only on opencode versions that ship the `question` tool.
+Only defined values are actually proxied; anything else you put in `proxyTools` is ignored. Proxying `Edit` also disables `MultiEdit` — opencode has no batched-edit equivalent, so Claude is forced to fan out into single `Edit` calls that each flow through the permission UI. The `"Question"` proxy is version-gated on opencode's built-in `question` tool: on builds that lack the registry entry the def is silently dropped (a forwarded call would otherwise render as `⚙ invalid`), so add it only on opencode versions that ship the `question` tool.
 
 Without `"Task"` in `proxyTools`, Claude's built-in `Agent` tool stays enabled and Claude orchestrates subagents internally with no opencode child-session visibility. To opt out of all proxying, including Task, use an explicit empty list:
 

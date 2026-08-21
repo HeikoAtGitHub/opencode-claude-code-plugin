@@ -131,7 +131,7 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-    * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`, `submit_plan`. Leave empty or unset to disable proxying.
+   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`, `submit_plan`, `workstream_manage`. Leave empty or unset to disable proxying.
     *
     * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
     * opencode's `task` tool, so subagent calls run under opencode's
@@ -141,8 +141,12 @@ export interface ClaudeCodeProviderSettings {
     * agent must have `permission.task: allow` for the target subagent
     * (see opencode's agent docs).
     *
-    * `submit_plan` proxies the Plannotator approval tool and may wait for
-    * browser review. Its default deadline is 24 hours.
+   * `submit_plan` proxies the Plannotator approval tool and may wait for
+   * browser review. Its default deadline is 24 hours.
+   *
+   * `workstream_manage` exposes only the controlled repair preview/apply/push
+   * actions and delegates authorization and execution to opencode's native
+   * workstream tool. It is opt-in and never executes Git inside this provider.
     *
     * `question` proxies Claude CLI's `AskUserQuestion` through opencode's
     * native `question` tool (TUI form with options + custom answer). The
@@ -154,7 +158,7 @@ export interface ClaudeCodeProviderSettings {
 
   /**
    * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool
-    * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`, `submit_plan` —
+     * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`, `submit_plan`, `workstream_manage` —
    * case-insensitive). When a proxied tool call waits longer than its
    * deadline for opencode to resolve it, the call is rejected and Claude
    * receives a timeout error.

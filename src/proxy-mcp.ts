@@ -74,6 +74,31 @@ export function isExpectedCleanupError(message: string): boolean {
   )
 }
 
+const WORKSTREAM_REPAIR_ACTIONS = new Set([
+  "repair_preview",
+  "repair_apply",
+  "repair_push",
+])
+const WORKSTREAM_SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/
+
+export function validateProxyToolInput(
+  toolName: string,
+  input: Record<string, unknown>,
+): string | null {
+  if (toolName.toLowerCase() !== "workstream_manage") return null
+  const keys = Object.keys(input).sort()
+  if (keys.length !== 2 || keys[0] !== "action" || keys[1] !== "slug") {
+    return "workstream_manage accepts exactly action and slug"
+  }
+  if (typeof input.action !== "string" || !WORKSTREAM_REPAIR_ACTIONS.has(input.action)) {
+    return "workstream_manage action must be repair_preview, repair_apply, or repair_push"
+  }
+  if (typeof input.slug !== "string" || !WORKSTREAM_SLUG_RE.test(input.slug)) {
+    return "workstream_manage slug is invalid"
+  }
+  return null
+}
+
 const SERVER_NAME = "opencode_proxy"
 export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 
@@ -526,6 +551,33 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
     },
   },
   {
+    name: "workstream_manage",
+    description:
+      "Run the controlled OpenCode workstream repair tool through OpenCode's" +
+      " native executor and permission gate. Only repair_preview," +
+      " repair_apply, and repair_push are exposed here. Preview is read-only;" +
+      " apply and push require separate approvals. This proxy executes no Git" +
+      " command itself and offers no raw argv, ref, remote, force, hash, path," +
+      " or state-root input.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: "string",
+          enum: ["repair_preview", "repair_apply", "repair_push"],
+          description: "Controlled repair phase to invoke through OpenCode.",
+        },
+        slug: {
+          type: "string",
+          pattern: "^[a-z0-9][a-z0-9._-]*$",
+          description: "Registered workstream slug without the agent/ prefix.",
+        },
+      },
+      required: ["action", "slug"],
+    },
+  },
+  {
     name: "question",
     description:
       "Ask the operator structured questions with options and receive" +
@@ -688,6 +740,19 @@ export async function createProxyMcpServer(
             id: requestId,
             result: {
               content: [{ type: "text", text: `Unknown proxy tool: ${toolName}` }],
+              isError: true,
+            },
+          })
+          return
+        }
+
+        const inputError = validateProxyToolInput(toolName, input)
+        if (inputError) {
+          writeJson(res, {
+            jsonrpc: "2.0",
+            id: requestId,
+            result: {
+              content: [{ type: "text", text: inputError }],
               isError: true,
             },
           })
