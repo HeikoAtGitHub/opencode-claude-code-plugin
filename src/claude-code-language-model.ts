@@ -873,11 +873,29 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
   private async ensureProxyServer(
     tools: ProxyToolDef[],
     sessionKeyForCalls: string,
+    callerContext: {
+      sessionAffinity: string
+      opencodeSessionID?: string
+      callerAgent?: string
+    },
   ): Promise<ProxyMcpServer> {
     const timeoutOverrides = this.config.proxyToolTimeoutMs
     const srv = await createProxyMcpServer(tools, timeoutOverrides)
+    let currentCallerContext = callerContext
+    srv.updateCallerContext = (next) => {
+      currentCallerContext = next
+    }
     srv.calls.on("call", (call: ProxyToolCall) => {
-      queuePendingProxyCall(sessionKeyForCalls, call, timeoutOverrides)
+      try {
+        queuePendingProxyCall(
+          sessionKeyForCalls,
+          call,
+          timeoutOverrides,
+          currentCallerContext,
+        )
+      } catch {
+        // queuePendingProxyCall already rejects privileged calls fail-closed.
+      }
     })
     return srv
   }
@@ -1095,6 +1113,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       (providerOptions as any)["claude-code"]
     const agent = bag?.opencodeAgent
     return typeof agent === "string" ? agent : undefined
+  }
+
+  private getOpencodeSessionID(
+    providerOptions?: LanguageModelV3CallOptions["providerOptions"],
+  ): string | undefined {
+    if (!providerOptions) return undefined
+    const ownKey = this.config.provider
+    const bag =
+      (providerOptions as any)[ownKey] ??
+      (providerOptions as any)["claude-code"]
+    const sessionID = bag?.opencodeSessionID
+    return typeof sessionID === "string" && sessionID ? sessionID : undefined
   }
 
   private isCompactionCall(
@@ -1756,6 +1786,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const skipPermissions = this.config.skipPermissions !== false
     const scope = this.requestScope(options as any)
     const affinity = this.sessionAffinity(options)
+    const proxyCallerContext = {
+      sessionAffinity: affinity,
+      opencodeSessionID: this.getOpencodeSessionID(options.providerOptions),
+      callerAgent: this.getOpencodeAgent(options.providerOptions),
+    }
     const compactionMode = this.isCompactionCall(options)
     // Use a separate session key for compaction so its short-lived spawn
     // never collides with the main conversation's claude process.
@@ -2148,8 +2183,13 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             const combinedProxyTools: ProxyToolDef[] | null =
               combinedList.length > 0 ? combinedList : null
 
+            proxyServer?.updateCallerContext?.(proxyCallerContext)
             if (!proxyServer && combinedProxyTools) {
-              proxyServer = await self.ensureProxyServer(combinedProxyTools, sk)
+              proxyServer = await self.ensureProxyServer(
+                combinedProxyTools,
+                sk,
+                proxyCallerContext,
+              )
             }
 
             // Whether the question proxy actually survived the version

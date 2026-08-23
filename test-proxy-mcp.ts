@@ -26,6 +26,19 @@ import {
   type ProxyToolCall,
   type ProxyToolResult,
 } from "./src/proxy-mcp.js"
+import {
+  WORKSTREAM_ACTIONS,
+  WORKSTREAM_TRANSPORT_CONTRACT_VERSION,
+  WORKSTREAM_TRANSPORT_SCHEMA_HASH,
+} from "./src/index.js"
+import {
+  getPendingProxyCalls,
+  onPendingProxyCall,
+  queuePendingProxyCall,
+  rejectAllPendingProxyCallsForSession,
+  resolvePendingProxyCallById,
+  type PendingProxyCall,
+} from "./src/proxy-broker.js"
 
 function post(url: string, body: unknown): Promise<{
   status: number
@@ -108,41 +121,133 @@ test("submit_plan dispatches through proxy as an MCP result", async () => {
   }
 })
 
-test("workstream_manage proxy exposes only controlled repair actions", () => {
+const EXPECTED_WORKSTREAM_ACTIONS = [
+  "list", "sessions", "new", "resume", "group_new", "member_new",
+  "finish_preview", "finish_apply", "sync_preview", "sync_apply", "sync_push",
+  "repair_preview", "repair_apply", "repair_push",
+  "cleanup_preview", "cleanup_apply", "cleanup_push",
+  "group_refresh_preview", "group_refresh_apply", "group_refresh_push",
+  "group_finish_preview", "group_finish_apply", "group_finish_push",
+  "group_cleanup_preview", "group_cleanup_apply", "group_cleanup_push",
+  "group_repair_preview", "group_repair_apply", "group_repair_push",
+  "abandon_preview",
+]
+
+test("workstream_manage proxy schema matches the native transport surface", () => {
   const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
   assert.ok(workstream)
   const schema = workstream.inputSchema as any
   assert.equal(schema.additionalProperties, false)
-  assert.deepEqual(schema.required, ["action", "slug"])
-  assert.deepEqual(schema.properties.action.enum, [
-    "repair_preview", "repair_apply", "repair_push",
+  assert.deepEqual(schema.required, ["action"])
+  assert.deepEqual(Object.keys(schema.properties).sort(), [
+    "action", "group_id", "members", "slug",
   ])
-  assert.equal(validateProxyToolInput("workstream_manage", {
-    action: "repair_preview", slug: "stlk_analyse",
-  }), null)
-  assert.match(validateProxyToolInput("workstream_manage", {
-    action: "sync_apply", slug: "stlk_analyse",
-  })!, /action must be/)
-  assert.match(validateProxyToolInput("workstream_manage", {
-    action: "repair_apply", slug: "stlk_analyse", remote: "origin",
-  })!, /exactly action and slug/)
+  assert.deepEqual(WORKSTREAM_ACTIONS, EXPECTED_WORKSTREAM_ACTIONS)
+  assert.deepEqual(schema.properties.action.enum, EXPECTED_WORKSTREAM_ACTIONS)
+  assert.equal(schema.properties.slug.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
+  assert.equal(schema.properties.group_id.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
+  assert.equal(schema.properties.members.items.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
+  assert.match(workstream.description, /sole authorization and execution owner/)
+  for (const forbidden of [
+    "preview_token", "refs", "paths", "hashes", "remotes", "force", "argv",
+  ]) {
+    assert.equal(schema.properties[forbidden], undefined)
+  }
 })
 
-test("workstream_manage dispatches exact input and rejects raw extras", async () => {
+test("workstream_manage exports pinned transport contract evidence", () => {
+  assert.equal(WORKSTREAM_TRANSPORT_CONTRACT_VERSION, 1)
+  assert.equal(
+    WORKSTREAM_TRANSPORT_SCHEMA_HASH,
+    "e050f522d06eb6a315a7b7503ca7acd12a32b1bf14931fd32f9e35a7ae1e3b17",
+  )
+})
+
+test("workstream_manage validates native action-specific inputs", () => {
+  for (const action of ["list"] as const) {
+    assert.equal(validateProxyToolInput("workstream_manage", { action }), null)
+  }
+  for (const action of [
+    "sessions", "new", "resume", "finish_preview", "finish_apply",
+    "sync_preview", "sync_apply", "sync_push", "repair_preview", "repair_apply",
+    "repair_push", "cleanup_preview", "cleanup_apply", "cleanup_push", "abandon_preview",
+  ] as const) {
+    assert.equal(validateProxyToolInput("workstream_manage", {
+      action, slug: "stlk_analyse",
+    }), null)
+  }
+  for (const action of [
+    "group_refresh_preview", "group_refresh_apply", "group_refresh_push",
+    "group_finish_preview", "group_finish_apply", "group_finish_push",
+    "group_cleanup_preview", "group_cleanup_apply", "group_cleanup_push",
+    "group_repair_preview", "group_repair_apply", "group_repair_push",
+  ] as const) {
+    assert.equal(validateProxyToolInput("workstream_manage", {
+      action, group_id: "general",
+    }), null)
+  }
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "group_new", group_id: "general", members: ["one", "two"],
+  }), null)
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "member_new", group_id: "general", slug: "three",
+  }), null)
+})
+
+test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "unknown", slug: "stlk_analyse",
+  })!, /action must be/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "sync_apply",
+  })!, /requires slug/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "group_refresh_apply", slug: "stlk_analyse",
+  })!, /requires group_id/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "list", slug: "stlk_analyse",
+  })!, /does not accept slug/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "member_new", group_id: "general", slug: "three", members: ["four"],
+  })!, /does not accept members/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "group_new", group_id: "General",
+  })!, /group_id is invalid/)
+  for (const identifier of [".", ".."] as const) {
+    assert.match(validateProxyToolInput("workstream_manage", {
+      action: "repair_preview", slug: identifier,
+    })!, /slug is invalid/)
+    assert.match(validateProxyToolInput("workstream_manage", {
+      action: "group_repair_preview", group_id: identifier,
+    })!, /group_id is invalid/)
+    assert.match(validateProxyToolInput("workstream_manage", {
+      action: "group_new", group_id: "general", members: [identifier],
+    })!, /members are invalid/)
+  }
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "repair_apply", slug: "stlk_analyse", remote: "origin",
+  })!, /accepts only/)
+})
+
+test("workstream_manage dispatches exact group input and rejects raw extras", async () => {
   const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
   assert.ok(workstream)
   const srv = await createProxyMcpServer([workstream])
   try {
     srv.calls.once("call", (call: ProxyToolCall) => {
       assert.equal(call.toolName, "workstream_manage")
-      assert.deepEqual(call.input, { action: "repair_preview", slug: "stlk_analyse" })
+      assert.deepEqual(call.input, {
+        action: "group_new", group_id: "general", members: ["one", "two"],
+      })
       call.resolve({ kind: "text", text: "preview-ok" })
     })
     const accepted = await post(srv.url, {
       jsonrpc: "2.0", id: "repair-1", method: "tools/call",
       params: {
         name: "workstream_manage",
-        arguments: { action: "repair_preview", slug: "stlk_analyse" },
+        arguments: {
+          action: "group_new", group_id: "general", members: ["one", "two"],
+        },
       },
     })
     assert.equal(accepted.json.result.isError, false)
@@ -156,9 +261,97 @@ test("workstream_manage dispatches exact input and rejects raw extras", async ()
       },
     })
     assert.equal(rejected.json.result.isError, true)
-    assert.match(rejected.json.result.content[0].text, /exactly action and slug/)
+    assert.match(rejected.json.result.content[0].text, /accepts only/)
   } finally {
     await srv.close()
+  }
+})
+
+test("workstream_manage keeps session affinity and input unchanged through the broker", async () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
+  assert.ok(workstream)
+  const affinity = `workstream-affinity-${Date.now()}`
+  const input = { action: "group_repair_apply", group_id: "general" }
+  const srv = await createProxyMcpServer([workstream])
+  const forwardCall = (call: ProxyToolCall) => queuePendingProxyCall(
+    affinity,
+    call,
+    undefined,
+    {
+      sessionAffinity: affinity,
+      opencodeSessionID: affinity,
+      callerAgent: "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER",
+    },
+  )
+  srv.calls.on("call", forwardCall)
+  try {
+    const pendingCall = new Promise<PendingProxyCall>((resolve) => {
+      const unsubscribe = onPendingProxyCall(affinity, (call) => {
+        unsubscribe()
+        resolve(call)
+      })
+    })
+    const response = post(srv.url, {
+      jsonrpc: "2.0", id: "member-new-1", method: "tools/call",
+      params: { name: "workstream_manage", arguments: input },
+    })
+    const call = await pendingCall
+    assert.equal(call.sessionKey, affinity)
+    assert.equal(call.sessionAffinity, affinity)
+    assert.equal(call.callerAgent, "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER")
+    assert.deepEqual(call.input, input)
+    assert.deepEqual(Object.keys(call.input).sort(), ["action", "group_id"])
+    assert.equal(resolvePendingProxyCallById(call.toolCallId, {
+      kind: "text", text: "member-created",
+    }), true)
+    assert.equal((await response).json.result.content[0].text, "member-created")
+  } finally {
+    srv.calls.off("call", forwardCall)
+    rejectAllPendingProxyCallsForSession(affinity, new Error("test cleanup"))
+    await srv.close()
+  }
+})
+
+test("workstream_manage HTTP bridge rejects missing and mismatched affinity", async () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
+  assert.ok(workstream)
+  for (const [name, context] of [
+    ["missing", undefined],
+    ["default", {
+      sessionAffinity: "default",
+      opencodeSessionID: "default",
+      callerAgent: "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER",
+    }],
+    ["mismatched", {
+      sessionAffinity: "session-header",
+      opencodeSessionID: "session-provider",
+      callerAgent: "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER",
+    }],
+  ] as const) {
+    const srv = await createProxyMcpServer([workstream])
+    const forwardCall = (call: ProxyToolCall) => {
+      try {
+        queuePendingProxyCall("privileged-integration", call, undefined, context)
+      } catch {}
+    }
+    srv.calls.on("call", forwardCall)
+    try {
+      const response = await post(srv.url, {
+        jsonrpc: "2.0",
+        id: `affinity-${name}`,
+        method: "tools/call",
+        params: {
+          name: "workstream_manage",
+          arguments: { action: "group_repair_preview", group_id: "general" },
+        },
+      })
+      assert.equal(response.json.result.isError, true)
+      assert.match(response.json.result.content[0].text, /exact OpenCode session affinity/)
+      assert.deepEqual(getPendingProxyCalls("privileged-integration"), [])
+    } finally {
+      srv.calls.off("call", forwardCall)
+      await srv.close()
+    }
   }
 })
 

@@ -437,7 +437,7 @@ test("opencode provider registration defaults Task without overriding proxyTools
   assert.deepEqual(explicit.provider["claude-code"].options.proxyTools, [])
 })
 
-test("parent and child calls retain distinct opencode session affinity", async () => {
+test("parent and child calls retain exact session affinity and caller agent", async () => {
   const hooks = await plugin.server({})
   const parentOutput: any = {}
   const childOutput: any = {}
@@ -461,6 +461,8 @@ test("parent and child calls retain distinct opencode session affinity", async (
 
   assert.equal(parentOutput.options.opencodeSessionID, "session-parent")
   assert.equal(childOutput.options.opencodeSessionID, "session-child")
+  assert.equal(parentOutput.options.opencodeAgent, "build")
+  assert.equal(childOutput.options.opencodeAgent, "general")
   assert.notEqual(
     parentOutput.options.opencodeSessionID,
     childOutput.options.opencodeSessionID,

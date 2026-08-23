@@ -18,6 +18,7 @@ import {
   rejectPendingProxyCallById,
   rejectAllPendingProxyCallsForSession,
   type PendingProxyCall,
+  PRIVILEGED_PROXY_CONTEXT_ERROR,
 } from "./src/proxy-broker.js"
 import type { ProxyToolCall, ProxyToolResult } from "./src/proxy-mcp.js"
 
@@ -167,6 +168,43 @@ test("onPendingProxyCall fires once per queued call for the matching session", (
 
 test("getPendingProxyCalls is empty for unknown session", () => {
   assert.deepEqual(getPendingProxyCalls(`sk-empty-${Date.now()}`), [])
+})
+
+test("workstream_manage fails closed without exact affinity and caller context", () => {
+  for (const context of [
+    undefined,
+    { sessionAffinity: "default", opencodeSessionID: "default", callerAgent: "manager" },
+    { sessionAffinity: "session-a", opencodeSessionID: "session-b", callerAgent: "manager" },
+    { sessionAffinity: "session-a", opencodeSessionID: "session-a" },
+  ]) {
+    const call = makeCall("workstream_manage", {
+      action: "group_repair_preview",
+      group_id: "general",
+    })
+    assert.throws(
+      () => queuePendingProxyCall("composite-key", call.call, undefined, context),
+      new RegExp(PRIVILEGED_PROXY_CONTEXT_ERROR),
+    )
+    assert.equal(getPendingProxyCalls("composite-key").length, 0)
+  }
+})
+
+test("workstream_manage broker preserves exact caller context and payload", () => {
+  const sessionAffinity = "session-exact"
+  const callerAgent = "99_generic_WS_GROUP_GIT_MANAGER"
+  const input = { action: "group_repair_apply", group_id: "general" }
+  const call = makeCall("workstream_manage", input)
+  const pending = queuePendingProxyCall(
+    "composite-key-exact",
+    call.call,
+    undefined,
+    { sessionAffinity, opencodeSessionID: sessionAffinity, callerAgent },
+  )
+  assert.equal(pending.sessionAffinity, sessionAffinity)
+  assert.equal(pending.callerAgent, callerAgent)
+  assert.deepEqual(pending.input, input)
+  assert.deepEqual(Object.keys(pending.input).sort(), ["action", "group_id"])
+  rejectAllPendingProxyCallsForSession("composite-key-exact", new Error("test cleanup"))
 })
 
 test("resolve / reject on already-resolved id is a no-op returning false", () => {

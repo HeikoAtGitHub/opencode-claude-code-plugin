@@ -9,10 +9,38 @@ import { log } from "./logger.js"
 
 export interface PendingProxyCall {
   sessionKey: string
+  sessionAffinity?: string
+  callerAgent?: string
   toolCallId: string
   toolName: string
   input: Record<string, unknown>
   timeoutMs?: number
+}
+
+export interface ProxyCallerContext {
+  sessionAffinity: string
+  opencodeSessionID?: string
+  callerAgent?: string
+}
+
+export const PRIVILEGED_PROXY_CONTEXT_ERROR =
+  "workstream_manage requires exact OpenCode session affinity and caller context"
+
+export function validatePrivilegedProxyContext(
+  context: ProxyCallerContext | undefined,
+): string | null {
+  if (
+    !context ||
+    !context.sessionAffinity?.trim() ||
+    context.sessionAffinity === "default" ||
+    !context.opencodeSessionID?.trim() ||
+    context.opencodeSessionID === "default" ||
+    context.sessionAffinity !== context.opencodeSessionID ||
+    !context.callerAgent?.trim()
+  ) {
+    return PRIVILEGED_PROXY_CONTEXT_ERROR
+  }
+  return null
 }
 
 type InternalPending = PendingProxyCall & {
@@ -64,7 +92,15 @@ export function queuePendingProxyCall(
   sessionKey: string,
   call: ProxyToolCall,
   timeoutOverrides?: Record<string, number>,
+  callerContext?: ProxyCallerContext,
 ): PendingProxyCall {
+  if (call.toolName.toLowerCase() === "workstream_manage") {
+    const contextError = validatePrivilegedProxyContext(callerContext)
+    if (contextError) {
+      call.reject(new Error(contextError))
+      throw new Error(contextError)
+    }
+  }
   // Defensive: if this exact callId is somehow already pending (UUID
   // collision or retry storm), replace it cleanly so we never leak two
   // entries for the same id.
@@ -102,6 +138,8 @@ export function queuePendingProxyCall(
 
   const pending: InternalPending = {
     sessionKey,
+    sessionAffinity: callerContext?.sessionAffinity,
+    callerAgent: callerContext?.callerAgent,
     toolCallId: call.id,
     toolName: call.toolName,
     input: call.input,
