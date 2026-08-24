@@ -6,6 +6,13 @@ import * as crypto from "node:crypto"
 import { EventEmitter } from "node:events"
 import { log } from "./logger.js"
 import { pluginTmpDir } from "./tmp.js"
+import {
+  WORKSTREAM_ACTIONS,
+  WORKSTREAM_CONTRACT_SHA256,
+  WORKSTREAM_CONTRACT_VERSION,
+  WORKSTREAM_INPUT_SCHEMA,
+  validateWorkstreamInput,
+} from "./workstream-contract.js"
 
 /**
  * Minimal MCP HTTP server embedded in-process. Exposes a set of "proxy"
@@ -80,134 +87,35 @@ export function isExpectedCleanupError(message: string): boolean {
   )
 }
 
-export const WORKSTREAM_ACTIONS = [
-  "list",
-  "sessions",
-  "new",
-  "resume",
-  "group_new",
-  "member_new",
-  "finish_preview",
-  "finish_apply",
-  "sync_preview",
-  "sync_apply",
-  "sync_push",
-  "repair_preview",
-  "repair_apply",
-  "repair_push",
-  "cleanup_preview",
-  "cleanup_apply",
-  "cleanup_push",
-  "group_refresh_preview",
-  "group_refresh_apply",
-  "group_refresh_push",
-  "group_finish_preview",
-  "group_finish_apply",
-  "group_finish_push",
-  "group_cleanup_preview",
-  "group_cleanup_apply",
-  "group_cleanup_push",
-  "group_repair_preview",
-  "group_repair_apply",
-  "group_repair_push",
-  "abandon_preview",
-] as const
-export const WORKSTREAM_TRANSPORT_CONTRACT_VERSION = 1
-const WORKSTREAM_ACTION_SET = new Set<string>(WORKSTREAM_ACTIONS)
-const WORKSTREAM_SLUG_ACTIONS = new Set<string>([
-  "sessions", "new", "resume", "finish_preview", "finish_apply",
-  "sync_preview", "sync_apply", "sync_push", "repair_preview", "repair_apply",
-  "repair_push", "cleanup_preview", "cleanup_apply", "cleanup_push", "abandon_preview",
-])
-const WORKSTREAM_GROUP_ACTIONS = new Set<string>([
-  "group_new", "member_new", "group_refresh_preview", "group_refresh_apply",
-  "group_refresh_push", "group_finish_preview", "group_finish_apply",
-  "group_finish_push", "group_cleanup_preview", "group_cleanup_apply",
-  "group_cleanup_push", "group_repair_preview", "group_repair_apply",
-  "group_repair_push",
-])
-const WORKSTREAM_INPUT_KEY_LIST = ["action", "slug", "group_id", "members"] as const
-const WORKSTREAM_INPUT_KEYS = new Set<string>(WORKSTREAM_INPUT_KEY_LIST)
-const WORKSTREAM_ID_RE = /^[a-z0-9._-]+$/
-const WORKSTREAM_ID_PATTERN = "^(?!\\.{1,2}$)[a-z0-9._-]+$"
-
-const WORKSTREAM_ACTION_RULES = WORKSTREAM_ACTIONS.map((action) => ({
-  action,
-  required: [
-    "action",
-    ...(WORKSTREAM_SLUG_ACTIONS.has(action) || action === "member_new" ? ["slug"] : []),
-    ...(WORKSTREAM_GROUP_ACTIONS.has(action) ? ["group_id"] : []),
-  ],
-  optional: action === "group_new" ? ["members"] : [],
-}))
-
-/** Provider-owned transport evidence only. OpenCode's native tool remains the
- * authoritative action and authorization owner. */
-export const WORKSTREAM_TRANSPORT_SCHEMA_HASH = crypto
-  .createHash("sha256")
-  .update(JSON.stringify({
-    version: WORKSTREAM_TRANSPORT_CONTRACT_VERSION,
-    additionalProperties: false,
-    inputKeys: WORKSTREAM_INPUT_KEY_LIST,
-    identifierPattern: WORKSTREAM_ID_PATTERN,
-    actions: WORKSTREAM_ACTION_RULES,
-  }))
-  .digest("hex")
-
-function isWorkstreamIdentifier(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    WORKSTREAM_ID_RE.test(value) &&
-    value !== "." &&
-    value !== ".."
-  )
-}
+export { WORKSTREAM_ACTIONS }
+export const WORKSTREAM_TRANSPORT_CONTRACT_VERSION = WORKSTREAM_CONTRACT_VERSION
+export const WORKSTREAM_TRANSPORT_SCHEMA_HASH = WORKSTREAM_CONTRACT_SHA256
 
 export function validateProxyToolInput(
   toolName: string,
   input: Record<string, unknown>,
 ): string | null {
   if (toolName.toLowerCase() !== "workstream_manage") return null
-  const keys = Object.keys(input)
-  if (!keys.includes("action") || keys.some((key) => !WORKSTREAM_INPUT_KEYS.has(key))) {
-    return "workstream_manage accepts only action, slug, group_id, and members"
-  }
-  if (typeof input.action !== "string" || !WORKSTREAM_ACTION_SET.has(input.action)) {
-    return `workstream_manage action must be one of: ${WORKSTREAM_ACTIONS.join(", ")}`
-  }
-  if (
-    input.slug !== undefined &&
-    !isWorkstreamIdentifier(input.slug)
-  ) {
-    return "workstream_manage slug is invalid"
-  }
-  if (
-    input.group_id !== undefined &&
-    !isWorkstreamIdentifier(input.group_id)
-  ) {
-    return "workstream_manage group_id is invalid"
-  }
-  if (
-    input.members !== undefined &&
-    (!Array.isArray(input.members) ||
-      input.members.some(
-        (member) => !isWorkstreamIdentifier(member),
-      ))
-  ) {
-    return "workstream_manage members are invalid"
-  }
+  return validateWorkstreamInput(input)
+}
 
-  const action = input.action
-  const needsSlug = WORKSTREAM_SLUG_ACTIONS.has(action) || action === "member_new"
-  const needsGroup = WORKSTREAM_GROUP_ACTIONS.has(action)
-  if (needsSlug && input.slug === undefined) return `${action} requires slug`
-  if (needsGroup && input.group_id === undefined) return `${action} requires group_id`
-  if (!needsSlug && input.slug !== undefined) return `${action} does not accept slug`
-  if (!needsGroup && input.group_id !== undefined) return `${action} does not accept group_id`
-  if (action !== "group_new" && input.members !== undefined) {
-    return `${action} does not accept members`
-  }
-  return null
+export function filterWorkstreamProxyByAvailability(
+  tools: ProxyToolDef[],
+  requestToolNames: ReadonlySet<string>,
+  liveToolIds: ReadonlySet<string> | undefined,
+): ProxyToolDef[] {
+  if (
+    requestToolNames.has("workstream_manage") &&
+    liveToolIds?.has("workstream_manage")
+  ) return tools
+  return tools.filter((tool) => tool.name !== "workstream_manage")
+}
+
+export function proxyToolExposureHash(tools: ProxyToolDef[] | null): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify(tools ?? []))
+    .digest("hex")
 }
 
 const SERVER_NAME = "opencode_proxy"
@@ -669,33 +577,7 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " including caller-agent checks, session-bound state, approvals, and" +
       " wrapper execution. This proxy performs no Git operation and exposes" +
       " no raw argv, ref, remote, force, hash, path, or state-root input.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        action: {
-          type: "string",
-          enum: WORKSTREAM_ACTIONS,
-          description: "Native workstream_manage action to transport unchanged.",
-        },
-        slug: {
-          type: "string",
-          pattern: WORKSTREAM_ID_PATTERN,
-          description: "Registered workstream slug without the agent/ prefix.",
-        },
-        group_id: {
-          type: "string",
-          pattern: WORKSTREAM_ID_PATTERN,
-          description: "Registered workstream group id.",
-        },
-        members: {
-          type: "array",
-          items: { type: "string", pattern: WORKSTREAM_ID_PATTERN },
-          description: "Initial member slugs for group_new.",
-        },
-      },
-      required: ["action"],
-    },
+    inputSchema: WORKSTREAM_INPUT_SCHEMA,
   },
   {
     name: "question",

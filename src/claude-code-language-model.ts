@@ -21,6 +21,7 @@ import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
 import {
   getRuntimeMcpStatus,
   fetchOpencodeToolList,
+  type OpencodeToolListItem,
   resolveSpawnCwd,
 } from "./runtime-status.js"
 import {
@@ -48,6 +49,8 @@ import {
   overlayTaskProxyDescription,
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
+  filterWorkstreamProxyByAvailability,
+  proxyToolExposureHash,
   PROXY_TOOL_PREFIX,
   type ProxyMcpServer,
   type ProxyToolCall,
@@ -136,6 +139,17 @@ export function resolveSessionAffinity(
     if (typeof sid === "string" && sid.length > 0) return sid
   }
   return "default"
+}
+
+export function requestToolNameSet(tools: unknown): Set<string> {
+  if (!Array.isArray(tools)) return new Set()
+  return new Set(
+    tools.flatMap((tool) =>
+      tool && typeof tool === "object" && typeof tool.name === "string"
+        ? [tool.name]
+        : [],
+    ),
+  )
 }
 
 /**
@@ -793,16 +807,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
    */
   private async resolvedProxyMcpTools(
     allEnabledServerNames: string[],
+    items: OpencodeToolListItem[] | undefined,
   ): Promise<ProxyToolDef[] | null> {
     if (this.config.proxyOpencodeMcpTools === false) return null
     if (this.config.bridgeOpencodeMcp === false) return null
     if (allEnabledServerNames.length === 0) return null
 
-    const items = await fetchOpencodeToolList(
-      this.config.provider,
-      this.modelId,
-      this.config.cwd,
-    )
     if (!items || items.length === 0) return null
 
     // opencode names MCP tools `<server>_<originalToolName>`. Match the
@@ -848,16 +858,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
    * Returns undefined/false when the SDK client is unavailable (direct
    * AI-SDK use, tests) so the static defs stand.
    */
-  private async fetchLiveToolInfo(): Promise<{
+  private fetchLiveToolInfo(items: OpencodeToolListItem[] | undefined): {
     taskDescription: string | undefined
     questionDescription: string | undefined
     hasQuestion: boolean
-  }> {
-    const items = await fetchOpencodeToolList(
-      this.config.provider,
-      this.modelId,
-      this.config.cwd,
-    )
+  } {
     const question = items?.find((item) => item.id === "question")
     return {
       taskDescription: items?.find((item) => item.id === "task")?.description,
@@ -877,6 +882,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       sessionAffinity: string
       opencodeSessionID?: string
       callerAgent?: string
+      allowWorkstreamManage?: boolean
     },
   ): Promise<ProxyMcpServer> {
     const timeoutOverrides = this.config.proxyToolTimeoutMs
@@ -1790,6 +1796,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       sessionAffinity: affinity,
       opencodeSessionID: this.getOpencodeSessionID(options.providerOptions),
       callerAgent: this.getOpencodeAgent(options.providerOptions),
+      allowWorkstreamManage: false,
     }
     const compactionMode = this.isCompactionCall(options)
     // Use a separate session key for compaction so its short-lived spawn
@@ -1929,9 +1936,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // the SDK client routes through `Server.app.fetch` (no socket).
     // Detect the Claude CLI version in parallel so the spawn can decide
     // which optional flags it supports without crashing older binaries.
-    const [runtimeStatus, cliVersion] = await Promise.all([
+    const [runtimeStatus, cliVersion, liveToolCatalog] = await Promise.all([
       compactionMode ? Promise.resolve(undefined) : getRuntimeMcpStatus(),
       detectCliVersion(this.config.cliPath),
+      compactionMode
+        ? Promise.resolve(undefined)
+        : fetchOpencodeToolList(this.config.provider, this.modelId, cwd),
     ])
 
     log.info("doStream starting", {
@@ -1967,6 +1977,56 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         let proxyServer: ProxyMcpServer | null = activeProcess?.proxyServer ?? null
 
         const setup = async () => {
+          const requestToolNames = requestToolNameSet(options.tools)
+          const liveToolIds = liveToolCatalog
+            ? new Set(liveToolCatalog.map((tool) => tool.id))
+            : undefined
+          let requestProxy = resolvedProxy
+            ? filterWorkstreamProxyByAvailability(
+                resolvedProxy,
+                requestToolNames,
+                liveToolIds,
+              )
+            : null
+          if (requestProxy?.some((tool) => tool.name === "question")) {
+            requestProxy = filterQuestionProxyByOpencodeSupport(
+              requestProxy,
+              liveToolIds?.has("question") ?? false,
+            )
+          }
+          if (requestProxy?.length === 0) requestProxy = null
+          proxyCallerContext.allowWorkstreamManage =
+            requestProxy?.some((tool) => tool.name === "workstream_manage") ?? false
+          // A reused process can retain spawn-time definitions while unrelated
+          // proxy calls are pending. Refresh broker context before any await so
+          // a stale definition cannot authorize a new privileged call.
+          proxyServer?.updateCallerContext?.(proxyCallerContext)
+          const currentProxyExposureHash = proxyToolExposureHash(requestProxy)
+
+          if (
+            !compactionMode &&
+            activeProcess &&
+            activeProcess.proxyExposureHash !== currentProxyExposureHash
+          ) {
+            if (previousPendingProxyCalls.length > 0) {
+              log.info("deferring proxy exposure refresh until proxy calls resolve", {
+                sk,
+                previousHash: activeProcess.proxyExposureHash,
+                currentHash: currentProxyExposureHash,
+                pendingCalls: previousPendingProxyCalls.length,
+              })
+            } else {
+              log.info("proxy exposure changed, respawning claude", {
+                sk,
+                previousHash: activeProcess.proxyExposureHash,
+                currentHash: currentProxyExposureHash,
+              })
+              await deleteActiveProcessAndWait(sk)
+              activeProcess = undefined
+              proxyServer = null
+            }
+          }
+
           // Wait for the old owner to exit before resuming its session ID in
           // the replacement, so two processes never append to one transcript.
           if (
@@ -2055,6 +2115,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 ignoreAnthropicApiKey: self.config.ignoreAnthropicApiKey,
               })
               ap.mcpHash = mcp.bridgedHash
+              ap.proxyExposureHash = currentProxyExposureHash
               setActiveProcess(sk, ap)
               proc = ap.proc
               lineEmitter = ap.lineEmitter
@@ -2103,6 +2164,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // bridging.
             const proxyMcpTools = await self.resolvedProxyMcpTools(
               discovery.allEnabledServerNames,
+              liveToolCatalog,
             )
             const excludeServers: ReadonlySet<string> | undefined = proxyMcpTools
               ? new Set(discovery.allEnabledServerNames)
@@ -2117,18 +2179,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // derive from a single tool-list fetch. Spawn-time only, like
             // the rest of this block; a reused process keeps its defs.
             const taskProxyEnabled =
-              resolvedProxy?.some((t) => t.name === "task") ?? false
+              requestProxy?.some((t) => t.name === "task") ?? false
             const questionProxyEnabled =
-              resolvedProxy?.some((t) => t.name === "question") ?? false
+              requestProxy?.some((t) => t.name === "question") ?? false
             const liveToolInfo =
               taskProxyEnabled || questionProxyEnabled
-                ? await self.fetchLiveToolInfo()
+                ? self.fetchLiveToolInfo(liveToolCatalog)
                 : {
                     taskDescription: undefined,
                     questionDescription: undefined,
                     hasQuestion: false,
                   }
-            let enrichedProxy = resolvedProxy
+            let enrichedProxy = requestProxy
             if (enrichedProxy && taskProxyEnabled) {
               enrichedProxy = overlayTaskProxyDescription(
                 enrichedProxy,
@@ -2263,6 +2325,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               spawnMcpHash,
               spawnSystemPromptFile,
               self.config.ignoreAnthropicApiKey,
+              currentProxyExposureHash,
             )
             proc = ap.proc
             lineEmitter = ap.lineEmitter

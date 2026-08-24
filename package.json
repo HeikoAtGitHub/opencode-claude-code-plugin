@@ -17,10 +17,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "npm run contract:check && tsup && npm run verify:dist",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test test-bridge.ts test-broker.ts test-proxy-mcp.ts test-proxy-task.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-session-manager.ts test-compaction-model.ts test-tool-mapping.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts test-respawn.ts test-startup-diagnostics.ts test-subagent-hint.ts"
+    "test": "npm run contract:check && tsx --test test-bridge.ts test-broker.ts test-proxy-mcp.ts test-proxy-task.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-session-manager.ts test-compaction-model.ts test-tool-mapping.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts test-respawn.ts test-startup-diagnostics.ts test-subagent-hint.ts",
+    "contract:check": "node check-workstream-contract.mjs",
+    "verify:dist": "node verify-dist.mjs"
   },
   "dependencies": {
     "@ai-sdk/provider": "^3.0.8",

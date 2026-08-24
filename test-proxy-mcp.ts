@@ -18,6 +18,8 @@ import {
   resolveProxyClientCeilingMs,
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
+  filterWorkstreamProxyByAvailability,
+  proxyToolExposureHash,
   validateProxyToolInput,
   DEFAULT_PROXY_TOOLS,
   PROXY_DEFAULT_TIMEOUT_MS,
@@ -28,9 +30,14 @@ import {
 } from "./src/proxy-mcp.js"
 import {
   WORKSTREAM_ACTIONS,
+  WORKSTREAM_INPUT_SCHEMA,
+  WORKSTREAM_CONTRACT,
+  WORKSTREAM_CONTRACT_VERSION,
+  WORKSTREAM_CONTRACT_SHA256,
   WORKSTREAM_TRANSPORT_CONTRACT_VERSION,
   WORKSTREAM_TRANSPORT_SCHEMA_HASH,
 } from "./src/index.js"
+import { requestToolNameSet } from "./src/claude-code-language-model.js"
 import {
   getPendingProxyCalls,
   onPendingProxyCall,
@@ -121,77 +128,57 @@ test("submit_plan dispatches through proxy as an MCP result", async () => {
   }
 })
 
-const EXPECTED_WORKSTREAM_ACTIONS = [
-  "list", "sessions", "new", "resume", "group_new", "member_new",
-  "finish_preview", "finish_apply", "sync_preview", "sync_apply", "sync_push",
-  "repair_preview", "repair_apply", "repair_push",
-  "cleanup_preview", "cleanup_apply", "cleanup_push",
-  "group_refresh_preview", "group_refresh_apply", "group_refresh_push",
-  "group_finish_preview", "group_finish_apply", "group_finish_push",
-  "group_cleanup_preview", "group_cleanup_apply", "group_cleanup_push",
-  "group_repair_preview", "group_repair_apply", "group_repair_push",
-  "abandon_preview",
-]
-
 test("workstream_manage proxy schema matches the native transport surface", () => {
   const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
   assert.ok(workstream)
   const schema = workstream.inputSchema as any
-  assert.equal(schema.additionalProperties, false)
-  assert.deepEqual(schema.required, ["action"])
-  assert.deepEqual(Object.keys(schema.properties).sort(), [
-    "action", "group_id", "members", "slug",
-  ])
-  assert.deepEqual(WORKSTREAM_ACTIONS, EXPECTED_WORKSTREAM_ACTIONS)
-  assert.deepEqual(schema.properties.action.enum, EXPECTED_WORKSTREAM_ACTIONS)
-  assert.equal(schema.properties.slug.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
-  assert.equal(schema.properties.group_id.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
-  assert.equal(schema.properties.members.items.pattern, "^(?!\\.{1,2}$)[a-z0-9._-]+$")
+  assert.equal(schema, WORKSTREAM_INPUT_SCHEMA)
+  assert.deepEqual(WORKSTREAM_ACTIONS, Object.keys(WORKSTREAM_CONTRACT.actions))
+  assert.equal(schema.oneOf.length, WORKSTREAM_ACTIONS.length)
+  for (const action of WORKSTREAM_ACTIONS) {
+    const branch = schema.oneOf.find(
+      (candidate: any) => candidate.properties.action.const === action,
+    )
+    assert.ok(branch, `missing schema branch for ${action}`)
+    assert.equal(branch.additionalProperties, false)
+    for (const rawArg of WORKSTREAM_CONTRACT.actions[action].args) {
+      const arg = rawArg.replace(/\?$/, "")
+      const property = branch.properties[arg]
+      assert.ok(property, `${action} missing ${arg} property`)
+      const pattern = arg === "members" ? property.items.pattern : property.pattern
+      assert.equal(pattern, WORKSTREAM_CONTRACT.identifier_pattern)
+      assert.equal(branch.required.includes(arg), !rawArg.endsWith("?"))
+    }
+  }
+  assert.ok(WORKSTREAM_ACTIONS.includes("member_adopt"))
   assert.match(workstream.description, /sole authorization and execution owner/)
   for (const forbidden of [
     "preview_token", "refs", "paths", "hashes", "remotes", "force", "argv",
   ]) {
-    assert.equal(schema.properties[forbidden], undefined)
+    for (const branch of schema.oneOf) {
+      assert.equal(branch.properties[forbidden], undefined)
+    }
   }
 })
 
 test("workstream_manage exports pinned transport contract evidence", () => {
-  assert.equal(WORKSTREAM_TRANSPORT_CONTRACT_VERSION, 1)
-  assert.equal(
-    WORKSTREAM_TRANSPORT_SCHEMA_HASH,
-    "e050f522d06eb6a315a7b7503ca7acd12a32b1bf14931fd32f9e35a7ae1e3b17",
-  )
+  assert.equal(WORKSTREAM_CONTRACT_VERSION, WORKSTREAM_CONTRACT.version)
+  assert.equal(WORKSTREAM_TRANSPORT_CONTRACT_VERSION, WORKSTREAM_CONTRACT_VERSION)
+  assert.equal(WORKSTREAM_TRANSPORT_SCHEMA_HASH, WORKSTREAM_CONTRACT_SHA256)
 })
 
 test("workstream_manage validates native action-specific inputs", () => {
-  for (const action of ["list"] as const) {
-    assert.equal(validateProxyToolInput("workstream_manage", { action }), null)
+  for (const [action, rule] of Object.entries(WORKSTREAM_CONTRACT.actions)) {
+    const input: Record<string, unknown> = { action }
+    for (const rawArg of rule.args) {
+      const optional = rawArg.endsWith("?")
+      const arg = rawArg.replace(/\?$/, "")
+      if (!optional || arg === "members") {
+        input[arg] = arg === "members" ? ["one", "two"] : `${arg}-value`
+      }
+    }
+    assert.equal(validateProxyToolInput("workstream_manage", input), null, action)
   }
-  for (const action of [
-    "sessions", "new", "resume", "finish_preview", "finish_apply",
-    "sync_preview", "sync_apply", "sync_push", "repair_preview", "repair_apply",
-    "repair_push", "cleanup_preview", "cleanup_apply", "cleanup_push", "abandon_preview",
-  ] as const) {
-    assert.equal(validateProxyToolInput("workstream_manage", {
-      action, slug: "stlk_analyse",
-    }), null)
-  }
-  for (const action of [
-    "group_refresh_preview", "group_refresh_apply", "group_refresh_push",
-    "group_finish_preview", "group_finish_apply", "group_finish_push",
-    "group_cleanup_preview", "group_cleanup_apply", "group_cleanup_push",
-    "group_repair_preview", "group_repair_apply", "group_repair_push",
-  ] as const) {
-    assert.equal(validateProxyToolInput("workstream_manage", {
-      action, group_id: "general",
-    }), null)
-  }
-  assert.equal(validateProxyToolInput("workstream_manage", {
-    action: "group_new", group_id: "general", members: ["one", "two"],
-  }), null)
-  assert.equal(validateProxyToolInput("workstream_manage", {
-    action: "member_new", group_id: "general", slug: "three",
-  }), null)
 })
 
 test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
@@ -203,17 +190,17 @@ test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
   })!, /requires slug/)
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "group_refresh_apply", slug: "stlk_analyse",
-  })!, /requires group_id/)
+  })!, /accepts only/)
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "list", slug: "stlk_analyse",
-  })!, /does not accept slug/)
+  })!, /accepts only/)
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "member_new", group_id: "general", slug: "three", members: ["four"],
-  })!, /does not accept members/)
+  })!, /accepts only/)
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "group_new", group_id: "General",
   })!, /group_id is invalid/)
-  for (const identifier of [".", ".."] as const) {
+  for (const identifier of [".", "..", "...", "...."] as const) {
     assert.match(validateProxyToolInput("workstream_manage", {
       action: "repair_preview", slug: identifier,
     })!, /slug is invalid/)
@@ -227,6 +214,30 @@ test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "repair_apply", slug: "stlk_analyse", remote: "origin",
   })!, /accepts only/)
+})
+
+test("workstream_manage exposure requires request and live native availability", () => {
+  const configured = [
+    DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "bash")!,
+    DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")!,
+  ]
+  const requested = requestToolNameSet([
+    { type: "function", name: "workstream_manage" },
+  ])
+  const catalog = new Set(["workstream_manage"])
+  assert.ok(filterWorkstreamProxyByAvailability(configured, requested, catalog)
+    .some((tool) => tool.name === "workstream_manage"))
+  assert.ok(!filterWorkstreamProxyByAvailability(configured, new Set(), catalog)
+    .some((tool) => tool.name === "workstream_manage"))
+  assert.ok(!filterWorkstreamProxyByAvailability(configured, requested, new Set())
+    .some((tool) => tool.name === "workstream_manage"))
+  assert.ok(!filterWorkstreamProxyByAvailability(configured, requested, undefined)
+    .some((tool) => tool.name === "workstream_manage"))
+})
+
+test("workstream_manage exposure change alters reused-process hash", () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")!
+  assert.notEqual(proxyToolExposureHash([workstream]), proxyToolExposureHash(null))
 })
 
 test("workstream_manage dispatches exact group input and rejects raw extras", async () => {
@@ -281,6 +292,7 @@ test("workstream_manage keeps session affinity and input unchanged through the b
       sessionAffinity: affinity,
       opencodeSessionID: affinity,
       callerAgent: "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER",
+      allowWorkstreamManage: true,
     },
   )
   srv.calls.on("call", forwardCall)
@@ -352,6 +364,68 @@ test("workstream_manage HTTP bridge rejects missing and mismatched affinity", as
       srv.calls.off("call", forwardCall)
       await srv.close()
     }
+  }
+})
+
+test("reused proxy denies stale workstream_manage while unrelated call stays pending", async () => {
+  const tools = DEFAULT_PROXY_TOOLS.filter(
+    (tool) => tool.name === "bash" || tool.name === "workstream_manage",
+  )
+  const sessionKey = `reused-exposure-${Date.now()}`
+  const srv = await createProxyMcpServer(tools)
+  let allowWorkstreamManage = true
+  const forwardCall = (call: ProxyToolCall) => {
+    try {
+      queuePendingProxyCall(sessionKey, call, undefined, {
+        sessionAffinity: sessionKey,
+        opencodeSessionID: sessionKey,
+        callerAgent: "99_generic_workstream_manager",
+        allowWorkstreamManage,
+      })
+    } catch {}
+  }
+  srv.calls.on("call", forwardCall)
+  try {
+    const bashPending = new Promise<PendingProxyCall>((resolve) => {
+      const unsubscribe = onPendingProxyCall(sessionKey, (call) => {
+        if (call.toolName !== "bash") return
+        unsubscribe()
+        resolve(call)
+      })
+    })
+    const bashResponse = post(srv.url, {
+      jsonrpc: "2.0",
+      id: "pending-bash",
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "long-running" } },
+    })
+    const bashCall = await bashPending
+
+    // Same server/process, but current request no longer exposes the native
+    // tool. Broker must reject the stale definition without touching bash.
+    allowWorkstreamManage = false
+    const denied = await post(srv.url, {
+      jsonrpc: "2.0",
+      id: "stale-workstream",
+      method: "tools/call",
+      params: { name: "workstream_manage", arguments: { action: "list" } },
+    })
+    assert.equal(denied.json.result.isError, true)
+    assert.match(denied.json.result.content[0].text, /not available in the current OpenCode request/)
+    assert.deepEqual(
+      getPendingProxyCalls(sessionKey).map((call) => call.toolCallId),
+      [bashCall.toolCallId],
+    )
+
+    assert.equal(resolvePendingProxyCallById(bashCall.toolCallId, {
+      kind: "text",
+      text: "bash-finished",
+    }), true)
+    assert.equal((await bashResponse).json.result.content[0].text, "bash-finished")
+  } finally {
+    srv.calls.off("call", forwardCall)
+    rejectAllPendingProxyCallsForSession(sessionKey, new Error("test cleanup"))
+    await srv.close()
   }
 })
 

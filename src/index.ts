@@ -465,7 +465,14 @@ export { ClaudeCodeLanguageModel } from "./claude-code-language-model.js"
 export { bridgeOpencodeMcp } from "./mcp-bridge.js"
 export { defaultModels } from "./models.js"
 export {
+  WORKSTREAM_CONTRACT,
   WORKSTREAM_ACTIONS,
+  WORKSTREAM_INPUT_SCHEMA,
+  WORKSTREAM_CONTRACT_CANONICAL_SOURCE,
+  WORKSTREAM_CONTRACT_VERSION,
+  WORKSTREAM_CONTRACT_SHA256,
+} from "./workstream-contract.js"
+export {
   WORKSTREAM_TRANSPORT_CONTRACT_VERSION,
   WORKSTREAM_TRANSPORT_SCHEMA_HASH,
 } from "./proxy-mcp.js"

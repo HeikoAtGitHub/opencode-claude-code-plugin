@@ -19,6 +19,7 @@ import {
   rejectAllPendingProxyCallsForSession,
   type PendingProxyCall,
   PRIVILEGED_PROXY_CONTEXT_ERROR,
+  PRIVILEGED_PROXY_EXPOSURE_ERROR,
 } from "./src/proxy-broker.js"
 import type { ProxyToolCall, ProxyToolResult } from "./src/proxy-mcp.js"
 
@@ -173,8 +174,8 @@ test("getPendingProxyCalls is empty for unknown session", () => {
 test("workstream_manage fails closed without exact affinity and caller context", () => {
   for (const context of [
     undefined,
-    { sessionAffinity: "default", opencodeSessionID: "default", callerAgent: "manager" },
-    { sessionAffinity: "session-a", opencodeSessionID: "session-b", callerAgent: "manager" },
+    { sessionAffinity: "default", opencodeSessionID: "default", callerAgent: "manager", allowWorkstreamManage: true },
+    { sessionAffinity: "session-a", opencodeSessionID: "session-b", callerAgent: "manager", allowWorkstreamManage: true },
     { sessionAffinity: "session-a", opencodeSessionID: "session-a" },
   ]) {
     const call = makeCall("workstream_manage", {
@@ -198,13 +199,27 @@ test("workstream_manage broker preserves exact caller context and payload", () =
     "composite-key-exact",
     call.call,
     undefined,
-    { sessionAffinity, opencodeSessionID: sessionAffinity, callerAgent },
+    { sessionAffinity, opencodeSessionID: sessionAffinity, callerAgent, allowWorkstreamManage: true },
   )
   assert.equal(pending.sessionAffinity, sessionAffinity)
   assert.equal(pending.callerAgent, callerAgent)
   assert.deepEqual(pending.input, input)
   assert.deepEqual(Object.keys(pending.input).sort(), ["action", "group_id"])
   rejectAllPendingProxyCallsForSession("composite-key-exact", new Error("test cleanup"))
+})
+
+test("workstream_manage broker rejects current request exposure reduction", () => {
+  const call = makeCall("workstream_manage", { action: "list" })
+  assert.throws(
+    () => queuePendingProxyCall("exposure-reduced", call.call, undefined, {
+      sessionAffinity: "session-exact",
+      opencodeSessionID: "session-exact",
+      callerAgent: "99_generic_workstream_manager",
+      allowWorkstreamManage: false,
+    }),
+    new RegExp(PRIVILEGED_PROXY_EXPOSURE_ERROR),
+  )
+  assert.deepEqual(getPendingProxyCalls("exposure-reduced"), [])
 })
 
 test("resolve / reject on already-resolved id is a no-op returning false", () => {

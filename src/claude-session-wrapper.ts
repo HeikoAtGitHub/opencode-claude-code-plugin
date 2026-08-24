@@ -256,6 +256,7 @@ export function spawnInteractiveProcess(
     lineEmitter,
     proxyServer: null,
     mcpHash: undefined,
+    proxyExposureHash: undefined,
     systemPromptFile: opts.systemPromptFile,
   }
 }

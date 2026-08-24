@@ -279,7 +279,7 @@ By default, the plugin proxies `Bash`, `Edit`, `Write`, `WebFetch`, and `Task`. 
 
 `Task` is proxied by default. The proxy disables Claude CLI's `Agent` tool and emits an unexecuted `task` call; it does not register a replacement task tool. OpenCode's built-in TaskTool remains responsible for permission checks, creating or resuming the child session, selecting the configured subagent, and foreground/background lifecycle.
 
-Only listed values are proxied; unknown `proxyTools` values are ignored. `submit_plan` is an OpenCode-specific proxy tool for Plannotator review. It waits up to 24 hours and sends SSE keepalives while browser approval is pending. `workstream_manage` is an opt-in OpenCode-specific transport for the constrained lifecycle, member, group, cleanup, and repair actions. Its schema accepts only the action plus the action-specific `slug`, `group_id`, or `members`; it exposes no raw argv, refs, paths, hashes, remotes, or force options. The proxy executes no Git and performs no authorization: OpenCode's native caller identity, agent authorization, session context, preview/apply/push separation, and permission prompts remain authoritative.
+Only listed values are proxied; unknown `proxyTools` values are ignored. `submit_plan` is an OpenCode-specific proxy tool for Plannotator review. It waits up to 24 hours and sends SSE keepalives while browser approval is pending. `workstream_manage` is an opt-in OpenCode-specific transport for the constrained lifecycle, member, group, cleanup, and repair actions. Its schema accepts only the action plus the action-specific `slug`, `group_id`, or `members`; it exposes no raw argv, refs, paths, hashes, remotes, or force options. The proxy executes no Git and performs no authorization: OpenCode's native caller identity, agent authorization, session context, preview/apply/push separation, and permission prompts remain authoritative. Exposure additionally requires `workstream_manage` in both the current request tool set and OpenCode's live native tool catalog. If exact live catalog data is unavailable, the provider fails closed and does not expose the proxy tool; it never guesses from global `proxyTools` config. A reused Claude process is refreshed when this exposure hash changes.
 
 | `workstream_manage` input | Actions |
 |---|---|
@@ -287,7 +287,7 @@ Only listed values are proxied; unknown `proxyTools` values are ignored. `submit
 | `slug` | `sessions`, `new`, `resume`, `finish_preview/apply`, `sync_preview/apply/push`, `repair_preview/apply/push`, `cleanup_preview/apply/push`, `abandon_preview` |
 | `group_id` | `group_refresh_preview/apply/push`, `group_finish_preview/apply/push`, `group_cleanup_preview/apply/push`, `group_repair_preview/apply/push` |
 | `group_id`, `members` | `group_new` |
-| `group_id`, `slug` | `member_new` |
+| `group_id`, `slug` | `member_new`, `member_adopt` |
 
 No `preview_token` crosses this bridge; OpenCode owns session-bound preview tokens internally. Provider exports a versioned deterministic hash of this narrow action/input contract for parity tests, but does not import the config repo at runtime. OpenCode's native `workstream_manage` owner remains authoritative. Missing, shared `default`, or mismatched session affinity and missing caller identity reject privileged calls before broker dispatch; exact session and caller metadata travel with accepted calls.
 

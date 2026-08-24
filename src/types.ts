@@ -144,11 +144,13 @@ export interface ClaudeCodeProviderSettings {
    * `submit_plan` proxies the Plannotator approval tool and may wait for
    * browser review. Its default deadline is 24 hours.
    *
-   * `workstream_manage` transports the native lifecycle, finish, sync, repair,
-   * cleanup, and group actions without exposing refs, paths, hashes, remotes,
-   * force flags, or raw argv. OpenCode's native tool remains the sole owner of
-   * caller authorization, session-bound state, approvals, and execution. This
-   * provider never executes Git for these calls.
+    * `workstream_manage` transports the native lifecycle, finish, sync, repair,
+    * cleanup, and group actions without exposing refs, paths, hashes, remotes,
+    * force flags, or raw argv. OpenCode's native tool remains the sole owner of
+    * caller authorization, session-bound state, approvals, and execution. This
+    * provider never executes Git for these calls. It is exposed only when both
+    * the current request tool set and OpenCode's live native catalog contain
+    * `workstream_manage`; unavailable live catalog data fails closed.
     *
     * `question` proxies Claude CLI's `AskUserQuestion` through opencode's
     * native `question` tool (TUI form with options + custom answer). The
