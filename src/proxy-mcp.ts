@@ -10,7 +10,7 @@ import {
   WORKSTREAM_ACTIONS,
   WORKSTREAM_CONTRACT_SHA256,
   WORKSTREAM_CONTRACT_VERSION,
-  WORKSTREAM_INPUT_SCHEMA,
+  WORKSTREAM_PROXY_INPUT_SCHEMA,
   validateWorkstreamInput,
 } from "./workstream-contract.js"
 
@@ -577,7 +577,7 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " including caller-agent checks, session-bound state, approvals, and" +
       " wrapper execution. This proxy performs no Git operation and exposes" +
       " no raw argv, ref, remote, force, hash, path, or state-root input.",
-    inputSchema: WORKSTREAM_INPUT_SCHEMA,
+    inputSchema: WORKSTREAM_PROXY_INPUT_SCHEMA,
   },
   {
     name: "question",

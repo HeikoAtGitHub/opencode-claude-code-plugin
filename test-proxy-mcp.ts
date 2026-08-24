@@ -31,6 +31,7 @@ import {
 import {
   WORKSTREAM_ACTIONS,
   WORKSTREAM_INPUT_SCHEMA,
+  WORKSTREAM_PROXY_INPUT_SCHEMA,
   WORKSTREAM_CONTRACT,
   WORKSTREAM_CONTRACT_VERSION,
   WORKSTREAM_CONTRACT_SHA256,
@@ -128,12 +129,9 @@ test("submit_plan dispatches through proxy as an MCP result", async () => {
   }
 })
 
-test("workstream_manage proxy schema matches the native transport surface", () => {
-  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
-  assert.ok(workstream)
-  const schema = workstream.inputSchema as any
-  assert.equal(schema, WORKSTREAM_INPUT_SCHEMA)
+test("workstream_manage keeps the exact native transport schema internally", () => {
   assert.deepEqual(WORKSTREAM_ACTIONS, Object.keys(WORKSTREAM_CONTRACT.actions))
+  const schema = WORKSTREAM_INPUT_SCHEMA as any
   assert.equal(schema.oneOf.length, WORKSTREAM_ACTIONS.length)
   for (const action of WORKSTREAM_ACTIONS) {
     const branch = schema.oneOf.find(
@@ -150,14 +148,24 @@ test("workstream_manage proxy schema matches the native transport surface", () =
       assert.equal(branch.required.includes(arg), !rawArg.endsWith("?"))
     }
   }
+})
+
+test("workstream_manage exposes a Claude-compatible object-root schema", () => {
+  const workstream = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")
+  assert.ok(workstream)
+  const schema = workstream.inputSchema as any
+  assert.equal(schema, WORKSTREAM_PROXY_INPUT_SCHEMA)
+  assert.equal(schema.type, "object")
+  assert.equal(schema.oneOf, undefined)
+  assert.equal(schema.additionalProperties, false)
+  assert.deepEqual(schema.required, ["action"])
+  assert.deepEqual(schema.properties.action.enum, WORKSTREAM_ACTIONS)
   assert.ok(WORKSTREAM_ACTIONS.includes("member_adopt"))
   assert.match(workstream.description, /sole authorization and execution owner/)
   for (const forbidden of [
     "preview_token", "refs", "paths", "hashes", "remotes", "force", "argv",
   ]) {
-    for (const branch of schema.oneOf) {
-      assert.equal(branch.properties[forbidden], undefined)
-    }
+    assert.equal(schema.properties[forbidden], undefined)
   }
 })
 
@@ -580,9 +588,15 @@ test("tools/list exposes the default proxy defs", async () => {
       method: "tools/list",
     })
     const names = res.json.result.tools.map((t: any) => t.name)
-    assert.ok(names.includes("question"))
-    assert.ok(names.includes("task"))
-    assert.ok(names.includes("bash"))
+    for (const name of [
+      "bash", "edit", "write", "webfetch", "task", "submit_plan",
+      "workstream_manage", "question",
+    ]) assert.ok(names.includes(name), `missing ${name}`)
+    const workstream = res.json.result.tools.find(
+      (tool: any) => tool.name === "workstream_manage",
+    )
+    assert.equal(workstream.inputSchema.type, "object")
+    assert.equal(workstream.inputSchema.oneOf, undefined)
   })
 })
 

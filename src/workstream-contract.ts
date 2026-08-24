@@ -52,6 +52,24 @@ export const WORKSTREAM_INPUT_SCHEMA: Record<string, unknown> = {
   }),
 }
 
+/**
+ * Claude Code's MCP client requires each exposed tool schema to have an
+ * object root.  Keep the exact action-specific contract above for internal
+ * evidence, but expose this object-root projection at the MCP boundary.
+ * Runtime validation remains action-specific in validateWorkstreamInput.
+ */
+export const WORKSTREAM_PROXY_INPUT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    action: { type: "string", enum: WORKSTREAM_ACTIONS },
+    slug: propertySchema("slug"),
+    group_id: propertySchema("group_id"),
+    members: propertySchema("members"),
+  },
+  required: ["action"],
+}
+
 export function validateWorkstreamInput(input: Record<string, unknown>): string | null {
   const action = typeof input.action === "string" ? input.action : ""
   const rule = WORKSTREAM_CONTRACT.actions[action]
