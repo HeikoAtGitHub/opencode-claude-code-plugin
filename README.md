@@ -78,7 +78,9 @@ The plugin auto-registers the following. They appear in the model picker without
 | `claude-opus-4-6` | Claude Opus 4.6 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
 | `claude-opus-4-7` | Claude Opus 4.7 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
 | `claude-opus-4-8` | Claude Opus 4.8 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-4-8-fast` | Claude Opus 4.8 Fast | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-opus-5` | Claude Opus 5 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
+| `claude-opus-5-fast` | Claude Opus 5 Fast | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-fable-5` | Claude Fable 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-mythos-5` | Claude Mythos 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 
@@ -86,9 +88,25 @@ The plugin auto-registers the following. They appear in the model picker without
 
 Capabilities for every model: text + image input, text output, tool use, attachments. No temperature control, no PDF/audio/video, no interleaved streaming.
 
-**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing — input and output ratios both come out the same (Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus $5/$25 = 5×, Fable 5 / Mythos 5 $10/$50 = 10×), so **Fable 5 and Mythos 5 cost 2× Opus 5**. Sonnet 5's `2×` uses its introductory $2/$10 pricing through August 31, 2026; standard $3/$15 pricing begins September 1. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
+**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing (input and output ratios both come out the same: Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus $5/$25 = 5×, Fable 5 / Mythos 5 / Opus fast mode $10/$50 = 10×). So **Fable 5, Mythos 5, and fast-mode Opus all cost 2× standard Opus 5**. Sonnet 5's `2×` uses its introductory $2/$10 pricing through August 31, 2026; standard $3/$15 pricing begins September 1. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
 
-The model ID is passed straight through to `claude --model`, so anything Claude Code accepts works.
+The model ID is passed straight through to `claude --model`, so anything Claude Code accepts works. The two `-fast` IDs are the one exception, described below.
+
+### Fast mode
+
+`claude-opus-5-fast` and `claude-opus-4-8-fast` run the same models at up to 2.5× the output tokens per second, at 2× the price ($10/M input, $50/M output, the 10× column). Pick them in the model selector like any other model.
+
+The `-fast` suffix is this plugin's own marker, not a model name Anthropic serves. The plugin strips it and spawns `claude --model claude-opus-5 --settings '{"fastMode":true}'`, because that settings layer is the only way to opt a headless (`--print`) session into fast mode: there is no `--fast` flag, and the old `claude-opus-4-6-fast` style model names are retired. Requires Claude Code 2.1.220+; below that the plugin skips the opt-in and you get standard speed.
+
+Fast mode is not available everywhere, and it **fails soft**: an ineligible account drops back to standard speed with no error. Known blockers:
+
+- **Usage credits are off.** The most common one. Run `/usage-credits` in an interactive `claude` session to enable them.
+- **Not first-party.** Fast mode is Anthropic-API-only; Bedrock, Vertex, and Foundry are excluded.
+- **Free tier**, or an organization that has turned fast mode off.
+- **Cooldown.** Fast mode has its own rate limit; after a hit, Claude Code falls back to standard until it clears.
+- `CLAUDE_CODE_DISABLE_FAST_MODE=1` in the environment turns it off outright.
+
+Because a downgrade is otherwise invisible, and because the picker shows these IDs at 10× regardless, the plugin logs a **warning** (once per reason) when a fast turn actually ran at standard speed, naming the reason. If you see it, switch to the non-fast ID so the picker's price matches your bill.
 
 ### Picking a variant
 
