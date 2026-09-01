@@ -5,7 +5,13 @@ import {
   applyTaskCreateToolResult,
   getLedger,
 } from "./src/todo-ledger.js"
-import { mapTool, isWebSearchTool, isWebSearchHandledByCli } from "./src/tool-mapping.js"
+import {
+  mapTool,
+  isWebSearchTool,
+  isWebSearchHandledByCli,
+  singleQuoteForShell,
+} from "./src/tool-mapping.js"
+import { execFileSync } from "node:child_process"
 
 test("WebSearch with default routing is skipped, not forwarded (no opencode registry entry)", () => {
   for (const route of [undefined, "claude" as const, "disabled" as const]) {
@@ -105,13 +111,48 @@ test("TaskUpdate with sessionId returns skip when task id is unknown to the ledg
   assert.equal(result.name, "TaskUpdate")
 })
 
-test("TaskOutput is still surfaced as a bash echo (not internalized)", () => {
+test("TaskOutput is still surfaced as a bash call (not internalized)", () => {
   const result = mapTool("TaskOutput", { content: "hello" })
   assert.equal(result.skip, undefined)
   assert.equal(result.executed, false)
   assert.equal(result.name, "bash")
   assert.ok(typeof result.input?.command === "string")
   assert.ok(result.input.command.includes("hello"))
+})
+
+// Issue #27: the payload is model-controlled and opencode really runs the
+// command, so anything the shell expands inside it is executed while the
+// operator sees something that reads like a print.
+test("TaskOutput payloads are not expanded by the shell", () => {
+  const payloads = [
+    "X$(id -u)Y",
+    "X`id -u`Y",
+    "X${HOME}Y",
+    "it's got a quote",
+    'and a "double" quote',
+    "semi; echo pwned",
+  ]
+
+  for (const content of payloads) {
+    const command = mapTool("TaskOutput", { content }).input.command as string
+    const printed = execFileSync("bash", ["-c", command], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: "/should-not-appear" },
+    })
+    assert.equal(
+      printed,
+      `TASK OUTPUT: ${content}\n`,
+      `payload must reach the operator verbatim: ${content}`,
+    )
+  }
+})
+
+test("singleQuoteForShell survives an embedded single quote", () => {
+  const quoted = singleQuoteForShell("a'b")
+  const printed = execFileSync("bash", ["-c", `printf '%s' ${quoted}`], {
+    encoding: "utf8",
+  })
+  assert.equal(printed, "a'b")
 })
 
 test("Pre-existing internal tools still skip", () => {

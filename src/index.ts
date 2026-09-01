@@ -50,7 +50,7 @@ let warnedAnthropicApiKey = false
 // behavior trade against the issue-#8 guarantee, so it stays opt-in until it
 // has the same live mileage Task had before v0.10.0 flipped it on. Users opt
 // in by listing it in `proxyTools`; see README "Question proxy tool".
-const DEFAULT_PROXY_TOOL_NAMES = [
+export const DEFAULT_PROXY_TOOL_NAMES = [
   "Bash",
   "Edit",
   "Write",
@@ -110,7 +110,9 @@ export function createClaudeCode(
       controlRequestToolBehaviors: settings.controlRequestToolBehaviors,
       controlRequestDenyMessage: settings.controlRequestDenyMessage,
       proxyTools,
+      extraDisallowedTools: settings.extraDisallowedTools,
       proxyToolTimeoutMs: settings.proxyToolTimeoutMs,
+      planModeQuestion: settings.planModeQuestion ?? false,
       webSearch: settings.webSearch,
       hotReloadMcp: settings.hotReloadMcp ?? true,
       proxyOpencodeMcpTools: settings.proxyOpencodeMcpTools ?? true,

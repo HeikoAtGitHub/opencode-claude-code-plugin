@@ -339,3 +339,41 @@ test("non-compaction call still injects reasoning keyword", () => {
     "reasoning keyword should still be injected for normal turns",
   )
 })
+
+test("AI SDK v4 image part carries its binary in part.image", () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+  const out = parsed(
+    p([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is in this screenshot?" },
+          { type: "image", image: png, mediaType: "image/png" },
+        ],
+      },
+    ]),
+  )
+
+  const image = out.message.content.find((b: any) => b.type === "image")
+  assert.ok(image, "image part must not be dropped")
+  assert.equal(image.source.media_type, "image/png")
+  assert.equal(image.source.data, png.toString("base64"))
+})
+
+test("part.data still wins when part.image is absent", () => {
+  const out = parsed(
+    p([
+      {
+        role: "user",
+        content: [
+          { type: "file", data: "aGVsbG8=", mediaType: "image/webp" },
+        ],
+      },
+    ]),
+  )
+
+  const image = out.message.content.find((b: any) => b.type === "image")
+  assert.ok(image, "data-carrying file part must still produce an image block")
+  assert.equal(image.source.media_type, "image/webp")
+  assert.equal(image.source.data, "aGVsbG8=")
+})

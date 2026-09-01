@@ -26,7 +26,7 @@ const SUPPORTED_IMAGE_TYPES = new Set([
 ])
 
 function toImageBlock(part: any): any | null {
-  const raw: unknown = part.data ?? part.url ?? part.source?.data
+  const raw: unknown = part.image ?? part.data ?? part.url ?? part.source?.data
   if (!raw) {
     log.warn("file part without data, skipping")
     return null

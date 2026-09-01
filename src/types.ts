@@ -28,7 +28,16 @@ export interface ClaudeCodeConfig {
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
   proxyTools?: string[]
+  extraDisallowedTools?: string[]
   proxyToolTimeoutMs?: Record<string, number>
+  /**
+   * Route `ExitPlanMode` through opencode's native `question` tool so plan
+   * approval is a real form instead of a "(yes/no)" line the operator has to
+   * answer in prose. Off by default: opencode's question form is currently
+   * broken upstream, so enabling this trades a working text prompt for a
+   * silent hang. See the plan-mode gotcha in AGENTS.md.
+   */
+  planModeQuestion?: boolean
   webSearch?: WebSearchRouting
   hotReloadMcp?: boolean
   proxyOpencodeMcpTools?: boolean
@@ -168,6 +177,21 @@ export interface ClaudeCodeProviderSettings {
   proxyTools?: string[]
 
   /**
+   * Extra Claude Code built-ins to switch off with `--disallowedTools`,
+   * on top of the ones implied by `proxyTools`.
+   *
+   * `proxyTools` can only disable built-ins the plugin knows how to
+   * replace, so a built-in with no proxy equivalent (`NotebookEdit`, and
+   * anything Claude Code adds after this release) has no off switch
+   * otherwise. Names are Claude's, not opencode's: `["NotebookEdit"]`.
+   *
+   * Disabling a tool with no replacement removes the capability rather
+   * than routing it through opencode — that is the point, but it does mean
+   * the model has to work without it.
+   */
+  extraDisallowedTools?: string[]
+
+  /**
    * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool
    * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`,
    * `submit_plan`, `repo_policy_scope`, `workstream_manage` —
@@ -188,7 +212,25 @@ export interface ClaudeCodeProviderSettings {
   proxyToolTimeoutMs?: Record<string, number>
 
   /**
-    * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of
+   * Route Claude's `ExitPlanMode` through opencode's native `question` tool.
+   *
+   * Off (default): the plan is rendered as markdown followed by
+   * `**Do you want to proceed with this plan?** (yes/no)` and the operator
+   * answers in prose. On: the plan is rendered, the turn ends on
+   * `tool-calls`, and opencode runs its own `question` tool so approval is a
+   * real form; the answer is fed back to the CLI as the `tool_result` for
+   * the original `ExitPlanMode` call, which is what unlocks plan mode.
+   *
+   * Two reasons it is opt-in. opencode's `question` form does not currently
+   * render (upstream anomalyco/opencode#36604), so an enabled bridge hangs
+   * the turn until the operator interrupts; and older opencode builds have
+   * no `question` registry entry at all, in which case the plugin silently
+   * keeps the text path. See the plan-mode gotcha in AGENTS.md.
+   */
+  planModeQuestion?: boolean
+
+  /**
+   * Strip `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment of
    * every spawned `claude` process. When an API key is present, Claude Code
    * authenticates with it (pay-as-you-go Console billing) instead of the
    * logged-in Pro/Max subscription — silently bypassing the Agent SDK plan
@@ -309,6 +351,14 @@ export interface ClaudeStreamMessage {
   type: string
   subtype?: string
   request_id?: string
+
+  // Fast mode, reported on both `system`/`init` and `result`. `off` with a
+  // reason is how a request that asked for fast mode but did not get it shows
+  // up: the CLI degrades to standard speed rather than failing, so without
+  // reading these the downgrade is invisible. `cooldown` is the post-rate-limit
+  // state and is temporary.
+  fast_mode_state?: "on" | "off" | "cooldown"
+  fast_mode_disabled_reason?: string
 
   // Present on `stream_event` envelopes when --include-partial-messages is on.
   // The inner event mirrors the same shape (content_block_*, message_*, etc).

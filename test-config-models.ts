@@ -82,16 +82,17 @@ test("configModelsForProvider registers Sonnet 5 and Opus 5 metadata", () => {
   const models = configModelsForProvider({}, "claude-code")
 
   const sonnet = models["claude-sonnet-5"] as Record<string, unknown>
-  assert.equal(sonnet.name, "Claude Sonnet 5 (2×)")
+  assert.equal(sonnet.name, "Claude Sonnet 5 (3×)")
   assert.equal(sonnet.family, "sonnet")
   assert.equal(sonnet.release_date, "2026-06-30")
   assert.equal(sonnet.reasoning, true)
   assert.deepEqual(sonnet.limit, { context: 1_000_000, output: 128_000 })
+  // Dollars per million tokens, the unit opencode/models.dev expect.
   assert.deepEqual(sonnet.cost, {
-    input: 2e-6,
-    output: 10e-6,
-    cache_read: 2e-7,
-    cache_write: 2.5e-6,
+    input: 3,
+    output: 15,
+    cache_read: 0.3,
+    cache_write: 3.75,
   })
 
   const opus = models["claude-opus-5"] as Record<string, unknown>
@@ -101,14 +102,68 @@ test("configModelsForProvider registers Sonnet 5 and Opus 5 metadata", () => {
   assert.equal(opus.reasoning, true)
   assert.deepEqual(opus.limit, { context: 1_000_000, output: 128_000 })
   assert.deepEqual(opus.cost, {
-    input: 5e-6,
-    output: 25e-6,
-    cache_read: 0.5e-6,
-    cache_write: 6.25e-6,
+    input: 5,
+    output: 25,
+    cache_read: 0.5,
+    cache_write: 6.25,
   })
 
   assert.ok("max" in (sonnet.variants as Record<string, unknown>))
   assert.ok("max" in (opus.variants as Record<string, unknown>))
+})
+
+// Fast mode is only registered for the two models the CLI actually gates it
+// on, and it is priced at the Mythos-class rate ($10/$50 per MTok), which is
+// the exact table the CLI applies for `speed: "fast"`. A fast entry priced at
+// standard Opus rates would under-report every fast turn by half.
+test("configModelsForProvider registers the fast Opus entries at fast pricing", () => {
+  const models = configModelsForProvider({}, "claude-code")
+
+  for (const [id, name, releaseDate] of [
+    ["claude-opus-4-8-fast", "Claude Opus 4.8 Fast (10×)", "2026-05-28"],
+    ["claude-opus-5-fast", "Claude Opus 5 Fast (10×)", "2026-07-24"],
+  ] as const) {
+    const model = models[id] as Record<string, unknown>
+    assert.ok(model, `${id} should be present`)
+    assert.equal(model.name, name)
+    assert.equal(model.family, "opus")
+    assert.equal(model.release_date, releaseDate)
+    assert.equal(model.reasoning, true)
+    assert.deepEqual(model.limit, { context: 1_000_000, output: 128_000 })
+    assert.deepEqual(
+      model.cost,
+      { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
+      id,
+    )
+    assert.ok(
+      "max" in (model.variants as Record<string, unknown>),
+      `${id} must carry the reasoning variants`,
+    )
+  }
+})
+
+test("configModelsForProvider registers fast entries only for fast-capable models", () => {
+  const models = configModelsForProvider({}, "claude-code")
+  const fastIds = Object.keys(models).filter((id) => id.endsWith("-fast"))
+
+  // The CLI gates fast mode on the model name containing `opus-4-8` or
+  // `opus-5`. Anything else would render a 10x price tag on a model that
+  // silently runs at standard speed.
+  assert.deepEqual(fastIds.sort(), ["claude-opus-4-8-fast", "claude-opus-5-fast"])
+})
+
+test("fast model ids survive the per-account suffix expansion", () => {
+  const models = configModelsForProvider({}, "claude-code-work", "work")
+
+  const model = models["claude-opus-5-fast@work"] as Record<string, unknown>
+  assert.ok(model, "account-suffixed fast id must be emitted")
+  assert.equal(model.id, "claude-opus-5-fast@work")
+  assert.deepEqual(model.cost, {
+    input: 10,
+    output: 50,
+    cache_read: 1,
+    cache_write: 12.5,
+  })
 })
 
 // Context and max-output values are published per model and had drifted: the

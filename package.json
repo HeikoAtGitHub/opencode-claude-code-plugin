@@ -1,6 +1,6 @@
 {
   "name": "@khalilgharbaoui/opencode-claude-code-plugin",
-  "version": "0.12.0",
+  "version": "0.14.0",
   "description": "Claude Code CLI provider plugin for opencode",
   "author": "Khalil Gharbaoui",
   "type": "module",
@@ -20,7 +20,7 @@
     "build": "npm run contract:check && tsup && npm run verify:dist",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "npm run contract:check && tsx --test test-bridge.ts test-broker.ts test-proxy-mcp.ts test-proxy-task.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-session-manager.ts test-compaction-model.ts test-tool-mapping.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts test-respawn.ts test-startup-diagnostics.ts test-subagent-hint.ts",
+    "test": "npm run contract:check && tsx --test test-bridge.ts test-broker.ts test-proxy-mcp.ts test-proxy-task.ts test-auto-continue.ts test-has-new-user-content.ts test-get-claude-user-message.ts test-logger.ts test-cli-args.ts test-session-manager.ts test-compaction-model.ts test-tool-mapping.ts test-cwd-resolution.ts test-todo-ledger.ts test-session-affinity.ts test-config-models.ts test-ask-user-question.ts test-claude-session-wrapper.ts test-spawn-env.ts test-respawn.ts test-startup-diagnostics.ts test-subagent-hint.ts test-exit-plan-mode-question.ts test-compress-tool.ts",
     "contract:check": "node check-workstream-contract.mjs",
     "verify:dist": "node verify-dist.mjs"
   },

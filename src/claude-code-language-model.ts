@@ -17,6 +17,13 @@ import type {
 import { mapTool, isWebSearchTool, isWebSearchHandledByCli } from "./tool-mapping.js"
 import { applyTaskCreateToolResult } from "./todo-ledger.js"
 import { getClaudeUserMessage } from "./message-builder.js"
+import { parseModelId } from "./models.js"
+import {
+  QUESTION_TOOL_NAME,
+  consumeExitPlanModeQuestionResult,
+  createExitPlanModeQuestionCall,
+  isPlanModeQuestionActive,
+} from "./plan-mode-question.js"
 import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
 import {
   getRuntimeMcpStatus,
@@ -40,11 +47,17 @@ import {
   sessionKey,
 } from "./session-manager.js"
 import { spawnInteractiveProcess } from "./claude-session-wrapper.js"
+import {
+  clearCompression,
+  consumeCompressionRestart,
+  getCompressionSummary,
+  storeCompressionSummary,
+} from "./compression-store.js"
 import { log } from "./logger.js"
 import { detectCliVersion } from "./cli-version.js"
 import {
   createProxyMcpServer,
-  disallowedToolFlags,
+  resolveDisallowedTools,
   DEFAULT_PROXY_TOOLS,
   overlayTaskProxyDescription,
   overlayQuestionProxyDescription,
@@ -56,6 +69,7 @@ import {
   type ProxyMcpServer,
   type ProxyToolCall,
   type ProxyToolDef,
+  type ProxyToolInterceptor,
   type ProxyToolResult,
 } from "./proxy-mcp.js"
 import {
@@ -222,6 +236,16 @@ const PROXY_RESULT_BOUNDARY_GRACE_MS = 250
 
 const AUTO_CONTINUE_PROMPT =
   "Continue the task from where you stopped. Do not summarize; keep working until the requested task is complete, you need clarification, or you hit a real blocker."
+
+/** One per-turn snapshot of opencode's live tool registry. */
+interface LiveToolInfo {
+  /** False when nothing answered (no SDK client, fetch failed). */
+  resolved: boolean
+  items: OpencodeToolListItem[] | undefined
+  taskDescription: string | undefined
+  questionDescription: string | undefined
+  hasQuestion: boolean
+}
 
 interface AutoContinueState {
   enabled: boolean | "smart" | undefined
@@ -610,6 +634,22 @@ You are running via the Claude Code CLI (not a direct API call). This affects co
 - DCP context injections (AGENTS.md, dynamic state) arrive via the system prompt and are already applied.`
 
 /**
+ * Replaces the note above when `compress` is in the resolved proxy list.
+ * The full MCP name is spelled out for the same reason the question proxy
+ * hint spells its own out: models strip the prefix and call bare
+ * `compress`, which opencode renders as `⚙ invalid`.
+ */
+const CLAUDE_CLI_COMPRESS_NOTE = `## Runtime environment: Claude Code CLI
+
+You are running via the Claude Code CLI (not a direct API call). This affects context management:
+
+- To compress context, call \`mcp__opencode_proxy__compress\` with a \`summary\` argument. Use that exact full name.
+- The reset happens at the start of your NEXT turn: this Claude Code session is discarded and a fresh one starts with your summary as its only prior context. Keep working normally after the call.
+- Everything outside the summary is gone after the reset — tool output, files you read, and the earlier conversation are not replayed. Write the summary as the authoritative record.
+- The \`distill\`, \`prune\`, and \`extract\` tools are NOT available.
+- DCP context injections (AGENTS.md, dynamic state) arrive via the system prompt and are already applied.`
+
+/**
  * Extract text content from all `system`-role messages in the prompt.
  * Standard API providers forward these as the `system` parameter; for
  * Claude CLI, the only equivalent path is --append-system-prompt-file.
@@ -659,13 +699,29 @@ export function buildProxyRuntimeHint(
   ].filter(Boolean).join("\n")
 }
 
+export interface AppendedSystemPromptOptions {
+  /** True when `compress` is in the resolved proxy list for this spawn. */
+  compressEnabled?: boolean
+  /** Summary from a previous `compress` call, if this key has one. */
+  compressionSummary?: string
+}
+
 export function renderAppendedSystemPrompt(
   cwd: string,
   includeMultiStepHint = true,
   extraSystemContent: string[] = [],
+  options: AppendedSystemPromptOptions = {},
 ): string {
   const parts: string[] = []
-  parts.push(CLAUDE_CLI_CONTEXT_NOTE)
+  // First, so it reads as prior context for everything that follows.
+  if (options.compressionSummary?.trim()) {
+    parts.push(
+      `## Summary of earlier work (context was compressed)\n\n${options.compressionSummary.trim()}`,
+    )
+  }
+  parts.push(
+    options.compressEnabled ? CLAUDE_CLI_COMPRESS_NOTE : CLAUDE_CLI_CONTEXT_NOTE,
+  )
   for (const s of extraSystemContent) {
     if (s.trim()) parts.push(s.trim())
   }
@@ -712,12 +768,101 @@ export function buildAppendedSystemPrompt(
   cwd: string,
   includeMultiStepHint = true,
   extraSystemContent: string[] = [],
+  options: AppendedSystemPromptOptions = {},
 ): string | undefined {
   return writeAppendedSystemPrompt(
-    renderAppendedSystemPrompt(cwd, includeMultiStepHint, extraSystemContent),
+    renderAppendedSystemPrompt(
+      cwd,
+      includeMultiStepHint,
+      extraSystemContent,
+      options,
+    ),
   )
 }
 
+/**
+ * Human-readable explanations for the CLI's `fast_mode_disabled_reason` codes,
+ * so a downgrade tells the user what to do instead of leaking an enum.
+ */
+const FAST_MODE_REASONS: Record<string, string> = {
+  sdk_opt_in_required:
+    "the CLI did not receive the headless opt-in (--settings). This is a plugin bug, please report it",
+  extra_usage_disabled:
+    "your account has usage credits turned off. Run /usage-credits in an interactive `claude` session to enable them",
+  free: "fast mode requires a paid subscription or purchased credits",
+  preference: "fast mode is turned off for your organization",
+  model_not_allowed:
+    "this model is not in your organization's allowed models",
+  not_first_party:
+    "fast mode only works against the Anthropic API directly, not Bedrock / Vertex / Foundry",
+  network_error: "the CLI could not reach Anthropic to check availability",
+  disabled_by_env: "CLAUDE_CODE_DISABLE_FAST_MODE is set in the environment",
+  pending: "the CLI is still checking availability",
+}
+
+/** Reasons already surfaced this process, so a persistent block warns once. */
+const warnedFastModeReasons = new Set<string>()
+
+/** Test-only. */
+export function _resetFastModeWarnings(): void {
+  warnedFastModeReasons.clear()
+}
+
+/**
+ * Report what actually happened to a fast-mode request.
+ *
+ * Fast mode fails soft: an ineligible account or a rate-limit cooldown drops
+ * back to standard speed with no error. That silence is the problem worth
+ * solving here: the fast model ids advertise 10x pricing in opencode's picker,
+ * so a downgrade the user cannot see means the picker is lying about cost for
+ * every subsequent turn.
+ *
+ * A hard block is therefore a WARN, which this codebase routes to the TUI
+ * unconditionally (NOTICE only surfaces in debug mode, which would defeat the
+ * purpose). It is deduped per reason per process because the blocking
+ * conditions are account-level and would otherwise repeat on every respawn.
+ * Cooldown stays quieter: it is transient and clears on its own.
+ */
+export function reportFastModeState(
+  msg: ClaudeStreamMessage,
+  requested: boolean,
+): void {
+  const state = msg.fast_mode_state
+  if (!state) return
+
+  if (!requested) {
+    // Nothing was asked for. Only interesting at debug level.
+    log.debug("fast mode state", { state })
+    return
+  }
+
+  if (state === "on") {
+    log.info("fast mode active", { state })
+    return
+  }
+
+  const reason = msg.fast_mode_disabled_reason
+  if (state === "cooldown") {
+    log.notice(
+      "fast mode is in cooldown after a rate limit; this turn runs at standard speed and is billed at standard Opus rates, not the 10x shown in the model picker.",
+      { state, reason: reason ?? null },
+    )
+    return
+  }
+
+  const key = reason ?? "unknown"
+  const explanation = reason ? FAST_MODE_REASONS[reason] : undefined
+  const message = `fast mode was requested but is off${
+    explanation ? `: ${explanation}` : reason ? ` (${reason})` : ""
+  }. Turns run at standard speed and are billed at standard Opus rates, not the 10x shown in the model picker. Switch to the non-fast model id to make the picker's price accurate.`
+
+  if (warnedFastModeReasons.has(key)) {
+    log.debug(message, { state, reason: reason ?? null })
+    return
+  }
+  warnedFastModeReasons.add(key)
+  log.warn(message, { state, reason: reason ?? null })
+}
 export class ClaudeCodeLanguageModel implements LanguageModelV3 {
   readonly specificationVersion = "v3"
   readonly modelId: string
@@ -828,9 +973,26 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       DEFAULT_PROXY_TOOLS.map((t) => [t.name.toLowerCase(), t]),
     )
     const picked: ProxyToolDef[] = []
+    const unknown: string[] = []
     for (const n of names) {
       const def = defsByName.get(String(n).toLowerCase())
       if (def) picked.push(def)
+      else unknown.push(String(n))
+    }
+    // A typo used to vanish here. Silence is the wrong response: unknown
+    // names are not proxied, so the matching Claude built-in stays enabled
+    // and unmediated, and if *every* name is unknown the whole turn runs
+    // with no proxy at all (issue #26).
+    if (unknown.length > 0) {
+      const known = [...defsByName.keys()].join(", ")
+      if (picked.length === 0) {
+        log.warn(
+          "no proxyTools entry was recognised; nothing will be proxied this turn",
+          { unknown, known },
+        )
+      } else {
+        log.warn("ignoring unknown proxyTools entries", { unknown, known })
+      }
     }
     return picked.length > 0 ? picked : null
   }
@@ -895,19 +1057,63 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
    *   call resolves to `⚙ invalid`; the version gate drops the def.
    *
    * Returns undefined/false when the SDK client is unavailable (direct
-   * AI-SDK use, tests) so the static defs stand.
+   * AI-SDK use, tests) so the static defs stand. `resolved` distinguishes
+   * "the registry answered and has no `question` entry" from "nobody
+   * answered": only the former is a real version-gate signal.
    */
-  private fetchLiveToolInfo(items: OpencodeToolListItem[] | undefined): {
-    taskDescription: string | undefined
-    questionDescription: string | undefined
-    hasQuestion: boolean
-  } {
+  private async fetchLiveToolInfo(): Promise<LiveToolInfo> {
+    const items = await fetchOpencodeToolList(
+      this.config.provider,
+      this.modelId,
+      this.config.cwd,
+    )
     const question = items?.find((item) => item.id === "question")
     return {
+      resolved: items !== undefined,
+      items,
       taskDescription: items?.find((item) => item.id === "task")?.description,
       questionDescription: question?.description,
       hasQuestion: !!question,
     }
+  }
+
+  /** Share one lazy registry request within a turn without making it stale. */
+  private createLiveToolInfoLoader(): () => Promise<LiveToolInfo> {
+    let pending: Promise<LiveToolInfo> | undefined
+    return () => {
+      pending ??= this.fetchLiveToolInfo()
+      return pending
+    }
+  }
+
+  /**
+   * Whether the ExitPlanMode approval bridge is live for this turn: the
+   * operator opted in AND opencode's registry actually has the `question`
+   * tool. Without the registry entry the emitted tool-call would render as
+   * `⚙ invalid` and wedge the turn, so the plugin keeps the text path.
+   */
+  private async resolvePlanModeQuestion(
+    compactionMode: boolean,
+    loadLiveToolInfo = () => this.fetchLiveToolInfo(),
+  ): Promise<boolean> {
+    if (compactionMode || this.config.planModeQuestion !== true) return false
+    const info = await loadLiveToolInfo()
+    const active = isPlanModeQuestionActive({
+      configured: this.config.planModeQuestion,
+      opencodeHasQuestion: info.hasQuestion,
+      compactionMode,
+    })
+    if (!active) {
+      // Same reasoning as the question proxy's version-gate log: a silent
+      // fallback to the text path looks from the outside like the setting
+      // was ignored.
+      log.info("plan-mode question gate", {
+        opencodeHasQuestion: info.hasQuestion,
+        registryResolved: info.resolved,
+        active,
+      })
+    }
+    return active
   }
 
   /**
@@ -925,7 +1131,33 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     },
   ): Promise<ProxyMcpServer> {
     const timeoutOverrides = this.config.proxyToolTimeoutMs
-    const srv = await createProxyMcpServer(tools, timeoutOverrides)
+    const interceptors = new Map<string, ProxyToolInterceptor>()
+    if (tools.some((t) => t.name === "compress")) {
+      interceptors.set("compress", (input) => {
+        const summary = typeof input.summary === "string" ? input.summary.trim() : ""
+        if (!summary) {
+          return {
+            kind: "error",
+            message:
+              "compress needs a non-empty `summary`: it becomes the only" +
+              " prior context after the reset. Nothing was compressed.",
+          }
+        }
+        storeCompressionSummary(sessionKeyForCalls, summary)
+        log.info("compress stored summary; session resets next turn", {
+          sessionKey: sessionKeyForCalls,
+          summaryLength: summary.length,
+        })
+        return {
+          kind: "text",
+          text:
+            "Summary stored. Finish this turn as normal; the next turn starts" +
+            " a fresh Claude Code session with this summary as its only prior" +
+            " context.",
+        }
+      })
+    }
+    const srv = await createProxyMcpServer(tools, timeoutOverrides, interceptors)
     let currentCallerContext = callerContext
     srv.updateCallerContext = (next) => {
       currentCallerContext = next
@@ -1445,39 +1677,47 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
         .length > 1
 
-    // New session — clear any stale state from a previous session
+    // New session — clear any stale state from a previous session.
+    // A compression summary is scoped to one conversation, so this is the
+    // one place it is dropped: the compress restart itself calls
+    // deleteClaudeSessionId, and clearing there would wipe the summary
+    // just before the fresh spawn reads it.
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearCompression(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
     const includeHistoryContext = !hasExistingSession && hasPriorConversation
 
     const reasoningEffort = this.getReasoningEffort(options.providerOptions)
-    const userMsg = getClaudeUserMessage(
-      options.prompt,
-      includeHistoryContext,
-      reasoningEffort,
-    )
+    const userMsg =
+      consumeExitPlanModeQuestionResult(sk, options.prompt as any) ??
+      getClaudeUserMessage(options.prompt, includeHistoryContext, reasoningEffort)
 
     // doGenerate always spawns a fresh process, never reuse session ID.
     // Pre-fetch opencode's MCP runtime status so the bridge overlays
     // UI-toggled state on top of disk config.
-    const [runtimeStatus, cliVersion] = await Promise.all([
+    const [runtimeStatus, cliVersion, planModeQuestionActive] = await Promise.all([
       getRuntimeMcpStatus(),
       detectCliVersion(this.config.cliPath),
+      this.resolvePlanModeQuestion(compactionMode),
     ])
     const systemPromptFile = buildAppendedSystemPrompt(
       cwd,
       this.config.multiStepContinuation !== false,
       extractSystemMessages(options.prompt),
+      // doGenerate has no proxy wiring, so `compress` is not callable here.
+      // An existing summary still carries: it is this key's prior context.
+      { compressEnabled: false, compressionSummary: getCompressionSummary(sk) },
     )
+    const { model: spawnModelId, fast: fastMode } = parseModelId(this.modelId)
     const cliArgs = buildCliArgs({
       sessionKey: sk,
       skipPermissions: this.config.skipPermissions !== false,
       includeSessionId: false,
-      model: this.modelId,
+      model: spawnModelId,
       permissionMode: this.config.permissionMode,
       mcpConfig: this.effectiveMcpConfig(cwd, undefined, runtimeStatus).paths,
       strictMcpConfig: this.config.strictMcpConfig,
@@ -1485,6 +1725,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         this.config.webSearch === "disabled" ? ["WebSearch"] : undefined,
       appendSystemPromptFile: systemPromptFile,
       ...this.thinkingCliOptions(),
+      fastMode,
       cliVersion,
     })
 
@@ -1576,6 +1817,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             if (msg.session_id) {
               setClaudeSessionId(sk, msg.session_id)
             }
+            reportFastModeState(msg, fastMode)
           }
 
           if (
@@ -1608,6 +1850,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     unknown
                   >
                   const plan = (parsedInput?.plan as string) || ""
+                  if (planModeQuestionActive) {
+                    const questionCall = createExitPlanModeQuestionCall(
+                      sk,
+                      block.id,
+                      plan,
+                    )
+                    responseText += questionCall.text
+                    toolCalls.push({
+                      id: questionCall.toolCallId,
+                      name: questionCall.toolName,
+                      args: questionCall.input,
+                    })
+                    continue
+                  }
                   responseText += `\n\n${plan}\n\n---\n**Do you want to proceed with this plan?** (yes/no)\n`
                   continue
                 }
@@ -1671,7 +1927,19 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   error: String(err),
                 })
               }
-              toolCalls.push({ id: tc.id, name: tc.name, args })
+              if (tc.name === "ExitPlanMode" && planModeQuestionActive) {
+                const parsedInput = args as Record<string, unknown>
+                const plan = (parsedInput?.plan as string) || ""
+                const questionCall = createExitPlanModeQuestionCall(sk, tc.id, plan)
+                responseText += questionCall.text
+                toolCalls.push({
+                  id: questionCall.toolCallId,
+                  name: questionCall.toolName,
+                  args: questionCall.input,
+                })
+              } else {
+                toolCalls.push({ id: tc.id, name: tc.name, args })
+              }
               toolCallStreams.delete(msg.index)
             }
           }
@@ -1767,6 +2035,17 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     }
 
     for (const tc of result.toolCalls) {
+      if (tc.name === QUESTION_TOOL_NAME) {
+        content.push({
+          type: "tool-call",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          input: JSON.stringify(tc.args),
+          providerExecuted: false,
+        } as any)
+        continue
+      }
+
       const {
         name: mappedName,
         input: mappedInput,
@@ -1791,11 +2070,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
     return {
       content,
-      // Claude CLI's `result` message signals a fully-completed turn —
-      // tools have already been executed internally and final assistant
-      // text has been produced. Always report "stop" so opencode doesn't
-      // loop expecting to run tools itself.
-      finishReason: this.toFinishReason("stop"),
+      // Claude CLI's `result` message normally signals a fully-completed turn:
+      // tools have already been executed internally and final assistant text
+      // has been produced. ExitPlanMode is the exception: we surface it as
+      // opencode's native question tool so the outer loop must run that tool.
+      finishReason: this.toFinishReason(
+        result.toolCalls.some((tc) => tc.name === QUESTION_TOOL_NAME)
+          ? "tool-calls"
+          : "stop",
+      ),
       usage,
       request: { body: { text: userMsg } },
       response: {
@@ -1843,6 +2126,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const effectiveModelId = compactionMode
       ? this.resolveCompactionModel()
       : this.modelId
+    // `effectiveModelId` stays intact for session keys, logs, and metadata;
+    // only the name handed to the CLI gets the `-fast` marker stripped.
+    // Session keys keeping it is deliberate: fast and standard must not share
+    // a claude process, both because the spawn flags differ and because
+    // switching speed invalidates the prompt cache anyway.
+    const { model: spawnModelId, fast: fastMode } = parseModelId(effectiveModelId)
     const sk = compactionMode
       ? sessionKey(cwd, `${effectiveModelId}::compaction::${affinity}`)
       : sessionKey(cwd, `${this.modelId}::${scope}::${affinity}`)
@@ -1934,10 +2223,15 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       options.prompt.filter((m) => m.role === "user" || m.role === "assistant")
         .length > 1
 
-    // New session — clear any stale state from a previous session
+    // New session — clear any stale state from a previous session.
+    // A compression summary is scoped to one conversation, so this is the
+    // one place it is dropped: the compress restart itself calls
+    // deleteClaudeSessionId, and clearing there would wipe the summary
+    // just before the fresh spawn reads it.
     if (!hasPriorConversation) {
       deleteClaudeSessionId(sk)
       deleteActiveProcess(sk)
+      clearCompression(sk)
     }
 
     const hasExistingSession = !!getClaudeSessionId(sk)
@@ -1946,13 +2240,29 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       !hasExistingSession && !hasActiveProcess && hasPriorConversation
 
     const reasoningEffort = this.getReasoningEffort(options.providerOptions)
-    const userMsg = getClaudeUserMessage(
-      options.prompt,
-      includeHistoryContext,
-      reasoningEffort,
-      { compactionMode },
-    )
+    const exitPlanModeQuestionResult = compactionMode
+      ? null
+      : consumeExitPlanModeQuestionResult(sk, options.prompt as any)
+    if (exitPlanModeQuestionResult) {
+      // The whole user message for this turn is the `tool_result` for the
+      // pending ExitPlanMode call, so say so: an operator looking at a turn
+      // that carries none of their typed text needs the reason in the log.
+      log.info("sending plan approval decision to claude", { sk })
+    }
+    const userMsg =
+      exitPlanModeQuestionResult ??
+      getClaudeUserMessage(options.prompt, includeHistoryContext, reasoningEffort, {
+        compactionMode,
+      })
     const resolvedProxy = compactionMode ? null : this.resolvedProxyTools()
+    const loadLiveToolInfo = this.createLiveToolInfoLoader()
+    // Resolved here, not inside the stream body: the ExitPlanMode branches
+    // run in a synchronous line handler and a reused process never reaches
+    // the spawn block where the registry snapshot is otherwise taken.
+    const planModeQuestionActive = await this.resolvePlanModeQuestion(
+      compactionMode,
+      loadLiveToolInfo,
+    )
     const self = this
 
     const previousPendingProxyCalls = compactionMode
@@ -1975,13 +2285,20 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     // the SDK client routes through `Server.app.fetch` (no socket).
     // Detect the Claude CLI version in parallel so the spawn can decide
     // which optional flags it supports without crashing older binaries.
-    const [runtimeStatus, cliVersion, liveToolCatalog] = await Promise.all([
+    const [runtimeStatus, cliVersion, liveToolInfoSnapshot] = await Promise.all([
       compactionMode ? Promise.resolve(undefined) : getRuntimeMcpStatus(),
       detectCliVersion(this.config.cliPath),
       compactionMode
-        ? Promise.resolve(undefined)
-        : fetchOpencodeToolList(this.config.provider, this.modelId, cwd),
+        ? Promise.resolve<LiveToolInfo>({
+            resolved: false,
+            items: undefined,
+            taskDescription: undefined,
+            questionDescription: undefined,
+            hasQuestion: false,
+          })
+        : loadLiveToolInfo(),
     ])
+    const liveToolCatalog = liveToolInfoSnapshot.items
 
     log.info("doStream starting", {
       cwd,
@@ -2007,6 +2324,25 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         if (compactionMode) {
           deleteActiveProcess(sk)
           deleteClaudeSessionId(sk)
+        }
+
+        // A compress call lands mid-turn, when the child is still streaming,
+        // so the reset it asks for happens here instead: drop the child and
+        // its session id, and the spawn below starts clean. `userMsg` and
+        // `includeHistoryContext` were resolved above while the session
+        // still existed, so the fresh process is given only this turn's
+        // message — the summary in its system prompt is the whole of its
+        // prior context, exactly as the tool promised.
+        //
+        // Not while this turn carries results for the live child: evicting
+        // it would send a tool_result to a process that never issued the
+        // matching tool_use. The mark survives to the next turn.
+        if (!compactionMode && !hasMatchedPendingResults && consumeCompressionRestart(sk)) {
+          deleteActiveProcess(sk)
+          deleteClaudeSessionId(sk)
+          log.info("compress reset: dropped claude process and session id", {
+            sessionKey: sk,
+          })
         }
 
         let activeProcess = getActiveProcess(sk)
@@ -2148,7 +2484,8 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 cwd,
                 cliPath,
                 configDir: self.config.configDir,
-                model: effectiveModelId,
+                model: spawnModelId,
+                fastMode,
                 mcpConfigPaths: mcp.paths,
                 permissionsAllow: allow,
                 systemPromptFile,
@@ -2184,8 +2521,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               sessionKey: sk,
               skipPermissions,
               includeSessionId: false,
-              model: effectiveModelId,
+              model: spawnModelId,
               permissionMode: self.config.permissionMode,
+              fastMode,
               cliVersion,
             })
           } else {
@@ -2225,8 +2563,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               requestProxy?.some((t) => t.name === "question") ?? false
             const liveToolInfo =
               taskProxyEnabled || questionProxyEnabled
-                ? self.fetchLiveToolInfo(liveToolCatalog)
+                ? liveToolInfoSnapshot
                 : {
+                    resolved: false,
+                    items: undefined,
                     taskDescription: undefined,
                     questionDescription: undefined,
                     hasQuestion: false,
@@ -2305,6 +2645,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               enrichedProxy?.some((t) => t.name === "question") ?? false
 
             const proxyRuntimeHint = buildProxyRuntimeHint(enrichedProxy)
+            const promptOptions: AppendedSystemPromptOptions = {
+              compressEnabled:
+                enrichedProxy?.some((t) => t.name === "compress") ?? false,
+              compressionSummary: getCompressionSummary(sk),
+            }
             const systemPromptContent = renderAppendedSystemPrompt(
               cwd,
               self.config.multiStepContinuation !== false,
@@ -2314,6 +2659,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
                 ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
               ],
+              promptOptions,
             )
             const currentSystemPromptHash = appendedSystemPromptHash(systemPromptContent)
             if (
@@ -2347,12 +2693,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // while the proxy replacement is absent, leaving the model
             // with no way to ask questions at all (neither proxy nor the
             // deny/markdown fallback path fires).
-            const proxyDisallowed = enrichedProxy
-              ? disallowedToolFlags(enrichedProxy)
-              : []
-            const extraDisallowed: string[] = []
-            if (self.config.webSearch === "disabled") extraDisallowed.push("WebSearch")
-            const allDisallowed = [...proxyDisallowed, ...extraDisallowed]
+            const allDisallowed = resolveDisallowedTools({
+              proxyTools: enrichedProxy,
+              extraDisallowedTools: self.config.extraDisallowedTools,
+              disableWebSearch: self.config.webSearch === "disabled",
+            })
             const mcp = self.effectiveMcpConfig(
               cwd,
               proxyServer?.configPath(),
@@ -2365,13 +2710,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             cliArgs = buildCliArgs({
               sessionKey: sk,
               skipPermissions,
-              model: self.modelId,
+              model: spawnModelId,
               permissionMode: self.config.permissionMode,
               mcpConfig: mcp.paths,
               strictMcpConfig: self.config.strictMcpConfig,
               disallowedTools: allDisallowed.length > 0 ? allDisallowed : undefined,
               appendSystemPromptFile: systemPromptFile,
               ...self.thinkingCliOptions(),
+              fastMode,
               cliVersion,
             })
             spawnSystemPromptFile = systemPromptFile
@@ -2643,6 +2989,39 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           } catch {}
         }
 
+        const finishWithExitPlanQuestion = (
+          call: ReturnType<typeof createExitPlanModeQuestionCall>,
+        ) => {
+          if (controllerClosed) return
+          endTextBlock()
+          controller.enqueue({
+            type: "tool-input-start",
+            id: call.toolCallId,
+            toolName: call.toolName,
+            providerExecuted: false,
+          } as any)
+          controller.enqueue({
+            type: "tool-call",
+            toolCallId: call.toolCallId,
+            toolName: call.toolName,
+            input: JSON.stringify(call.input),
+            providerExecuted: false,
+          } as any)
+          controller.enqueue({
+            type: "finish",
+            finishReason: toFinishReason("tool-calls"),
+            usage: toUsage(resultMeta.usage),
+            providerMetadata: {
+              "claude-code": resultMeta,
+            },
+          })
+          controllerClosed = true
+          cleanupTurn()
+          try {
+            controller.close()
+          } catch {}
+        }
+
         const drainNow = () => {
           if (drainTimer) {
             clearTimeout(drainTimer)
@@ -2872,6 +3251,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   claudeSessionId: msg.session_id,
                 })
               }
+              reportFastModeState(msg, fastMode)
             }
 
             // content_block_start
@@ -3061,6 +3441,25 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   endTextBlock()
                 } else if (tc.name === "ExitPlanMode") {
                   const plan = (parsedInput?.plan as string) || ""
+
+                  if (planModeQuestionActive) {
+                    // Approval bridge: render the plan, then hand the
+                    // yes/no back to opencode's own `question` tool and end
+                    // the turn on "tool-calls" so the outer loop runs it.
+                    const questionCall = createExitPlanModeQuestionCall(
+                      sk,
+                      tc.id,
+                      plan,
+                    )
+                    const planId = startTextBlock()
+                    controller.enqueue({
+                      type: "text-delta",
+                      id: planId,
+                      delta: questionCall.text,
+                    })
+                    finishWithExitPlanQuestion(questionCall)
+                    return
+                  }
 
                   const planId = startTextBlock()
                   controller.enqueue({
@@ -3273,6 +3672,22 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     endTextBlock()
                   } else if (block.name === "ExitPlanMode") {
                     const plan = (parsedInput?.plan as string) || ""
+
+                    if (planModeQuestionActive) {
+                      const questionCall = createExitPlanModeQuestionCall(
+                        sk,
+                        block.id,
+                        plan,
+                      )
+                      const planId = startTextBlock()
+                      controller.enqueue({
+                        type: "text-delta",
+                        id: planId,
+                        delta: questionCall.text,
+                      })
+                      finishWithExitPlanQuestion(questionCall)
+                      return
+                    }
 
                     const planId = startTextBlock()
                     controller.enqueue({

@@ -29,6 +29,11 @@ export interface ProxyMcpServer {
   url: string
   serverName: string
   tools: ProxyToolDef[]
+  /** Per-server bearer secret. Minted on start, handed to Claude via the
+   * `headers` block of the generated MCP config, and required on every
+   * request. Exposed so callers (and tests) can authenticate; MUST NOT be
+   * logged or placed in the URL. */
+  authToken: string
   /** Fires when Claude invokes one of our proxy tools. The handler resolves
    * the returned pending call once a result is available. */
   calls: EventEmitter
@@ -70,6 +75,16 @@ export type ProxyToolResult =
 // correct across CLI versions.
 const PROTOCOL_VERSION = "2025-06-18"
 const PROXY_HEARTBEAT_MS = 60 * 1000
+
+/**
+ * Handler that answers a `tools/call` inside this process instead of
+ * queueing it for opencode. Used by tools that act on plugin state rather
+ * than on the workspace (currently only `compress`), so they never reach
+ * the broker, never block on a human, and have no deadline.
+ */
+export type ProxyToolInterceptor = (
+  input: Record<string, unknown>,
+) => Promise<ProxyToolResult> | ProxyToolResult
 export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
 
 /** Rejections that fire on normal lifecycle transitions: AFK-permission
@@ -314,6 +329,21 @@ export const QUESTION_PROXY_NOTE =
   " Question calls get a 30-minute proxy deadline by default (configurable" +
   " via proxyToolTimeoutMs); for long-AFK scenarios prefer fewer," +
   " high-signal questions."
+
+/**
+ * Disambiguation appended to the `compress` proxy def. Two things the
+ * model gets wrong without it: when the reset happens (not mid-turn, so
+ * it can keep working after the call), and how much survives it (only
+ * the summary, because the fresh spawn is not given the prior transcript).
+ */
+export const COMPRESS_PROXY_NOTE =
+  "The current turn continues normally after this call — finish what you" +
+  " are doing. The reset happens at the START of the next turn: the" +
+  " Claude Code session is discarded and a fresh one begins with your" +
+  " summary as its only prior context. Everything else, including tool" +
+  " output and files you read, is gone, so write the summary as the" +
+  " authoritative record. Call this once per compression, when older" +
+  " resolved work no longer needs full detail."
 
 /**
  * Pull *only* the agent-type list out of opencode's live `task` description.
@@ -684,19 +714,139 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       required: ["questions"],
     },
   },
+  {
+    name: "compress",
+    description:
+      "Replace older conversation detail with a summary you write, then" +
+      " continue in a fresh Claude Code session. Handled inside the plugin," +
+      " so it never prompts the operator. " +
+      COMPRESS_PROXY_NOTE,
+    inputSchema: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description:
+            "Dense technical summary of the work being compressed: decisions" +
+            " made, files changed, commands run and their outcomes, and what" +
+            " is still open. This is the ONLY prior context that survives, so" +
+            " anything omitted is lost.",
+        },
+      },
+      required: ["summary"],
+    },
+  },
 ]
 
 export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
   timeoutOverrides?: Record<string, number>,
+  interceptors?: Map<string, ProxyToolInterceptor>,
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
 
+  // Per-server bearer secret (256 bits). This endpoint executes Bash/Edit/
+  // Write through opencode's executor, so an unauthenticated caller on
+  // loopback would have arbitrary command execution. The token lives only
+  // in this process and in the 0600 MCP config file Claude reads; it is
+  // deliberately kept out of the URL, because query strings leak into logs
+  // and process listings.
+  const authToken = crypto.randomBytes(32).toString("hex")
+  const expectedAuth = Buffer.from(`Bearer ${authToken}`)
+  // The exact authority we hand to Claude. Set once the ephemeral port is
+  // known; compared against the Host header to defeat DNS rebinding.
+  let boundAuthority = ""
+
+  function authOk(req: IncomingMessage): boolean {
+    const got = req.headers.authorization
+    if (typeof got !== "string") return false
+    const candidate = Buffer.from(got)
+    // timingSafeEqual throws on length mismatch, so length-check first.
+    // Length is not secret (the token is fixed-width).
+    if (candidate.length !== expectedAuth.length) return false
+    return crypto.timingSafeEqual(candidate, expectedAuth)
+  }
+
+  /**
+   * Reject a request without leaving the connection usable.
+   *
+   * Ending the response alone is not enough. A peer can declare a large
+   * Content-Length, send a single byte, take the rejection, and leave the
+   * request still arriving — and `server.close()` does not reap connections
+   * that are still sending, so a shutdown would hang behind it. Node's
+   * default whole-request timeout is five minutes, which is five minutes of
+   * a socket held by an unauthenticated caller.
+   *
+   * `Connection: close` tells Node to close once the response is flushed;
+   * destroying the socket on `finish` covers the case where the peer never
+   * finishes its body.
+   */
+  function reject(
+    req: IncomingMessage,
+    res: ServerResponse,
+    statusCode: number,
+    reason: string,
+  ): void {
+    // Every guard below is a measured property of the client we spawn, not a
+    // guarantee about future ones. If a later Claude CLI starts sending an
+    // Origin header, or a different Content-Type, every proxy call would
+    // 403/415 with no other symptom than tools mysteriously not working — so
+    // say why, here, once per rejected request. Header VALUES are omitted:
+    // this line must never carry the bearer token.
+    log.notice("proxy-mcp rejected a request", {
+      statusCode,
+      reason,
+      method: req.method,
+      hasAuthorization: typeof req.headers.authorization === "string",
+    })
+    res.statusCode = statusCode
+    res.setHeader("Connection", "close")
+    res.on("finish", () => {
+      req.socket?.destroy()
+    })
+    res.end()
+  }
+
   const server = createServer(async (req, res) => {
     if (req.method !== "POST" || !req.url?.startsWith("/mcp")) {
-      res.statusCode = 404
-      res.end()
+      reject(req, res, 404, "not a POST to /mcp")
+      return
+    }
+    // Everything below runs BEFORE readBody: an unauthenticated peer must
+    // not be able to stream an unbounded body into memory.
+    //
+    // DNS rebinding: a browser rebound onto this port via an attacker
+    // hostname sends that hostname in Host, never the loopback authority we
+    // generated. This does NOT block a page posting directly to
+    // 127.0.0.1:<port> — such a request carries exactly the expected Host —
+    // so it is a rebinding defense specifically, not a browser defense. The
+    // Origin and Content-Type guards below, and the token, cover that case.
+    if (req.headers.host !== boundAuthority) {
+      reject(req, res, 403, "host header is not the bound authority")
+      return
+    }
+    // Claude Code 2.1.226 sends no Origin on MCP requests (verified). The MCP
+    // transport spec obliges SERVERS to validate Origin; it does not oblige
+    // clients to omit it, so this is a measured property of the client we
+    // spawn rather than a guarantee about all conforming clients.
+    if (req.headers.origin !== undefined) {
+      reject(req, res, 403, "origin header present")
+      return
+    }
+    // Requiring application/json forces a CORS preflight for cross-origin
+    // callers (which then fails), closing the text/plain "simple request"
+    // bypass that would otherwise allow blind cross-site POSTs.
+    const contentType = String(req.headers["content-type"] ?? "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase()
+    if (contentType !== "application/json") {
+      reject(req, res, 415, "content-type is not application/json")
+      return
+    }
+    if (!authOk(req)) {
+      reject(req, res, 401, "missing or invalid bearer token")
       return
     }
     // Hoist the request id and method so the catch block can echo them
@@ -805,6 +955,28 @@ export async function createProxyMcpServer(
               isError: true,
             },
           })
+          return
+        }
+
+        // Intercepted tools act on plugin state, not on the workspace, so
+        // they are answered here and never queued for opencode. The result
+        // still goes through the shared MCP envelope below — a JSON-RPC
+        // error here would be rejected by Claude CLI exactly like any other
+        // tools/call error envelope.
+        const interceptor = interceptors?.get(toolName)
+        if (interceptor) {
+          let intercepted: ProxyToolResult
+          try {
+            intercepted = await interceptor(input)
+          } catch (interceptorError) {
+            const message =
+              interceptorError instanceof Error
+                ? interceptorError.message
+                : String(interceptorError)
+            log.warn("proxy-mcp interceptor failed", { toolName, error: message })
+            intercepted = { kind: "error", message }
+          }
+          writeToolCallResult(res, requestId, intercepted)
           return
         }
 
@@ -977,8 +1149,12 @@ export async function createProxyMcpServer(
     throw new Error("Failed to bind proxy MCP server")
   }
 
-  const url = `http://127.0.0.1:${addr.port}/mcp`
+  boundAuthority = `127.0.0.1:${addr.port}`
+  const url = `http://${boundAuthority}/mcp`
 
+  // NOTE: authToken is deliberately absent from this line and every other
+  // log call. The plugin log is written to disk and echoed to the TUI in
+  // debug mode; a leaked token there would defeat the whole mechanism.
   log.info("proxy-mcp server started", {
     url,
     tools: tools.map((t) => t.name),
@@ -990,6 +1166,7 @@ export async function createProxyMcpServer(
     url,
     serverName: SERVER_NAME,
     tools,
+    authToken,
     calls,
     configPath() {
       if (configFilePath) return configFilePath
@@ -999,6 +1176,10 @@ export async function createProxyMcpServer(
             [SERVER_NAME]: {
               type: "http",
               url,
+              // Claude CLI replays these headers on every request to this
+              // server, which is what lets the handler above reject anyone
+              // who did not read this 0600 file.
+              headers: { Authorization: `Bearer ${authToken}` },
               timeout: resolveProxyClientCeilingMs(timeoutOverrides),
             },
           },
@@ -1081,12 +1262,64 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
   return out
 }
 
+/**
+ * Everything that goes to `--disallowedTools` for one spawn: the built-ins
+ * the proxied tools replace, plus the ones the operator named directly.
+ *
+ * `disallowedToolFlags` can only cover tools the plugin has a proxy for, so
+ * a built-in with no equivalent (`NotebookEdit`, and anything Claude Code
+ * ships next) is unreachable without `extraDisallowedTools` — issue #26.
+ */
+export function resolveDisallowedTools(options: {
+  proxyTools?: ProxyToolDef[] | null
+  extraDisallowedTools?: string[]
+  disableWebSearch?: boolean
+}): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (name: string) => {
+    const trimmed = name.trim()
+    if (!trimmed || seen.has(trimmed)) return
+    seen.add(trimmed)
+    out.push(trimmed)
+  }
+
+  for (const name of disallowedToolFlags(options.proxyTools ?? [])) push(name)
+  for (const name of options.extraDisallowedTools ?? []) push(String(name))
+  if (options.disableWebSearch) push("WebSearch")
+  return out
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     req.on("data", (chunk: Buffer) => chunks.push(chunk))
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
     req.on("error", reject)
+  })
+}
+
+/**
+ * The single exit for every `tools/call`, broker-backed or intercepted.
+ * Success and failure share one MCP result envelope: a JSON-RPC error for
+ * `kind: "error"` was rejected by Claude CLI as a "malformed result that
+ * failed schema validation", so tool failures must surface as
+ * `isError: true` instead.
+ */
+function writeToolCallResult(
+  res: ServerResponse,
+  requestId: unknown,
+  result: ProxyToolResult,
+): void {
+  const text = result.kind === "error" ? result.message : result.text
+  const isError = result.kind === "error" || result.isError === true
+  writeJson(res, {
+    jsonrpc: "2.0",
+    id: requestId ?? null,
+    result: {
+      content: [{ type: "text", text }],
+      isError,
+    },
   })
 }
 
