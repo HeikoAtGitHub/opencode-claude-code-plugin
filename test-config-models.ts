@@ -78,6 +78,32 @@ test("configModelsForProvider registers claude-mythos-5 with real metadata", () 
   assert.ok(variants && "max" in variants, "reasoning variants must be carried")
 })
 
+test("configModelsForProvider registers Fable and Mythos 5.1 metadata", () => {
+  const models = configModelsForProvider({}, "claude-code")
+
+  for (const [id, name, family] of [
+    ["claude-fable-5-1", "Claude Fable 5.1 (10×)", "fable"],
+    ["claude-mythos-5-1", "Claude Mythos 5.1 (10×)", "mythos"],
+  ] as const) {
+    const model = models[id] as Record<string, unknown>
+    assert.ok(model, `${id} should be present`)
+    assert.equal(model.name, name)
+    assert.equal(model.family, family)
+    assert.equal(model.release_date, "2026-09-01")
+    assert.equal(model.reasoning, true)
+    assert.deepEqual(model.limit, { context: 1_000_000, output: 128_000 })
+    assert.deepEqual(
+      model.cost,
+      { input: 10, output: 50, cache_read: 0.25, cache_write: 12.5 },
+      id,
+    )
+    assert.ok(
+      "max" in (model.variants as Record<string, unknown>),
+      `${id} must carry the reasoning variants`,
+    )
+  }
+})
+
 test("configModelsForProvider registers Sonnet 5 and Opus 5 metadata", () => {
   const models = configModelsForProvider({}, "claude-code")
 
@@ -188,7 +214,9 @@ test("configModelsForProvider reports the published context and output limits", 
     "claude-opus-4-8",
     "claude-opus-5",
     "claude-fable-5",
+    "claude-fable-5-1",
     "claude-mythos-5",
+    "claude-mythos-5-1",
   ]) {
     assert.deepEqual(limitOf(id), { context: 1_000_000, output: 128_000 }, id)
   }
