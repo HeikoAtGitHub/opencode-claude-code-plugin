@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events"
 import {
   buildProxyTimeoutError,
+  isRequestScopedProxyTool,
   resolveProxyCallTimeoutMs,
   type ProxyToolCall,
   type ProxyToolResult,
@@ -21,13 +22,13 @@ export interface ProxyCallerContext {
   sessionAffinity: string
   opencodeSessionID?: string
   callerAgent?: string
-  allowWorkstreamManage?: boolean
+  allowedRequestScopedTools?: readonly string[]
 }
 
 export const PRIVILEGED_PROXY_CONTEXT_ERROR =
-  "workstream_manage requires exact OpenCode session affinity and caller context"
+  "request-scoped proxy tool requires exact OpenCode session affinity and caller context"
 export const PRIVILEGED_PROXY_EXPOSURE_ERROR =
-  "workstream_manage is not available in the current OpenCode request"
+  "request-scoped proxy tool is not available in the current OpenCode request"
 
 export function validatePrivilegedProxyContext(
   context: ProxyCallerContext | undefined,
@@ -97,13 +98,14 @@ export function queuePendingProxyCall(
   timeoutOverrides?: Record<string, number>,
   callerContext?: ProxyCallerContext,
 ): PendingProxyCall {
-  if (call.toolName.toLowerCase() === "workstream_manage") {
+  const normalizedToolName = call.toolName.toLowerCase()
+  if (isRequestScopedProxyTool(normalizedToolName)) {
     const contextError = validatePrivilegedProxyContext(callerContext)
     if (contextError) {
       call.reject(new Error(contextError))
       throw new Error(contextError)
     }
-    if (!callerContext?.allowWorkstreamManage) {
+    if (!callerContext?.allowedRequestScopedTools?.includes(normalizedToolName)) {
       call.reject(new Error(PRIVILEGED_PROXY_EXPOSURE_ERROR))
       throw new Error(PRIVILEGED_PROXY_EXPOSURE_ERROR)
     }

@@ -4,8 +4,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { test } from "node:test"
 import {
+  appendedSystemPromptHash,
   buildAppendedSystemPrompt,
   DEFAULT_COMPACTION_MODEL,
+  renderAppendedSystemPrompt,
   resolveCompactionModel,
 } from "./src/claude-code-language-model.js"
 
@@ -103,6 +105,26 @@ test("headless prompt path still preserves forwarded opencode system prompt", ()
     assert.match(content, /FORWARDED_OPENCODE_SYSTEM_PROMPT/)
   } finally {
     if (promptFile) unlinkSync(promptFile)
+    if (previousConfigHome === undefined) {
+      delete process.env.XDG_CONFIG_HOME
+    } else {
+      process.env.XDG_CONFIG_HOME = previousConfigHome
+    }
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+test("appended system prompt hash is stable and changes with forwarded scope context", () => {
+  const tmp = mkdtempSync(join(tmpdir(), "opencode-cc-test-"))
+  const previousConfigHome = process.env.XDG_CONFIG_HOME
+  try {
+    process.env.XDG_CONFIG_HOME = join(tmp, "config")
+    const first = renderAppendedSystemPrompt(tmp, true, ["scope:a"])
+    const same = renderAppendedSystemPrompt(tmp, true, ["scope:a"])
+    const changed = renderAppendedSystemPrompt(tmp, true, ["scope:b"])
+    assert.equal(appendedSystemPromptHash(first), appendedSystemPromptHash(same))
+    assert.notEqual(appendedSystemPromptHash(first), appendedSystemPromptHash(changed))
+  } finally {
     if (previousConfigHome === undefined) {
       delete process.env.XDG_CONFIG_HOME
     } else {

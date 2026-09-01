@@ -27,6 +27,9 @@ export interface ActiveProcess {
   proxyExposureHash?: string
   /** Temp file holding `--append-system-prompt-file` content; unlinked on exit. */
   systemPromptFile?: string
+  /** Hash of the complete appended system prompt. Reuse is safe only while
+   * current forwarded system context and proxy runtime guidance match. */
+  systemPromptHash?: string
 }
 
 // One active CLI process per session key. Keyed by a composite
@@ -210,6 +213,7 @@ export function spawnClaudeProcess(
   systemPromptFile?: string,
   ignoreAnthropicApiKey?: boolean,
   proxyExposureHash?: string,
+  systemPromptHash?: string,
 ): ActiveProcess {
   evictIfNeeded()
   log.info("spawning new claude process", { cliPath, cliArgs, cwd, sessionKey })
@@ -238,6 +242,7 @@ export function spawnClaudeProcess(
     mcpHash,
     proxyExposureHash,
     systemPromptFile,
+    systemPromptHash,
   }
   activeProcesses.set(sessionKey, ap)
 
@@ -369,6 +374,7 @@ export function respawnActiveProcess(
     old.systemPromptFile,
     ignoreAnthropicApiKey,
     old.proxyExposureHash,
+    old.systemPromptHash,
   )
 }
 

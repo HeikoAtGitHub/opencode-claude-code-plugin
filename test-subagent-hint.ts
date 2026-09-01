@@ -1,6 +1,10 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { SUBAGENT_DISPATCH_HINT, QUESTION_PROXY_HINT } from "./src/claude-code-language-model.js"
+import {
+  buildProxyRuntimeHint,
+  SUBAGENT_DISPATCH_HINT,
+  QUESTION_PROXY_HINT,
+} from "./src/claude-code-language-model.js"
 import {
   DEFAULT_PROXY_TOOLS,
   extractAgentTypeList,
@@ -29,6 +33,23 @@ test("subagent dispatch hint names the tool and defuses TaskCreate", () => {
   // The "don't grep configs to verify agents" guard (opus burned ~8 tool
   // calls doing exactly that before dispatching).
   assert.match(SUBAGENT_DISPATCH_HINT, /config files/i)
+})
+
+test("generic proxy runtime hint advertises exact tools and deferred selectors", () => {
+  const tools = DEFAULT_PROXY_TOOLS.filter((tool) =>
+    ["bash", "repo_policy_scope"].includes(tool.name),
+  )
+  const hint = buildProxyRuntimeHint(tools)!
+  assert.match(hint, /mcp__opencode_proxy__bash/)
+  assert.match(hint, /select:mcp__opencode_proxy__bash/)
+  assert.match(hint, /mcp__opencode_proxy__repo_policy_scope/)
+  assert.match(hint, /another repo or exclusive owner scope/)
+  assert.match(hint, /built-ins not replaced/)
+})
+
+test("generic proxy runtime hint is absent without active proxy tools", () => {
+  assert.equal(buildProxyRuntimeHint(null), undefined)
+  assert.equal(buildProxyRuntimeHint([]), undefined)
 })
 
 test("static task proxy def carries the disambiguation note", () => {

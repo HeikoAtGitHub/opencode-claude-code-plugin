@@ -1,0 +1,24 @@
+// Managed as a tracked repo/worktree document. Restart OpenCode after changes.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "bash": {
+      "**": "allow",
+      "git push*": "ask",
+      "git reset*": "ask",
+      "git clean*": "ask",
+      "git checkout*": "ask",
+      "git switch*": "ask",
+      "git worktree add*": "ask",
+      "git worktree remove*": "ask",
+      "git worktree prune*": "ask",
+      "rm *": "ask",
+      "rmdir *": "ask",
+      "chmod *": "ask",
+      "sudo *": "deny"
+    },
+    "external_directory": {
+      "**": "ask"
+    }
+  }
+}

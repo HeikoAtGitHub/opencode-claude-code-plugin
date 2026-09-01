@@ -173,3 +173,25 @@ test("an exiting stale process cannot delete its replacement", async () => {
     deleteClaudeSessionId(key)
   }
 })
+
+test("spawned process retains appended system prompt hash for reuse checks", () => {
+  const key = "system-prompt-hash"
+  const ap = spawnClaudeProcess(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1000)"],
+    process.cwd(),
+    key,
+    null,
+    null,
+    undefined,
+    undefined,
+    "proxy-hash",
+    "system-hash",
+  )
+  try {
+    assert.equal(ap.proxyExposureHash, "proxy-hash")
+    assert.equal(ap.systemPromptHash, "system-hash")
+  } finally {
+    deleteActiveProcess(key)
+  }
+})

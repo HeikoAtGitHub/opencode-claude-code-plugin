@@ -171,11 +171,11 @@ test("getPendingProxyCalls is empty for unknown session", () => {
   assert.deepEqual(getPendingProxyCalls(`sk-empty-${Date.now()}`), [])
 })
 
-test("workstream_manage fails closed without exact affinity and caller context", () => {
+test("request-scoped proxy tools fail closed without exact affinity and caller context", () => {
   for (const context of [
     undefined,
-    { sessionAffinity: "default", opencodeSessionID: "default", callerAgent: "manager", allowWorkstreamManage: true },
-    { sessionAffinity: "session-a", opencodeSessionID: "session-b", callerAgent: "manager", allowWorkstreamManage: true },
+    { sessionAffinity: "default", opencodeSessionID: "default", callerAgent: "manager", allowedRequestScopedTools: ["workstream_manage"] },
+    { sessionAffinity: "session-a", opencodeSessionID: "session-b", callerAgent: "manager", allowedRequestScopedTools: ["workstream_manage"] },
     { sessionAffinity: "session-a", opencodeSessionID: "session-a" },
   ]) {
     const call = makeCall("workstream_manage", {
@@ -199,7 +199,7 @@ test("workstream_manage broker preserves exact caller context and payload", () =
     "composite-key-exact",
     call.call,
     undefined,
-    { sessionAffinity, opencodeSessionID: sessionAffinity, callerAgent, allowWorkstreamManage: true },
+    { sessionAffinity, opencodeSessionID: sessionAffinity, callerAgent, allowedRequestScopedTools: ["workstream_manage"] },
   )
   assert.equal(pending.sessionAffinity, sessionAffinity)
   assert.equal(pending.callerAgent, callerAgent)
@@ -215,11 +215,30 @@ test("workstream_manage broker rejects current request exposure reduction", () =
       sessionAffinity: "session-exact",
       opencodeSessionID: "session-exact",
       callerAgent: "99_generic_workstream_manager",
-      allowWorkstreamManage: false,
+      allowedRequestScopedTools: [],
     }),
     new RegExp(PRIVILEGED_PROXY_EXPOSURE_ERROR),
   )
   assert.deepEqual(getPendingProxyCalls("exposure-reduced"), [])
+})
+
+test("repo_policy_scope broker keeps targets on exact request-scoped context", () => {
+  const sessionAffinity = "scope-session-exact"
+  const input = { targets: ["/repo/a", "/repo/b"] }
+  const call = makeCall("repo_policy_scope", input)
+  const pending = queuePendingProxyCall(
+    "scope-composite-key",
+    call.call,
+    undefined,
+    {
+      sessionAffinity,
+      opencodeSessionID: sessionAffinity,
+      callerAgent: "01_opencode_config",
+      allowedRequestScopedTools: ["repo_policy_scope"],
+    },
+  )
+  assert.deepEqual(pending.input, input)
+  rejectAllPendingProxyCallsForSession("scope-composite-key", new Error("test cleanup"))
 })
 
 test("resolve / reject on already-resolved id is a no-op returning false", () => {

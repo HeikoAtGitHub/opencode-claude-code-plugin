@@ -18,7 +18,7 @@ import {
   resolveProxyClientCeilingMs,
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
-  filterWorkstreamProxyByAvailability,
+  filterRequestScopedProxiesByAvailability,
   proxyToolExposureHash,
   validateProxyToolInput,
   DEFAULT_PROXY_TOOLS,
@@ -224,23 +224,37 @@ test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
   })!, /accepts only/)
 })
 
-test("workstream_manage exposure requires request and live native availability", () => {
+test("request-scoped proxy exposure requires request and live native availability", () => {
   const configured = [
     DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "bash")!,
+    DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "repo_policy_scope")!,
     DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "workstream_manage")!,
   ]
   const requested = requestToolNameSet([
+    { type: "function", name: "repo_policy_scope" },
     { type: "function", name: "workstream_manage" },
   ])
-  const catalog = new Set(["workstream_manage"])
-  assert.ok(filterWorkstreamProxyByAvailability(configured, requested, catalog)
+  const catalog = new Set(["repo_policy_scope", "workstream_manage"])
+  const exposed = filterRequestScopedProxiesByAvailability(configured, requested, catalog)
+  assert.ok(exposed.some((tool) => tool.name === "repo_policy_scope"))
+  assert.ok(exposed.some((tool) => tool.name === "workstream_manage"))
+  assert.ok(!filterRequestScopedProxiesByAvailability(configured, new Set(), catalog)
     .some((tool) => tool.name === "workstream_manage"))
-  assert.ok(!filterWorkstreamProxyByAvailability(configured, new Set(), catalog)
-    .some((tool) => tool.name === "workstream_manage"))
-  assert.ok(!filterWorkstreamProxyByAvailability(configured, requested, new Set())
-    .some((tool) => tool.name === "workstream_manage"))
-  assert.ok(!filterWorkstreamProxyByAvailability(configured, requested, undefined)
-    .some((tool) => tool.name === "workstream_manage"))
+  assert.ok(!filterRequestScopedProxiesByAvailability(configured, requested, new Set())
+    .some((tool) => tool.name === "repo_policy_scope"))
+  assert.deepEqual(
+    filterRequestScopedProxiesByAvailability(configured, requested, undefined)
+      .map((tool) => tool.name),
+    ["bash"],
+  )
+})
+
+test("repo_policy_scope exposes narrow schema and validates targets", () => {
+  const scope = DEFAULT_PROXY_TOOLS.find((tool) => tool.name === "repo_policy_scope")!
+  assert.deepEqual(scope.inputSchema.required, ["targets"])
+  assert.equal(validateProxyToolInput("repo_policy_scope", { targets: ["/repo/a", "/repo/b"] }), null)
+  assert.match(validateProxyToolInput("repo_policy_scope", { targets: [] })!, /1-20/)
+  assert.match(validateProxyToolInput("repo_policy_scope", { targets: ["/repo"], force: true })!, /only targets/)
 })
 
 test("workstream_manage exposure change alters reused-process hash", () => {
@@ -300,7 +314,7 @@ test("workstream_manage keeps session affinity and input unchanged through the b
       sessionAffinity: affinity,
       opencodeSessionID: affinity,
       callerAgent: "99_generic_WS_HISTORY_REPAIR_GIT_MANAGER",
-      allowWorkstreamManage: true,
+      allowedRequestScopedTools: ["workstream_manage"],
     },
   )
   srv.calls.on("call", forwardCall)
@@ -381,14 +395,14 @@ test("reused proxy denies stale workstream_manage while unrelated call stays pen
   )
   const sessionKey = `reused-exposure-${Date.now()}`
   const srv = await createProxyMcpServer(tools)
-  let allowWorkstreamManage = true
+  let allowedRequestScopedTools = ["workstream_manage"]
   const forwardCall = (call: ProxyToolCall) => {
     try {
       queuePendingProxyCall(sessionKey, call, undefined, {
         sessionAffinity: sessionKey,
         opencodeSessionID: sessionKey,
         callerAgent: "99_generic_workstream_manager",
-        allowWorkstreamManage,
+        allowedRequestScopedTools,
       })
     } catch {}
   }
@@ -411,7 +425,7 @@ test("reused proxy denies stale workstream_manage while unrelated call stays pen
 
     // Same server/process, but current request no longer exposes the native
     // tool. Broker must reject the stale definition without touching bash.
-    allowWorkstreamManage = false
+    allowedRequestScopedTools = []
     const denied = await post(srv.url, {
       jsonrpc: "2.0",
       id: "stale-workstream",

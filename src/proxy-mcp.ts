@@ -39,6 +39,7 @@ export interface ProxyMcpServer {
     sessionAffinity: string
     opencodeSessionID?: string
     callerAgent?: string
+    allowedRequestScopedTools?: readonly string[]
   }) => void
   close(): Promise<void>
 }
@@ -95,20 +96,43 @@ export function validateProxyToolInput(
   toolName: string,
   input: Record<string, unknown>,
 ): string | null {
-  if (toolName.toLowerCase() !== "workstream_manage") return null
-  return validateWorkstreamInput(input)
+  const normalized = toolName.toLowerCase()
+  if (normalized === "workstream_manage") return validateWorkstreamInput(input)
+  if (normalized !== "repo_policy_scope") return null
+  if (Object.keys(input).some((key) => key !== "targets")) {
+    return "repo_policy_scope accepts only targets"
+  }
+  if (
+    !Array.isArray(input.targets) ||
+    input.targets.length < 1 ||
+    input.targets.length > 20 ||
+    !input.targets.every(
+      (target) => typeof target === "string" && target.trim().length > 0 && target.length <= 2000,
+    )
+  ) {
+    return "repo_policy_scope targets must contain 1-20 non-empty path strings"
+  }
+  return null
 }
 
-export function filterWorkstreamProxyByAvailability(
+export const REQUEST_SCOPED_PROXY_TOOLS = new Set([
+  "repo_policy_scope",
+  "workstream_manage",
+])
+
+export function isRequestScopedProxyTool(toolName: string): boolean {
+  return REQUEST_SCOPED_PROXY_TOOLS.has(toolName.toLowerCase())
+}
+
+export function filterRequestScopedProxiesByAvailability(
   tools: ProxyToolDef[],
   requestToolNames: ReadonlySet<string>,
   liveToolIds: ReadonlySet<string> | undefined,
 ): ProxyToolDef[] {
-  if (
-    requestToolNames.has("workstream_manage") &&
-    liveToolIds?.has("workstream_manage")
-  ) return tools
-  return tools.filter((tool) => tool.name !== "workstream_manage")
+  return tools.filter((tool) =>
+    !isRequestScopedProxyTool(tool.name) ||
+    (requestToolNames.has(tool.name) && liveToolIds?.has(tool.name)),
+  )
 }
 
 export function proxyToolExposureHash(tools: ProxyToolDef[] | null): string {
@@ -567,6 +591,29 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
         },
       },
       required: ["edits"],
+    },
+  },
+  {
+    name: "repo_policy_scope",
+    description:
+      "Load and validate Repo Policy Overlay for one or more action targets" +
+      " through OpenCode's native session-bound tool. Call this before the" +
+      " first effective read, write, or run in another repo or exclusive" +
+      " owner scope. The proxy only transports target paths; OpenCode remains" +
+      " the validation, scope-state, drift, and authorization owner.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        targets: {
+          type: "array",
+          minItems: 1,
+          maxItems: 20,
+          items: { type: "string", minLength: 1, maxLength: 2000 },
+          description: "Absolute or workspace-relative action targets to attest.",
+        },
+      },
+      required: ["targets"],
     },
   },
   {

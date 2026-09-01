@@ -131,7 +131,9 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`, `submit_plan`, `workstream_manage`. Leave empty or unset to disable proxying.
+   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`,
+   * `submit_plan`, `repo_policy_scope`, `workstream_manage`. Leave empty or
+   * unset to disable proxying.
     *
     * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
     * opencode's `task` tool, so subagent calls run under opencode's
@@ -152,6 +154,11 @@ export interface ClaudeCodeProviderSettings {
     * the current request tool set and OpenCode's live native catalog contain
     * `workstream_manage`; unavailable live catalog data fails closed.
     *
+    * `repo_policy_scope` transports OpenCode's native session-bound overlay
+    * resolver. Like `workstream_manage`, it is exposed only when the current
+    * request and live native catalog both contain the tool; unavailable live
+    * catalog or mismatched session identity fails closed.
+    *
     * `question` proxies Claude CLI's `AskUserQuestion` through opencode's
     * native `question` tool (TUI form with options + custom answer). The
     * calling agent must have `permission.question: allow`. Version-gated:
@@ -162,7 +169,8 @@ export interface ClaudeCodeProviderSettings {
 
   /**
    * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool
-     * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`, `submit_plan`, `workstream_manage` —
+   * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`,
+   * `submit_plan`, `repo_policy_scope`, `workstream_manage` —
    * case-insensitive). When a proxied tool call waits longer than its
    * deadline for opencode to resolve it, the call is rejected and Claude
    * receives a timeout error.

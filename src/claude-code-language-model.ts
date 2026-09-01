@@ -49,7 +49,8 @@ import {
   overlayTaskProxyDescription,
   overlayQuestionProxyDescription,
   filterQuestionProxyByOpencodeSupport,
-  filterWorkstreamProxyByAvailability,
+  filterRequestScopedProxiesByAvailability,
+  isRequestScopedProxyTool,
   proxyToolExposureHash,
   PROXY_TOOL_PREFIX,
   type ProxyMcpServer,
@@ -65,11 +66,12 @@ import {
   rejectPendingProxyCallById,
   resolvePendingProxyCallById,
   type PendingProxyCall,
+  type ProxyCallerContext,
 } from "./proxy-broker.js"
 import { readFileSync, writeFileSync } from "node:fs"
 import { unlink } from "node:fs/promises"
 import { homedir, tmpdir } from "node:os"
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 
 /**
@@ -637,11 +639,31 @@ function extractSystemMessages(
   return out
 }
 
-export function buildAppendedSystemPrompt(
+export function buildProxyRuntimeHint(
+  tools: ProxyToolDef[] | null,
+): string | undefined {
+  if (!tools?.length) return undefined
+  const names = Array.from(new Set(tools.map((tool) => tool.name.toLowerCase())))
+  const routes = names.map((name) =>
+    `- \`${name}\`: \`${PROXY_TOOL_PREFIX}${name}\`; deferred-schema selector \`select:${PROXY_TOOL_PREFIX}${name}\``,
+  )
+  return [
+    "## OpenCode proxy tool runtime",
+    "This Claude Code session is hosted by OpenCode. Active proxy routes are listed below.",
+    "Use the exact MCP tool name. If its schema is deferred or the tool is not yet callable, load it with ToolSearch using the exact selector; do not probe disabled Claude built-ins first.",
+    ...routes,
+    names.includes("repo_policy_scope")
+      ? `Before effective access to another repo or exclusive owner scope, call \`${PROXY_TOOL_PREFIX}repo_policy_scope\` with all targets. OpenCode remains the scope and drift owner.`
+      : "",
+    "Claude built-ins not replaced by a listed route may still be used when current repo permissions allow them.",
+  ].filter(Boolean).join("\n")
+}
+
+export function renderAppendedSystemPrompt(
   cwd: string,
   includeMultiStepHint = true,
   extraSystemContent: string[] = [],
-): string | undefined {
+): string {
   const parts: string[] = []
   parts.push(CLAUDE_CLI_CONTEXT_NOTE)
   for (const s of extraSystemContent) {
@@ -666,7 +688,14 @@ export function buildAppendedSystemPrompt(
   if (pushGlobal || pushWorkspace) parts.push(AGENTS_MAINTENANCE_HINT)
   if (includeMultiStepHint) parts.push(MULTI_STEP_TASK_HINT)
 
-  const content = parts.join("\n\n")
+  return parts.join("\n\n")
+}
+
+export function appendedSystemPromptHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex")
+}
+
+function writeAppendedSystemPrompt(content: string): string | undefined {
   if (!content) return undefined
 
   const path = join(tmpdir(), `opencode-cc-sys-${randomUUID()}.md`)
@@ -677,6 +706,16 @@ export function buildAppendedSystemPrompt(
     log.warn("failed to write system prompt file", { error: String(err) })
     return undefined
   }
+}
+
+export function buildAppendedSystemPrompt(
+  cwd: string,
+  includeMultiStepHint = true,
+  extraSystemContent: string[] = [],
+): string | undefined {
+  return writeAppendedSystemPrompt(
+    renderAppendedSystemPrompt(cwd, includeMultiStepHint, extraSystemContent),
+  )
 }
 
 export class ClaudeCodeLanguageModel implements LanguageModelV3 {
@@ -882,7 +921,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       sessionAffinity: string
       opencodeSessionID?: string
       callerAgent?: string
-      allowWorkstreamManage?: boolean
+      allowedRequestScopedTools?: readonly string[]
     },
   ): Promise<ProxyMcpServer> {
     const timeoutOverrides = this.config.proxyToolTimeoutMs
@@ -1792,11 +1831,11 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const skipPermissions = this.config.skipPermissions !== false
     const scope = this.requestScope(options as any)
     const affinity = this.sessionAffinity(options)
-    const proxyCallerContext = {
+    const proxyCallerContext: ProxyCallerContext = {
       sessionAffinity: affinity,
       opencodeSessionID: this.getOpencodeSessionID(options.providerOptions),
       callerAgent: this.getOpencodeAgent(options.providerOptions),
-      allowWorkstreamManage: false,
+      allowedRequestScopedTools: [],
     }
     const compactionMode = this.isCompactionCall(options)
     // Use a separate session key for compaction so its short-lived spawn
@@ -1982,7 +2021,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             ? new Set(liveToolCatalog.map((tool) => tool.id))
             : undefined
           let requestProxy = resolvedProxy
-            ? filterWorkstreamProxyByAvailability(
+            ? filterRequestScopedProxiesByAvailability(
                 resolvedProxy,
                 requestToolNames,
                 liveToolIds,
@@ -1995,8 +2034,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             )
           }
           if (requestProxy?.length === 0) requestProxy = null
-          proxyCallerContext.allowWorkstreamManage =
-            requestProxy?.some((tool) => tool.name === "workstream_manage") ?? false
+          proxyCallerContext.allowedRequestScopedTools = requestProxy
+            ?.map((tool) => tool.name.toLowerCase())
+            .filter(isRequestScopedProxyTool) ?? []
           // A reused process can retain spawn-time definitions while unrelated
           // proxy calls are pending. Refresh broker context before any await so
           // a stale definition cannot authorize a new privileged call.
@@ -2129,6 +2169,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             }
           } else {
           let spawnSystemPromptFile: string | undefined
+          let spawnSystemPromptHash: string | undefined
           let spawnProxyServer: ProxyMcpServer | null = null
           let spawnMcpHash: string | null = null
 
@@ -2263,6 +2304,41 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             const questionProxyActive =
               enrichedProxy?.some((t) => t.name === "question") ?? false
 
+            const proxyRuntimeHint = buildProxyRuntimeHint(enrichedProxy)
+            const systemPromptContent = renderAppendedSystemPrompt(
+              cwd,
+              self.config.multiStepContinuation !== false,
+              [
+                ...extractSystemMessages(options.prompt),
+                ...(proxyRuntimeHint ? [proxyRuntimeHint] : []),
+                ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
+                ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
+              ],
+            )
+            const currentSystemPromptHash = appendedSystemPromptHash(systemPromptContent)
+            if (
+              activeProcess &&
+              activeProcess.systemPromptHash !== currentSystemPromptHash
+            ) {
+              if (previousPendingProxyCalls.length > 0) {
+                log.info("deferring system prompt refresh until proxy calls resolve", {
+                  sk,
+                  previousHash: activeProcess.systemPromptHash ?? null,
+                  currentHash: currentSystemPromptHash,
+                  pendingCalls: previousPendingProxyCalls.length,
+                })
+              } else {
+                log.info("system prompt changed, respawning claude", {
+                  sk,
+                  previousHash: activeProcess.systemPromptHash ?? null,
+                  currentHash: currentSystemPromptHash,
+                })
+                await deleteActiveProcessAndWait(sk)
+                activeProcess = undefined
+                proxyServer = null
+              }
+            }
+
             // Compute disallowed flags from the POST-FILTER proxy list
             // (enrichedProxy), not the pre-filter one (resolvedProxy).
             // When the version gate drops `question` on an older opencode
@@ -2285,15 +2361,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             )
             const systemPromptFile = activeProcess
               ? undefined
-              : buildAppendedSystemPrompt(
-                  cwd,
-                  self.config.multiStepContinuation !== false,
-                  [
-                    ...extractSystemMessages(options.prompt),
-                    ...(taskProxyEnabled ? [SUBAGENT_DISPATCH_HINT] : []),
-                    ...(questionProxyActive ? [QUESTION_PROXY_HINT] : []),
-                  ],
-                )
+              : writeAppendedSystemPrompt(systemPromptContent)
             cliArgs = buildCliArgs({
               sessionKey: sk,
               skipPermissions,
@@ -2307,6 +2375,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               cliVersion,
             })
             spawnSystemPromptFile = systemPromptFile
+            spawnSystemPromptHash = currentSystemPromptHash
             spawnProxyServer = proxyServer
             spawnMcpHash = mcp.bridgedHash
           }
@@ -2326,6 +2395,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               spawnSystemPromptFile,
               self.config.ignoreAnthropicApiKey,
               currentProxyExposureHash,
+              spawnSystemPromptHash,
             )
             proc = ap.proc
             lineEmitter = ap.lineEmitter
