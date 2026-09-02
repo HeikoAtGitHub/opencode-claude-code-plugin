@@ -2627,13 +2627,6 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               combinedList.length > 0 ? combinedList : null
 
             proxyServer?.updateCallerContext?.(proxyCallerContext)
-            if (!proxyServer && combinedProxyTools) {
-              proxyServer = await self.ensureProxyServer(
-                combinedProxyTools,
-                sk,
-                proxyCallerContext,
-              )
-            }
 
             // Whether the question proxy actually survived the version
             // gate (post-filter). Used to decide whether to inject the
@@ -2683,6 +2676,19 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 activeProcess = undefined
                 proxyServer = null
               }
+            }
+
+            // Every refresh above can discard the active process and its
+            // process-owned proxy server. Recreate the proxy only after all
+            // invalidation checks, so the final MCP config and disallowed-tool
+            // list can never describe replacements that the spawned process
+            // cannot reach. A creation failure aborts before build/spawn.
+            if (!proxyServer && combinedProxyTools) {
+              proxyServer = await self.ensureProxyServer(
+                combinedProxyTools,
+                sk,
+                proxyCallerContext,
+              )
             }
 
             // Compute disallowed flags from the POST-FILTER proxy list

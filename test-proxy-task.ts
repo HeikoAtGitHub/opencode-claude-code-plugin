@@ -299,6 +299,74 @@ readline.createInterface({ input: process.stdin }).on("line", () => {
   return { cliPath, cwd }
 }
 
+function createFakeRefreshCli() {
+  const cwd = mkdtempSync(join(tmpdir(), "opencode-proxy-refresh-"))
+  const cliPath = join(cwd, "fake-claude.cjs")
+  const spawnLog = join(cwd, "spawns.jsonl")
+  const source = `#!/usr/bin/env node
+const fs = require("node:fs")
+const readline = require("node:readline")
+
+if (process.argv.includes("--version")) {
+  process.stdout.write("2.1.142\\n")
+  process.exit(0)
+}
+
+const args = process.argv.slice(2)
+const configIndex = args.indexOf("--mcp-config")
+let proxyConfigPath
+if (configIndex >= 0) {
+  for (let index = configIndex + 1; index < args.length; index++) {
+    const value = args[index]
+    if (value.startsWith("--")) break
+    try {
+      const config = JSON.parse(fs.readFileSync(value, "utf8"))
+      if (config.mcpServers?.opencode_proxy) proxyConfigPath = value
+    } catch {}
+  }
+}
+fs.appendFileSync(${JSON.stringify(spawnLog)}, JSON.stringify({
+  proxyConfigPath,
+  resume: args.includes("--resume"),
+}) + "\\n")
+if (!proxyConfigPath) {
+  process.stderr.write("missing opencode proxy config\\n")
+  process.exit(2)
+}
+
+function emit(message) {
+  process.stdout.write(JSON.stringify(message) + "\\n")
+}
+
+let handled = false
+readline.createInterface({ input: process.stdin }).on("line", () => {
+  if (handled) return
+  handled = true
+  emit({
+    type: "assistant",
+    session_id: "fake-refresh-session",
+    message: {
+      role: "assistant",
+      stop_reason: "end_turn",
+      content: [{ type: "text", text: "proxy ready" }],
+    },
+  })
+  emit({
+    type: "result",
+    subtype: "success",
+    session_id: "fake-refresh-session",
+    duration_ms: 1,
+    num_turns: 1,
+    is_error: false,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  })
+})
+`
+  writeFileSync(cliPath, source)
+  chmodSync(cliPath, 0o755)
+  return { cliPath, cwd, spawnLog }
+}
+
 async function streamTaskBoundary(
   mode: "normal" | "race" | "batch" | "duplicate" | "error",
 ) {
@@ -932,6 +1000,76 @@ test("parent tool-result turn defers MCP hot reload and continues the same Claud
     )
   } finally {
     rejectAllPendingProxyCallsForSession(sk, new Error("test cleanup"))
+    deleteActiveProcess(sk)
+    rmSync(fake.cwd, { recursive: true, force: true })
+  }
+})
+
+test("system prompt refresh respawns with a new proxy MCP config", {
+  timeout: 10_000,
+}, async () => {
+  const fake = createFakeRefreshCli()
+  const modelId = "claude-test-proxy-system-refresh"
+  const sk = sessionKey(fake.cwd, `${modelId}::tools::default`)
+  const tools = [
+    {
+      type: "function",
+      name: "bash",
+      description: "Run a command through opencode",
+      inputSchema: { type: "object", properties: {} },
+    },
+  ]
+
+  try {
+    const model = createClaudeCode({
+      cliPath: fake.cliPath,
+      cwd: fake.cwd,
+      bridgeOpencodeMcp: false,
+      proxyOpencodeMcpTools: false,
+      proxyTools: ["Bash"],
+    }).languageModel(modelId)
+
+    const firstPrompt = [
+      { role: "system", content: "scope alpha" },
+      { role: "user", content: [{ type: "text", text: "first turn" }] },
+    ]
+    const firstResponse = await model.doStream({ prompt: firstPrompt, tools } as any)
+    for await (const _part of firstResponse.stream) {
+      // Drain the turn so the fake session id is retained for --resume.
+    }
+
+    const secondResponse = await model.doStream({
+      prompt: [
+        { role: "system", content: "scope beta" },
+        ...firstPrompt.slice(1),
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "proxy ready" }],
+        },
+        { role: "user", content: [{ type: "text", text: "second turn" }] },
+      ],
+      tools,
+    } as any)
+    const secondParts: any[] = []
+    for await (const part of secondResponse.stream) secondParts.push(part)
+
+    const spawns = readFileSync(fake.spawnLog, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+    assert.equal(spawns.length, 2)
+    assert.ok(spawns.every((spawn) => typeof spawn.proxyConfigPath === "string"))
+    assert.notEqual(spawns[0].proxyConfigPath, spawns[1].proxyConfigPath)
+    assert.equal(spawns[0].resume, false)
+    assert.equal(spawns[1].resume, true)
+    assert.equal(
+      secondParts
+        .filter((part) => part.type === "text-delta")
+        .map((part) => part.delta)
+        .join(""),
+      "proxy ready",
+    )
+  } finally {
     deleteActiveProcess(sk)
     rmSync(fake.cwd, { recursive: true, force: true })
   }
