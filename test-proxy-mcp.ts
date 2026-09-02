@@ -166,8 +166,10 @@ test("workstream_manage keeps the exact native transport schema internally", () 
       const arg = rawArg.replace(/\?$/, "")
       const property = branch.properties[arg]
       assert.ok(property, `${action} missing ${arg} property`)
-      const pattern = arg === "members" ? property.items.pattern : property.pattern
-      assert.equal(pattern, WORKSTREAM_CONTRACT.identifier_pattern)
+      if (["slug", "group_id", "members"].includes(arg)) {
+        const pattern = arg === "members" ? property.items.pattern : property.pattern
+        assert.equal(pattern, WORKSTREAM_CONTRACT.identifier_pattern)
+      }
       assert.equal(branch.required.includes(arg), !rawArg.endsWith("?"))
     }
   }
@@ -184,6 +186,9 @@ test("workstream_manage exposes a Claude-compatible object-root schema", () => {
   assert.deepEqual(schema.required, ["action"])
   assert.deepEqual(schema.properties.action.enum, WORKSTREAM_ACTIONS)
   assert.ok(WORKSTREAM_ACTIONS.includes("member_adopt"))
+  assert.ok(WORKSTREAM_ACTIONS.includes("collision_preview"))
+  assert.equal(schema.properties.planned_paths.maxItems, 100)
+  assert.equal(schema.properties.repo_roots.maxItems, 20)
   assert.match(workstream.description, /sole authorization and execution owner/)
   for (const forbidden of [
     "preview_token", "refs", "paths", "hashes", "remotes", "force", "argv",
@@ -205,7 +210,13 @@ test("workstream_manage validates native action-specific inputs", () => {
       const optional = rawArg.endsWith("?")
       const arg = rawArg.replace(/\?$/, "")
       if (!optional || arg === "members") {
-        input[arg] = arg === "members" ? ["one", "two"] : `${arg}-value`
+        if (arg === "members") input[arg] = ["one", "two"]
+        else if (arg === "planned_paths") input[arg] = ["src/new.ts"]
+        else if (arg === "repo_roots") input[arg] = ["/repo"]
+        else if (arg === "repo_root") input[arg] = "/repo"
+        else if (arg === "scope") input[arg] = "all"
+        else if (arg === "on_conflict") input[arg] = "skip"
+        else input[arg] = `${arg}-value`
       }
     }
     assert.equal(validateProxyToolInput("workstream_manage", input), null, action)
@@ -245,6 +256,12 @@ test("workstream_manage rejects missing, mismatched, and unsafe inputs", () => {
   assert.match(validateProxyToolInput("workstream_manage", {
     action: "repair_apply", slug: "stlk_analyse", remote: "origin",
   })!, /accepts only/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "collision_preview", slug: "stlk_analyse", planned_paths: ["../escape"],
+  })!, /planned_paths are invalid/)
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "collision_preview", slug: "stlk_analyse", planned_paths: ["src/new.ts"],
+  }), null)
 })
 
 test("request-scoped proxy exposure requires request and live native availability", () => {

@@ -653,7 +653,9 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       " tool. OpenCode remains the sole authorization and execution owner," +
       " including caller-agent checks, session-bound state, approvals, and" +
       " wrapper execution. This proxy performs no Git operation and exposes" +
-      " no raw argv, ref, remote, force, hash, path, or state-root input.",
+      " no raw argv, ref, remote, force, hash, or state-root input. Planned" +
+      " repository paths are bounded, transient inputs for collision_preview" +
+      " and are interpreted only by OpenCode's native owner.",
     inputSchema: WORKSTREAM_PROXY_INPUT_SCHEMA,
   },
   {

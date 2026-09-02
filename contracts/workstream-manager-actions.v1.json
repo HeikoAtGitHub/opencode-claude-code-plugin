@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.2.0",
   "identifier_pattern": "^(?!\\.+$)[a-z0-9._-]+$",
   "roles": {
     "manager": ["99_generic_workstream_manager"],
@@ -21,6 +21,11 @@
     "sync_preview": {"family": "sync", "phase": "preview", "args": ["slug"], "mutates": false, "roles": ["coding", "cleanup"], "argv": ["sync", "{slug}"]},
     "sync_apply": {"family": "sync", "phase": "apply", "args": ["slug"], "mutates": true, "token": "preview", "roles": ["coding", "cleanup"], "argv": ["sync", "{slug}", "--apply", "--preview-token", "{preview_token}"]},
     "sync_push": {"family": "sync", "phase": "push", "args": ["slug"], "mutates": true, "token": "push", "roles": ["coding", "cleanup"], "argv": ["sync", "{slug}", "--push", "--push-token", "{push_token}"]},
+    "collision_preview": {"family": "collision", "phase": "read", "args": ["slug", "planned_paths", "repo_root?"], "mutates": false, "roles": ["coding"], "argv": ["collision-preview", "{slug}", "{planned_paths}"]},
+    "sync_batch_inventory": {"family": "sync_batch_inventory", "phase": "read", "args": [], "mutates": false, "roles": ["manager", "coding"], "argv": ["sync-batch", "--inventory"]},
+    "sync_batch_preview": {"family": "sync_batch", "phase": "preview", "args": ["repo_root", "repo_roots", "scope", "on_conflict"], "mutates": false, "roles": ["manager", "coding"], "argv": ["sync-batch", "--scope", "{scope}", "--on-conflict", "{on_conflict}", "{repo_roots}"]},
+    "sync_batch_apply": {"family": "sync_batch", "phase": "apply", "args": ["repo_root", "repo_roots", "scope", "on_conflict"], "mutates": true, "token": "preview", "roles": ["manager", "coding"], "argv": ["sync-batch", "--scope", "{scope}", "--on-conflict", "{on_conflict}", "{repo_roots}", "--apply", "--preview-token", "{preview_token}"]},
+    "sync_batch_push": {"family": "sync_batch", "phase": "push", "args": ["repo_root", "repo_roots", "scope", "on_conflict"], "mutates": true, "token": "push", "roles": ["manager", "coding"], "argv": ["sync-batch", "--scope", "{scope}", "--on-conflict", "{on_conflict}", "{repo_roots}", "--push", "--push-token", "{push_token}"]},
     "repair_preview": {"family": "repair", "phase": "preview", "args": ["slug"], "mutates": false, "roles": ["repair"], "argv": ["repair", "{slug}"]},
     "repair_apply": {"family": "repair", "phase": "apply", "args": ["slug"], "mutates": true, "token": "preview", "roles": ["repair"], "argv": ["repair", "{slug}", "--apply", "--preview-token", "{preview_token}"]},
     "repair_push": {"family": "repair", "phase": "push", "args": ["slug"], "mutates": true, "token": "push", "roles": ["repair"], "argv": ["repair", "{slug}", "--push", "--push-token", "{push_token}"]},

@@ -27,7 +27,30 @@ function propertySchema(name: string): Record<string, unknown> {
   if (name === "members") {
     return { type: "array", items: identifierSchema }
   }
+  if (name === "planned_paths") {
+    return {
+      type: "array", minItems: 1, maxItems: 100,
+      items: { type: "string", minLength: 1, maxLength: 1000 },
+    }
+  }
+  if (name === "repo_roots") {
+    return {
+      type: "array", maxItems: 20,
+      items: { type: "string", minLength: 1, maxLength: 1000 },
+    }
+  }
+  if (name === "repo_root") return { type: "string", minLength: 1, maxLength: 1000 }
+  if (name === "scope") return { type: "string", enum: ["current", "all"] }
+  if (name === "on_conflict") return { type: "string", enum: ["skip", "stop"] }
   return identifierSchema
+}
+
+function isSafePlannedPath(value: unknown): value is string {
+  if (typeof value !== "string" || !value || value.length > 1000) return false
+  if (value.startsWith("/") || value.endsWith("/") || value.includes("\\")) return false
+  return value.split("/").every(
+    (part) => part !== "" && part !== "." && part !== ".." && !/[*?[\]]/.test(part),
+  )
 }
 
 export const WORKSTREAM_INPUT_SCHEMA: Record<string, unknown> = {
@@ -66,6 +89,11 @@ export const WORKSTREAM_PROXY_INPUT_SCHEMA: Record<string, unknown> = {
     slug: propertySchema("slug"),
     group_id: propertySchema("group_id"),
     members: propertySchema("members"),
+    planned_paths: propertySchema("planned_paths"),
+    repo_root: propertySchema("repo_root"),
+    repo_roots: propertySchema("repo_roots"),
+    scope: propertySchema("scope"),
+    on_conflict: propertySchema("on_conflict"),
   },
   required: ["action"],
 }
@@ -97,6 +125,20 @@ export function validateWorkstreamInput(input: Record<string, unknown>): string 
       if (!Array.isArray(value) || value.some((member) =>
         typeof member !== "string" || !identifier.test(member)
       )) return "workstream_manage members are invalid"
+    } else if (name === "planned_paths") {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 100 || value.some((path) => !isSafePlannedPath(path))) {
+        return "workstream_manage planned_paths are invalid"
+      }
+    } else if (name === "repo_roots") {
+      if (!Array.isArray(value) || value.length > 20 || value.some((repo) =>
+        typeof repo !== "string" || !repo || repo.length > 1000
+      )) return "workstream_manage repo_roots are invalid"
+    } else if (name === "repo_root") {
+      if (typeof value !== "string" || !value || value.length > 1000) return "workstream_manage repo_root is invalid"
+    } else if (name === "scope") {
+      if (value !== "current" && value !== "all") return "workstream_manage scope is invalid"
+    } else if (name === "on_conflict") {
+      if (value !== "skip" && value !== "stop") return "workstream_manage on_conflict is invalid"
     } else if (typeof value !== "string" || !identifier.test(value)) {
       return `workstream_manage ${name} is invalid`
     }
