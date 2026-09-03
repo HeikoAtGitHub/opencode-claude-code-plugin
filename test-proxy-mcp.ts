@@ -187,6 +187,14 @@ test("workstream_manage exposes a Claude-compatible object-root schema", () => {
   assert.deepEqual(schema.properties.action.enum, WORKSTREAM_ACTIONS)
   assert.ok(WORKSTREAM_ACTIONS.includes("member_adopt"))
   assert.ok(WORKSTREAM_ACTIONS.includes("collision_preview"))
+  for (const action of [
+    "conflict_preview",
+    "conflict_prepare",
+    "conflict_finalize",
+    "conflict_abort",
+  ]) {
+    assert.ok(WORKSTREAM_ACTIONS.includes(action), `missing ${action}`)
+  }
   assert.equal(schema.properties.planned_paths.maxItems, 100)
   assert.equal(schema.properties.repo_roots.maxItems, 20)
   assert.match(workstream.description, /sole authorization and execution owner/)

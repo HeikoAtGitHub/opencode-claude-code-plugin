@@ -1,5 +1,5 @@
 {
-  "version": "1.3.0",
+  "version": "1.4.0",
   "identifier_pattern": "^(?!\\.+$)[a-z0-9._-]+$",
   "roles": {
     "manager": ["99_generic_workstream_manager"],
@@ -7,7 +7,8 @@
     "config": ["01_opencode_config_alt", "01_opencode_sync_config", "02_nvim_config", "03_dotfiles_config", "99_generic_config", "99_generic_plannotator_config"],
     "cleanup": ["99_generic_WS_CLEANUP_GIT_MANAGER"],
     "repair": ["99_generic_WS_HISTORY_REPAIR_GIT_MANAGER"],
-    "group_git": ["99_generic_WS_GROUP_GIT_MANAGER"]
+    "group_git": ["99_generic_WS_GROUP_GIT_MANAGER"],
+    "conflict": ["99_generic_WS_CONFLICT_RESOLUTION"]
   },
   "actions": {
     "list": {"family": "list", "phase": "read", "args": [], "mutates": false, "roles": ["manager"], "argv": ["list"]},
@@ -23,6 +24,10 @@
     "sync_apply": {"family": "sync", "phase": "apply", "args": ["slug"], "mutates": true, "token": "preview", "roles": ["coding", "config", "cleanup"], "argv": ["sync", "{slug}", "--apply", "--preview-token", "{preview_token}"]},
     "sync_push": {"family": "sync", "phase": "push", "args": ["slug"], "mutates": true, "token": "push", "roles": ["coding", "config", "cleanup"], "argv": ["sync", "{slug}", "--push", "--push-token", "{push_token}"]},
     "collision_preview": {"family": "collision", "phase": "read", "args": ["slug", "planned_paths", "repo_root?"], "mutates": false, "roles": ["coding", "config"], "argv": ["collision-preview", "{slug}", "{planned_paths}"]},
+    "conflict_preview": {"family": "conflict", "phase": "preview", "args": ["slug"], "mutates": false, "roles": ["conflict"], "argv": ["conflict-preview", "{slug}"]},
+    "conflict_prepare": {"family": "conflict", "phase": "apply", "args": ["slug"], "mutates": true, "token": "preview", "roles": ["conflict"], "argv": ["conflict-prepare", "{slug}", "--preview-token", "{preview_token}"]},
+    "conflict_finalize": {"family": "conflict", "phase": "apply", "args": ["slug"], "mutates": true, "token": "push", "roles": ["conflict"], "argv": ["conflict-finalize", "{slug}", "--receipt-token", "{push_token}"]},
+    "conflict_abort": {"family": "conflict", "phase": "apply", "args": ["slug"], "mutates": true, "token": "push", "roles": ["conflict"], "argv": ["conflict-abort", "{slug}", "--receipt-token", "{push_token}"]},
     "sync_batch_inventory": {"family": "sync_batch_inventory", "phase": "read", "args": [], "mutates": false, "roles": ["manager", "coding", "config"], "argv": ["sync-batch", "--inventory"]},
     "sync_batch_preview": {"family": "sync_batch", "phase": "preview", "args": ["repo_root", "repo_roots", "scope", "on_conflict"], "mutates": false, "roles": ["manager", "coding", "config"], "argv": ["sync-batch", "--scope", "{scope}", "--on-conflict", "{on_conflict}", "{repo_roots}"]},
     "sync_batch_apply": {"family": "sync_batch", "phase": "apply", "args": ["repo_root", "repo_roots", "scope", "on_conflict"], "mutates": true, "token": "preview", "roles": ["manager", "coding", "config"], "argv": ["sync-batch", "--scope", "{scope}", "--on-conflict", "{on_conflict}", "{repo_roots}", "--apply", "--preview-token", "{preview_token}"]},
