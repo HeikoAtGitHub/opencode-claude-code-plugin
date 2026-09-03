@@ -84,6 +84,9 @@ const opusCost = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 }
 // ($10/M in, $50/M out). Cache read/write follow Anthropic's standard 0.1x / 1.25x
 // input ratios (not separately published).
 const fableCost = { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 }
+// Fable 5.1 and Mythos 5.1 keep the same input/output and cache-write rates,
+// but Anthropic cut cache reads to $0.25/M (one quarter of the 5.0 price).
+const fable51Cost = { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 }
 // Fast mode bills the same per-token rates as the Mythos-class tier: $10/M in,
 // $50/M out, cache read 1, cache write 12.5. Not an inference; this is the
 // exact table the CLI itself applies for `speed: "fast"` on Opus 4.8 / Opus 5
@@ -277,10 +280,21 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     multiplier: 10,
     releaseDate: "2026-06-09",
   }),
-  // Mythos 5 shares Fable 5's capabilities and pricing without the safety
-  // classifiers; limited availability via Project Glasswing. `claude --model
-  // claude-mythos-5` simply errors for accounts without access, so it's safe to
-  // register unconditionally.
+  "claude-fable-5-1": defineModel({
+    id: "claude-fable-5-1",
+    name: "Claude Fable 5.1",
+    family: "fable",
+    reasoning: true,
+    context: 1_000_000,
+    output: 128_000,
+    cost: fable51Cost,
+    multiplier: 10,
+    releaseDate: "2026-09-01",
+  }),
+  // Mythos 5 and 5.1 share the corresponding Fable models' capabilities and
+  // pricing without the safety classifiers; limited availability via Project
+  // Glasswing. `claude --model` simply errors for accounts without access, so
+  // they are safe to register unconditionally.
   "claude-mythos-5": defineModel({
     id: "claude-mythos-5",
     name: "Claude Mythos 5",
@@ -291,6 +305,17 @@ export const defaultModels: Record<string, OpenCodeModel> = {
     cost: fableCost,
     multiplier: 10,
     releaseDate: "2026-06-09",
+  }),
+  "claude-mythos-5-1": defineModel({
+    id: "claude-mythos-5-1",
+    name: "Claude Mythos 5.1",
+    family: "mythos",
+    reasoning: true,
+    context: 1_000_000,
+    output: 128_000,
+    cost: fable51Cost,
+    multiplier: 10,
+    releaseDate: "2026-09-01",
   }),
 }
 
