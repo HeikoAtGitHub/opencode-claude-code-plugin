@@ -555,3 +555,51 @@ test("runtime overlay: missing entry leaves disk value untouched", async () => {
     assert.equal(written.mcpServers.gh.command, "gh-mcp")
   })
 })
+
+test("runtime overlay: connected runtime-only server is proxy-discoverable", async () => {
+  await withIsolatedEnv(async (xdgRoot) => {
+    const repo = path.join(xdgRoot, "proj")
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+
+    const result = bridgeOpencodeMcp(repo, { "nvim-tools": "connected" })
+
+    assert.ok(result)
+    assert.equal(result.path, "")
+    assert.deepEqual(result.serverNames, [])
+    assert.deepEqual(result.allEnabledServerNames, ["nvim-tools"])
+  })
+})
+
+test("runtime overlay: inactive runtime-only servers stay hidden", async () => {
+  await withIsolatedEnv(async (xdgRoot) => {
+    const repo = path.join(xdgRoot, "proj")
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+
+    assert.equal(
+      bridgeOpencodeMcp(repo, {
+        "nvim-disabled": "disabled",
+        "nvim-failed": "failed",
+      }),
+      null,
+    )
+  })
+})
+
+test("runtime overlay: runtime-only connection changes discovery hash", async () => {
+  await withIsolatedEnv(async (xdgRoot) => {
+    const globalDir = path.join(xdgRoot, "opencode")
+    writeJson(path.join(globalDir, "opencode.json"), {
+      mcp: { gh: { type: "local", command: ["gh-mcp"], enabled: true } },
+    })
+    const repo = path.join(xdgRoot, "proj")
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+
+    const disconnected = bridgeOpencodeMcp(repo, { "nvim-tools": "disabled" })
+    const connected = bridgeOpencodeMcp(repo, { "nvim-tools": "connected" })
+
+    assert.ok(disconnected && connected)
+    assert.notEqual(disconnected.hash, connected.hash)
+    assert.deepEqual(disconnected.allEnabledServerNames, ["gh"])
+    assert.deepEqual(connected.allEnabledServerNames, ["gh", "nvim-tools"])
+  })
+})

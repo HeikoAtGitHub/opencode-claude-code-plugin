@@ -493,6 +493,8 @@ Claude Code ships a built-in `WebSearch` tool. The `webSearch` option controls w
 
 If `bridgeOpencodeMcp` is true (the default), the plugin reads your opencode config's `mcp` block, translates it into Claude's MCP schema, writes it to a temp file, and passes that to `claude --mcp-config`. So whatever MCP servers you've already configured in opencode become available to Claude with no extra setup.
 
+Connected MCP servers that exist only in opencode's runtime, such as dynamically registered editor bridges, use the existing OpenCode tool proxy instead. Their live tool schemas are exposed to Claude, while opencode keeps ownership of execution and connection credentials; runtime URLs, headers, and tokens are not copied into Claude's MCP config. If the live tool catalog is unavailable, runtime-only servers stay unavailable rather than falling back to a direct connection.
+
 ### Discovery order (highest to lowest priority)
 
 1. `OPENCODE_CONFIG` env var (file path)

@@ -408,6 +408,8 @@ export interface MergedMcp {
   servers: Record<string, OpencodeServer>
   /** Server names whose final spec is enabled (or implicitly enabled). */
   enabledServerNames: string[]
+  /** Connected runtime servers that have no on-disk spec and must stay proxy-only. */
+  runtimeOnlyServerNames: string[]
   /** Stable hash of the merged (pre-translation) MCP block. */
   hash: string
 }
@@ -443,6 +445,7 @@ export function bridgeOpencodeMcp(
   const {
     servers: merged,
     enabledServerNames: allEnabledServerNames,
+    runtimeOnlyServerNames,
     hash,
   } = mergeOpencodeMcp(cwd, runtimeStatus)
 
@@ -463,6 +466,7 @@ export function bridgeOpencodeMcp(
     servers,
     bridgedServerNames,
     allEnabledServerNames,
+    runtimeOnlyServerNames,
     hash,
     excludeServers,
   })
@@ -541,6 +545,16 @@ export function mergeOpencodeMcp(
     }
   }
 
+  // Runtime registrations (for example editor bridges) can exist entirely
+  // in-memory. They have no URL/headers available here and therefore remain
+  // proxy-only: the live tool catalog supplies schemas and opencode executes
+  // calls without exposing connection credentials to Claude.
+  const runtimeOnlyServerNames = runtimeStatus
+    ? Object.keys(runtimeStatus)
+        .filter((name) => !(name in merged) && runtimeStatus[name] === "connected")
+        .sort()
+    : []
+
   // Compute the set of enabled server names BEFORE exclusion so callers can
   // tell whether a tool ID like `slack_conversations_add_message` came from
   // an opencode MCP server (vs a built-in tool that happens to contain `_`).
@@ -551,17 +565,25 @@ export function mergeOpencodeMcp(
     if (enabled === false) continue
     enabledServerNames.push(name)
   }
+  enabledServerNames.push(...runtimeOnlyServerNames)
 
   // Hash the pre-exclusion merged block so the hot-reload detector picks up
-  // upstream config changes even when every server is excluded.
-  const mergedBody = JSON.stringify({ mcpServers: merged }, null, 2)
+  // upstream config and runtime-only discovery changes even when every server
+  // is excluded from direct bridging.
+  const mergedBody = JSON.stringify(
+    runtimeOnlyServerNames.length > 0
+      ? { mcpServers: merged, runtimeOnlyServerNames }
+      : { mcpServers: merged },
+    null,
+    2,
+  )
   const hash = crypto
     .createHash("sha256")
     .update(mergedBody)
     .digest("hex")
     .slice(0, 12)
 
-  return { servers: merged, enabledServerNames, hash }
+  return { servers: merged, enabledServerNames, runtimeOnlyServerNames, hash }
 }
 
 /** Write the translated config (if any) and shape `bridgeOpencodeMcp`'s result. */
@@ -569,11 +591,18 @@ function finishBridge(input: {
   servers: Record<string, unknown>
   bridgedServerNames: string[]
   allEnabledServerNames: string[]
+  runtimeOnlyServerNames: string[]
   hash: string
   excludeServers?: ReadonlySet<string>
 }): BridgedMcp | null {
-  const { servers, bridgedServerNames, allEnabledServerNames, hash, excludeServers } =
-    input
+  const {
+    servers,
+    bridgedServerNames,
+    allEnabledServerNames,
+    runtimeOnlyServerNames,
+    hash,
+    excludeServers,
+  } = input
 
   if (Object.keys(servers).length === 0) {
     const allEnabledServersExcluded =
@@ -581,7 +610,7 @@ function finishBridge(input: {
       allEnabledServerNames.length > 0 &&
       allEnabledServerNames.every((name) => excludeServers.has(name))
 
-    if (!allEnabledServersExcluded) return null
+    if (!allEnabledServersExcluded && runtimeOnlyServerNames.length === 0) return null
 
     return {
       path: "",
