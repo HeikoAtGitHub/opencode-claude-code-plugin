@@ -24,7 +24,11 @@ import {
   createExitPlanModeQuestionCall,
   isPlanModeQuestionActive,
 } from "./plan-mode-question.js"
-import { bridgeOpencodeMcp, type RuntimeMcpStatus } from "./mcp-bridge.js"
+import {
+  bridgeOpencodeMcp,
+  runtimeMcpProxyDefs,
+  type RuntimeMcpStatus,
+} from "./mcp-bridge.js"
 import {
   getRuntimeMcpStatus,
   fetchOpencodeToolList,
@@ -945,6 +949,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     paths: string[]
     bridgedHash: string | null
     allEnabledServerNames: string[]
+    runtimeOnlyServerNames: string[]
   } {
     const paths = Array.isArray(this.config.mcpConfig)
       ? this.config.mcpConfig.slice()
@@ -953,16 +958,18 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
         : []
     let bridgedHash: string | null = null
     let allEnabledServerNames: string[] = []
+    let runtimeOnlyServerNames: string[] = []
     if (this.config.bridgeOpencodeMcp !== false) {
       const bridged = bridgeOpencodeMcp(cwd, runtimeStatus, excludeServers)
       if (bridged) {
         if (bridged.path) paths.push(bridged.path)
         bridgedHash = bridged.hash
         allEnabledServerNames = bridged.allEnabledServerNames
+        runtimeOnlyServerNames = bridged.runtimeOnlyServerNames
       }
     }
     if (proxyConfigPath) paths.push(proxyConfigPath)
-    return { paths, bridgedHash, allEnabledServerNames }
+    return { paths, bridgedHash, allEnabledServerNames, runtimeOnlyServerNames }
   }
 
   /** Resolve ProxyToolDef[] for the configured proxyTools names. */
@@ -1008,39 +1015,35 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
    */
   private async resolvedProxyMcpTools(
     allEnabledServerNames: string[],
+    runtimeOnlyServerNames: string[],
+    requestTools: unknown,
     items: OpencodeToolListItem[] | undefined,
   ): Promise<ProxyToolDef[] | null> {
     if (this.config.proxyOpencodeMcpTools === false) return null
     if (this.config.bridgeOpencodeMcp === false) return null
-    if (allEnabledServerNames.length === 0) return null
+    if (runtimeOnlyServerNames.length === 0) return null
 
-    if (!items || items.length === 0) return null
-
-    // opencode names MCP tools `<server>_<originalToolName>`. Match the
-    // longest server name prefix first so e.g. `slack_intl_*` resolves to
-    // server `slack_intl` not `slack`.
-    const serversByLengthDesc = [...allEnabledServerNames].sort(
-      (a, b) => b.length - a.length,
+    // Runtime-only servers (registered via `POST /mcp`) have no URL/headers
+    // the plugin may forward, so they are reachable only through the proxy.
+    // Disk-configured servers stay directly bridged. Schemas come from the
+    // request tool set because opencode's live catalog omits MCP tools.
+    const resolution = runtimeMcpProxyDefs(
+      requestTools,
+      runtimeOnlyServerNames,
+      allEnabledServerNames,
+      items,
     )
-    const out: ProxyToolDef[] = []
-    const seen = new Set<string>()
-    for (const item of items) {
-      const matchedServer = serversByLengthDesc.find(
-        (name) => item.id === name || item.id.startsWith(`${name}_`),
-      )
-      if (!matchedServer) continue
-      if (seen.has(item.id)) continue
-      seen.add(item.id)
-      out.push({
-        name: item.id,
-        description: item.description ?? "",
-        inputSchema:
-          item.parameters && typeof item.parameters === "object"
-            ? item.parameters
-            : { type: "object", properties: {} },
+    if (resolution.notLoadedServerNames.length > 0) {
+      log.info("runtime MCP server not loaded; excluded", {
+        servers: resolution.notLoadedServerNames,
       })
     }
-    return out.length > 0 ? out : null
+    if (resolution.defs.length === 0) return null
+    log.info("proxied opencode runtime MCP tools", {
+      servers: resolution.loadedServerNames,
+      count: resolution.defs.length,
+    })
+    return resolution.defs
   }
 
   /**
@@ -2543,11 +2546,16 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             // bridging.
             const proxyMcpTools = await self.resolvedProxyMcpTools(
               discovery.allEnabledServerNames,
+              discovery.runtimeOnlyServerNames,
+              options.tools,
               liveToolCatalog,
             )
-            const excludeServers: ReadonlySet<string> | undefined = proxyMcpTools
-              ? new Set(discovery.allEnabledServerNames)
-              : undefined
+            // Runtime-only servers are never directly bridged (they have no
+            // disk spec); excluding them keeps the bridge result explicit.
+            const excludeServers: ReadonlySet<string> | undefined =
+              discovery.runtimeOnlyServerNames.length > 0
+                ? new Set(discovery.runtimeOnlyServerNames)
+                : undefined
 
             // Overlay opencode's live tool info onto the static proxy defs.
             // Both the `task` description (with the "Available agent types"

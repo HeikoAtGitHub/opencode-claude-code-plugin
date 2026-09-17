@@ -14,7 +14,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import * as os from "node:os"
 
-import { bridgeOpencodeMcp, __test } from "./src/mcp-bridge.js"
+import { bridgeOpencodeMcp, runtimeMcpProxyDefs, __test } from "./src/mcp-bridge.js"
 import { defaultModels, toConfigModel } from "./src/models.js"
 
 const {
@@ -602,4 +602,123 @@ test("runtime overlay: runtime-only connection changes discovery hash", async ()
     assert.deepEqual(disconnected.allEnabledServerNames, ["gh"])
     assert.deepEqual(connected.allEnabledServerNames, ["gh", "nvim-tools"])
   })
+})
+
+test("runtime overlay: bridge result exposes runtime-only server names", async () => {
+  await withIsolatedEnv(async (xdgRoot) => {
+    const globalDir = path.join(xdgRoot, "opencode")
+    writeJson(path.join(globalDir, "opencode.json"), {
+      mcp: { gh: { type: "local", command: ["gh-mcp"], enabled: true } },
+    })
+    const repo = path.join(xdgRoot, "proj")
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+
+    const bridged = bridgeOpencodeMcp(repo, { "nvim-tools": "connected" })
+    assert.ok(bridged)
+    assert.deepEqual(bridged.runtimeOnlyServerNames, ["nvim-tools"])
+    assert.deepEqual(bridged.serverNames, ["gh"])
+  })
+})
+
+const dapStatusSchema = {
+  type: "object",
+  properties: {},
+  additionalProperties: false,
+}
+
+test("runtimeMcpProxyDefs: loaded runtime server tools come from request tools", () => {
+  const result = runtimeMcpProxyDefs(
+    [
+      { type: "function", name: "bash", description: "b", inputSchema: {} },
+      {
+        type: "function",
+        name: "nvim-tools_dap_status",
+        description: "DAP status",
+        inputSchema: dapStatusSchema,
+      },
+      { type: "function", name: "gh_list_issues", inputSchema: {} },
+    ],
+    ["nvim-tools"],
+    ["gh", "nvim-tools"],
+    [],
+  )
+  assert.deepEqual(result.defs, [
+    {
+      name: "nvim-tools_dap_status",
+      description: "DAP status",
+      inputSchema: dapStatusSchema,
+    },
+  ])
+  assert.deepEqual(result.loadedServerNames, ["nvim-tools"])
+  assert.deepEqual(result.notLoadedServerNames, [])
+})
+
+test("runtimeMcpProxyDefs: connected server without loaded tools is excluded", () => {
+  const result = runtimeMcpProxyDefs(
+    [{ type: "function", name: "bash", inputSchema: {} }],
+    ["nvim-tools"],
+    ["nvim-tools"],
+    [{ id: "read", description: "", parameters: {} }],
+  )
+  assert.deepEqual(result.defs, [])
+  assert.deepEqual(result.loadedServerNames, [])
+  assert.deepEqual(result.notLoadedServerNames, ["nvim-tools"])
+})
+
+test("runtimeMcpProxyDefs: missing request tools yield no definitions", () => {
+  const result = runtimeMcpProxyDefs(undefined, ["nvim-tools"], ["nvim-tools"])
+  assert.deepEqual(result.defs, [])
+  assert.deepEqual(result.notLoadedServerNames, ["nvim-tools"])
+})
+
+test("runtimeMcpProxyDefs: longest disk server prefix wins over runtime server", () => {
+  const result = runtimeMcpProxyDefs(
+    [
+      { type: "function", name: "nvim-tools_extra_run", inputSchema: {} },
+      { type: "function", name: "nvim-tools_dap_run", inputSchema: {} },
+    ],
+    ["nvim-tools"],
+    ["nvim-tools_extra", "nvim-tools"],
+  )
+  assert.deepEqual(
+    result.defs.map((d) => d.name),
+    ["nvim-tools_dap_run"],
+  )
+})
+
+test("runtimeMcpProxyDefs: live catalog is a fallback source without duplicates", () => {
+  const result = runtimeMcpProxyDefs(
+    [{ type: "function", name: "nvim-tools_dap_status", inputSchema: dapStatusSchema }],
+    ["nvim-tools"],
+    ["nvim-tools"],
+    [
+      { id: "nvim-tools_dap_status", description: "dup", parameters: {} },
+      { id: "nvim-tools_dap_run", description: "run", parameters: dapStatusSchema },
+    ],
+  )
+  assert.deepEqual(
+    result.defs.map((d) => d.name),
+    ["nvim-tools_dap_status", "nvim-tools_dap_run"],
+  )
+  assert.equal(result.defs[0].description, "")
+})
+
+test("runtimeMcpProxyDefs: output never carries connection data", () => {
+  const result = runtimeMcpProxyDefs(
+    [
+      {
+        type: "function",
+        name: "nvim-tools_dap_status",
+        inputSchema: dapStatusSchema,
+        url: "http://127.0.0.1:1",
+        headers: { Authorization: "Bearer secret-token" },
+      },
+    ],
+    ["nvim-tools"],
+    ["nvim-tools"],
+  )
+  const serialized = JSON.stringify(result)
+  assert.equal(serialized.includes("Bearer"), false)
+  assert.equal(serialized.includes("127.0.0.1"), false)
+  assert.deepEqual(Object.keys(result.defs[0]).sort(), ["description", "inputSchema", "name"])
 })

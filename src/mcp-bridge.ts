@@ -400,6 +400,99 @@ export interface BridgedMcp {
    * `<server>_<tool>` IDs in opencode's tool catalog are MCP-origin.
    */
   allEnabledServerNames: string[]
+  /**
+   * Connected opencode MCP servers that exist only in opencode's runtime
+   * (registered via `POST /mcp`) and therefore can only be proxied.
+   */
+  runtimeOnlyServerNames: string[]
+}
+
+/** Proxy tool definition derived from opencode's request tool set. */
+export interface RuntimeMcpProxyDef {
+  name: string
+  description: string
+  inputSchema: Record<string, unknown>
+}
+
+export interface RuntimeMcpProxyResolution {
+  defs: RuntimeMcpProxyDef[]
+  /** Runtime-only servers with at least one tool in the request tool set. */
+  loadedServerNames: string[]
+  /** Runtime-only servers reported connected but without loaded tools. */
+  notLoadedServerNames: string[]
+}
+
+/**
+ * Build proxy definitions for runtime-only opencode MCP servers.
+ *
+ * Load-before-forward rule: a server counts as loaded only when opencode
+ * put its tools (with JSON Schema) into the current request tool set
+ * (`doStream(options.tools)`), which opencode builds from `MCP.tools()` —
+ * connected clients with cached definitions. opencode's `/experimental/tool`
+ * catalog does not contain MCP tools, so it is only a fallback source.
+ * Only name, description and schema are returned; never URLs or headers.
+ */
+export function runtimeMcpProxyDefs(
+  requestTools: unknown,
+  runtimeOnlyServerNames: readonly string[],
+  allServerNames: readonly string[],
+  catalog?: ReadonlyArray<{
+    id: string
+    description?: string
+    parameters?: Record<string, unknown>
+  }>,
+): RuntimeMcpProxyResolution {
+  const candidates: RuntimeMcpProxyDef[] = []
+  if (Array.isArray(requestTools)) {
+    for (const tool of requestTools) {
+      if (!tool || typeof tool !== "object") continue
+      const t = tool as Record<string, unknown>
+      if (t.type !== undefined && t.type !== "function") continue
+      if (typeof t.name !== "string") continue
+      candidates.push({
+        name: t.name,
+        description: typeof t.description === "string" ? t.description : "",
+        inputSchema:
+          t.inputSchema && typeof t.inputSchema === "object"
+            ? (t.inputSchema as Record<string, unknown>)
+            : { type: "object", properties: {} },
+      })
+    }
+  }
+  for (const item of catalog ?? []) {
+    candidates.push({
+      name: item.id,
+      description: item.description ?? "",
+      inputSchema:
+        item.parameters && typeof item.parameters === "object"
+          ? item.parameters
+          : { type: "object", properties: {} },
+    })
+  }
+
+  // opencode names MCP tools `<server>_<tool>`; longest server prefix wins
+  // across all known servers, then only runtime-only matches are kept.
+  const runtimeOnly = new Set(runtimeOnlyServerNames)
+  const serversByLengthDesc = [
+    ...new Set([...allServerNames, ...runtimeOnlyServerNames]),
+  ].sort((a, b) => b.length - a.length)
+  const defs: RuntimeMcpProxyDef[] = []
+  const seen = new Set<string>()
+  const loaded = new Set<string>()
+  for (const candidate of candidates) {
+    const server = serversByLengthDesc.find((name) =>
+      candidate.name.startsWith(`${name}_`),
+    )
+    if (!server || !runtimeOnly.has(server) || seen.has(candidate.name)) continue
+    seen.add(candidate.name)
+    loaded.add(server)
+    defs.push(candidate)
+  }
+  return {
+    defs,
+    loadedServerNames: runtimeOnlyServerNames.filter((n) => loaded.has(n)),
+    notLoadedServerNames: runtimeOnlyServerNames.filter((n) => !loaded.has(n)),
+  }
 }
 
 /** Result of merging opencode's MCP config layers + applying runtime overlay. */
@@ -617,6 +710,7 @@ function finishBridge(input: {
       hash,
       serverNames: [],
       allEnabledServerNames,
+      runtimeOnlyServerNames,
     }
   }
 
@@ -647,6 +741,7 @@ function finishBridge(input: {
     hash,
     serverNames: bridgedServerNames,
     allEnabledServerNames,
+    runtimeOnlyServerNames,
   }
 }
 
