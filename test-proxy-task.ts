@@ -573,8 +573,31 @@ function waitForBrokerCalls(sessionKey: string, count: number) {
   })
 }
 
+/**
+ * The fake CLI is a real Node process, so its cold start competes with
+ * whatever else the machine is doing. The old value was 500 ms, described
+ * in a comment as "ample", and it was not: at load average 5 with dozens of
+ * other node processes, every recovery test here failed, identically on
+ * master and on already-released tags, while the same commits were green on
+ * an idle machine. A test that reports the machine's mood rather than the
+ * code's behaviour is worse than no test, because it trains you to wave
+ * failures through.
+ *
+ * Everything that waits is derived from this one value so the three cannot
+ * drift apart again: the longest recovery path deliberately lets TWO
+ * consecutive watchdog deadlines elapse, so any wait shorter than twice the
+ * watchdog fails by construction rather than by timing. That is exactly how
+ * the first attempt at this fix broke: the watchdog was raised on its own
+ * and a hard-coded 5 s wait then expired mid-test.
+ */
+const START_WATCHDOG_MS = 2_500
+/** Two watchdog deadlines, plus room for the fixture's own work. */
+const RECOVERY_WAIT_MS = START_WATCHDOG_MS * 2 + 5_000
+/** The per-test cap has to sit above the wait it contains. */
+const RECOVERY_TEST_TIMEOUT_MS = RECOVERY_WAIT_MS + 10_000
+
 async function eventually(description: string, ready: () => boolean) {
-  const deadline = performance.now() + 5_000
+  const deadline = performance.now() + RECOVERY_WAIT_MS
   while (!ready()) {
     assert.ok(performance.now() < deadline, `Timed out waiting for ${description}`)
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -594,8 +617,12 @@ async function collectRecoveryStream(
       })(),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          reject(new Error("Recovery stream did not finish within 5s"))
-        }, 5_000)
+          reject(
+            new Error(
+              `Recovery stream did not finish within ${RECOVERY_WAIT_MS}ms`,
+            ),
+          )
+        }, RECOVERY_WAIT_MS)
       }),
     ])
   } finally {
@@ -609,8 +636,8 @@ async function exerciseTaskRecovery(mode: "late" | "late-queued" | "swallow" | "
   const modelId = `claude-test-task-${mode}`
   const sk = sessionKey(fake.cwd, `${modelId}::tools::default::context=["claude-code",null]`)
   const previousWatchdog = process.env.CLAUDE_CODE_START_WATCHDOG_MS
-  // Leave ample room for the Node fixture to start, even under the full suite.
-  process.env.CLAUDE_CODE_START_WATCHDOG_MS = "500"
+  // Derived, never a literal: see START_WATCHDOG_MS.
+  process.env.CLAUDE_CODE_START_WATCHDOG_MS = String(START_WATCHDOG_MS)
   const events = () => existsSync(fake.eventsPath)
     ? readFileSync(fake.eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))
     : []
@@ -822,23 +849,23 @@ async function exerciseTaskRecovery(mode: "late" | "late-queued" | "swallow" | "
 }
 
 test("late Task result replays unattended narration without finishing before the fresh answer", {
-  timeout: 20_000,
+  timeout: RECOVERY_TEST_TIMEOUT_MS,
 }, () => exerciseTaskRecovery("late"))
 
 test("Task queued while unattended is emitted exactly once and resolved on the following turn", {
-  timeout: 20_000,
+  timeout: RECOVERY_TEST_TIMEOUT_MS,
 }, () => exerciseTaskRecovery("late-queued"))
 
 test("silently swallowed HTTP Task result recovers through a resumed completion envelope", {
-  timeout: 20_000,
+  timeout: RECOVERY_TEST_TIMEOUT_MS,
 }, () => exerciseTaskRecovery("swallow"))
 
 test("tool-result bookkeeping does not disarm the recovery watchdog", {
-  timeout: 20_000,
+  timeout: RECOVERY_TEST_TIMEOUT_MS,
 }, () => exerciseTaskRecovery("bookkeeping"))
 
 test("bookkeeping-only output after respawn still reaches the second watchdog deadline", {
-  timeout: 20_000,
+  timeout: RECOVERY_TEST_TIMEOUT_MS,
 }, () => exerciseTaskRecovery("bookkeeping-respawn"))
 
 for (const ordering of ["buffered-terminal", "delayed-terminal", "close-after-resolution"] as const) {
