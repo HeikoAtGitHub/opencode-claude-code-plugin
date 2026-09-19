@@ -88,6 +88,14 @@ test("the report names every field a bug report needs, and nothing secret", () =
   assert.equal(/authToken|bearer|sk-ant|Authorization/i.test(text), false)
 })
 
+test("a pending call with no deadline reads as none, not as 0.0s", () => {
+  const text = formatDoctorReport({
+    ...report,
+    pendingCalls: [{ ...report.pendingCalls[0]!, toolCallId: "call_2", deadlineMs: 0 }],
+  })
+  assert.ok(text.includes("| task | `call_2` | 30.0s | none |"), text)
+})
+
 test("an empty runtime reads as empty rather than as broken", () => {
   const text = formatDoctorReport({
     ...report,

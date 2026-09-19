@@ -24,6 +24,7 @@ import {
   DEFAULT_PROXY_TOOLS,
   disallowedToolFlags,
   isExpectedCleanupError,
+  MAX_PROXY_TIMEOUT_MS,
   resolveProxyClientCeilingMs,
   SERVER_CLOSED_MESSAGE,
   type ProxyMcpServer,
@@ -43,6 +44,7 @@ import {
   deleteActiveProcessAndWait,
   deleteClaudeSessionId,
   getActiveProcess,
+  isTurnInFlight,
   setActiveProcess,
   setClaudeSessionId,
   bufferUnattendedLine,
@@ -361,7 +363,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         return
       }
       if (mode === "late-queued") finishQueuedTask()
-      else answer(resumed ? "Fresh answer after watchdog recovery." : "Fresh answer after late completion.")
+      // Hold the answer back a little so the test can observe the process
+      // between the continuation envelope and its terminal result.
+      else setTimeout(() => answer(resumed ? "Fresh answer after watchdog recovery." : "Fresh answer after late completion."), 250)
       return
     }
     handled = true
@@ -683,8 +687,30 @@ async function exerciseTaskRecovery(mode: "late" | "late-queued" | "swallow" | "
     }
 
     addResult(taskCall, "subagent complete")
+    // The continuation envelope (written directly, or re-sent to the
+    // watchdog's replacement) asks the CLI for work like any fresh turn, so
+    // abort, LRU eviction and the idle timer must see the process as busy
+    // until its result lands. The fixture holds that result back.
+    if (mode === "late") {
+      assert.equal(isTurnInFlight(originalProcess), false, "the CLI ended its own turn while unattended")
+    }
     const secondResponse = await model.doStream(options)
+    if (mode === "late") {
+      await eventually("recovered continuation marked in flight", () => isTurnInFlight(originalProcess))
+    }
+    if (mode === "swallow") {
+      // The parked CLI never answered, so the first turn is still in flight;
+      // what matters is that the watchdog's replacement inherits that.
+      assert.equal(isTurnInFlight(originalProcess), true)
+      await eventually("respawned replacement marked in flight", () => {
+        const current = getActiveProcess(sk)
+        return current !== undefined && current !== originalProcess && isTurnInFlight(current)
+      })
+    }
     const secondParts = await collectRecoveryStream(secondResponse.stream)
+    if (mode === "late" || mode === "swallow") {
+      assert.equal(isTurnInFlight(getActiveProcess(sk)!), false, "the fresh result settles the turn")
+    }
     if (mode === "bookkeeping-respawn") {
       const errors = secondParts.filter((part) => part.type === "error")
       assert.equal(errors.length, 1)
@@ -1015,13 +1041,15 @@ test("proxy MCP initializes, lists Task, and resolves it through the broker", as
   try {
     const generatedConfig = JSON.parse(readFileSync(server.configPath(), "utf8"))
     // The client-side ceiling written into --mcp-config tracks the largest
-    // effective server-side deadline (task's 60-min default here), so
-    // Claude's remote-HTTP MCP client never aborts before the broker does.
+    // effective server-side deadline, so Claude's remote-HTTP MCP client
+    // never aborts before the broker does. Task has no deadline, and the CLI
+    // rejects `timeout: 0`, so the ceiling is the largest supported value.
     assert.equal(
       generatedConfig.mcpServers.opencode_proxy.timeout,
       resolveProxyClientCeilingMs(undefined),
     )
-    assert.equal(resolveProxyClientCeilingMs(undefined), 60 * 60 * 1000)
+    assert.equal(resolveProxyClientCeilingMs(undefined), MAX_PROXY_TIMEOUT_MS)
+    assert.ok(generatedConfig.mcpServers.opencode_proxy.timeout > 0)
 
     const initialized = await postRpc(server, {
       jsonrpc: "2.0",

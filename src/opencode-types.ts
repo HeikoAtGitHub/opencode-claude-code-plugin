@@ -103,7 +103,7 @@ export type OpenCodeConfig = {
  * Bus events surface to plugins. Shape mirrors what opencode core publishes
  * via `GlobalBus.emit("event", { directory, payload: { type, properties } })`
  * but kept loose since opencode adds events over time and this plugin only
- * reacts to a small subset (currently just `global.disposed`).
+ * reacts to a small subset (currently just `session.deleted`).
  */
 export type OpenCodeEvent = {
   type?: string
@@ -148,8 +148,9 @@ export type OpenCodeHooks = {
     id: string
     models?: (provider: OpenCodeProvider) => Promise<Record<string, OpenCodeModel>>
   }
-  // Called for every bus event opencode publishes. Optional; this plugin
-  // doesn't currently subscribe — MCP config drift is handled at turn start.
+  // Called for every bus event opencode publishes. This plugin only acts on
+  // `session.deleted` (releasing that session's `claude` children); MCP
+  // config drift is handled at turn start.
   event?: (input: { event: OpenCodeEvent }) => Promise<void>
   "chat.params"?: (
     input: OpenCodeChatParamsInput,

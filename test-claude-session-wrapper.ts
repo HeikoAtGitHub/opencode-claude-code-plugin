@@ -3,6 +3,7 @@ import * as path from "node:path"
 import { test } from "node:test"
 import {
   decodeUserEnvelope,
+  interactiveExtraArgs,
   spawnInteractiveProcess,
 } from "./src/claude-session-wrapper.js"
 import { ClaudeSession, encodeCwd } from "./src/claude-session-bun.js"
@@ -132,6 +133,37 @@ test("spawnInteractiveProcess threads systemPromptFile into ActiveProcess", () =
   })
   assert.equal(ap.systemPromptFile, "/tmp/nonexistent-system-prompt.txt")
   ;(ap.proc as any).kill()
+})
+
+// The skill bridge reaches the TUI through the same `--plugin-dir` flag as
+// the headless spawn. `interactiveExtraArgs` is exactly what ClaudeSession
+// appends to its argv, so this is the spawn argument list without a PTY.
+test("interactiveExtraArgs passes one --plugin-dir per staged directory, keeping the single --settings payload", () => {
+  const args = interactiveExtraArgs({
+    cwd: process.cwd(),
+    mcpConfigPaths: ["/tmp/mcp.json"],
+    pluginDirs: ["/tmp/skills-a", "/tmp/skills-b"],
+    permissionsAllow: ["Bash"],
+    fastMode: true,
+  })
+  assert.deepEqual(args.slice(0, 3), ["--mcp-config", "/tmp/mcp.json", "--strict-mcp-config"])
+  const dirs = args.reduce<string[]>((acc, arg, i) => {
+    if (arg === "--plugin-dir") acc.push(args[i + 1]!)
+    return acc
+  }, [])
+  assert.deepEqual(dirs, ["/tmp/skills-a", "/tmp/skills-b"])
+  assert.equal(args.filter((arg) => arg === "--settings").length, 1, "the CLI takes --settings once")
+  assert.deepEqual(JSON.parse(args[args.indexOf("--settings") + 1]!), {
+    permissions: { allow: ["Bash"] },
+    fastMode: true,
+  })
+})
+
+test("interactiveExtraArgs omits --plugin-dir when nothing was staged", () => {
+  for (const pluginDirs of [undefined, [] as string[]]) {
+    const args = interactiveExtraArgs({ cwd: process.cwd(), pluginDirs })
+    assert.equal(args.includes("--plugin-dir"), false)
+  }
 })
 
 test("error handler registration is add/remove symmetric", () => {

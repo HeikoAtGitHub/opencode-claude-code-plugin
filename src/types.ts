@@ -193,13 +193,17 @@ export interface ClaudeCodeProviderSettings {
    * receives a timeout error.
    *
    * Defaults (used when a tool is absent here): `bash`/`edit`/`write`/
-   * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` →
-   * 60 min (subagents routinely run 20–40 min); `question` → 30 min
-   * (operator AFK). Setting a key here replaces the default for that tool.
+   * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` and
+   * `task_batch` → no deadline (the call waits for the subagent; abandoned
+   * calls are released by aborts, the next user turn, and the process going
+   * away); `question` → 30 min (operator AFK). A positive value here replaces
+   * the default for that tool, `0` disables its deadline, and a negative or
+   * non-finite value is ignored.
    *
    * For `bash` specifically the call's own `input.timeout` is honoured on
    * top: the effective deadline is `max(resolved, input.timeout)`, so a
-   * long build the caller explicitly asked to run is never undercut.
+   * long build the caller explicitly asked to run is never undercut, and a
+   * positive `input.timeout` restores a deadline that `bash: 0` disabled.
    */
   proxyToolTimeoutMs?: Record<string, number>
 
@@ -239,19 +243,24 @@ export interface ClaudeCodeProviderSettings {
 
   /**
    * Kill a retained headless Claude worker after this many milliseconds of
-   * inactivity following a completed turn. Starting another turn cancels the
-   * timer, and the Claude session id is retained for a transparent resume.
-   * Omit or set to 0 to keep workers until LRU eviction. Interactive transport
-   * is excluded because it does not currently guarantee session-id resume.
+   * inactivity following a completed turn. Defaults to 30 minutes. The timer
+   * starts when a turn completes (not at spawn), starting another turn cancels
+   * it, a worker found mid-turn when it fires is left alone and re-timed, and
+   * the Claude session id is retained for a transparent resume. Set to 0 to
+   * keep workers until LRU eviction (8 processes). Interactive transport is
+   * excluded because it does not currently guarantee session-id resume.
    */
   idleProcessTimeoutMs?: number
   /**
    * Expose your opencode skills (`.opencode/skills`, `~/.config/opencode/skills`)
    * to Claude Code's native Skill tool by staging them as a session-scoped
-   * `--plugin-dir`. Off by default: every bridged skill is also listed in the
-   * system prompt opencode already forwards, so a large skill set is paid for
-   * twice per turn. Turn it on when the model tries `Skill("<name>")` and gets
-   * `Unknown skill`. No-op on CLIs without `--plugin-dir`.
+   * `--plugin-dir`, so a `Skill("<name>")` call for a skill opencode advertises
+   * does not fail with `Unknown skill`. On by default, on the headless,
+   * interactive and direct `doGenerate` spawns alike; compaction never loads
+   * it. Set `false` to bridge only the bundled configuration skill: every
+   * bridged skill is also listed in the system prompt opencode forwards, so a
+   * large skill set costs prompt tokens twice per turn. No-op on CLIs without
+   * `--plugin-dir`.
    */
   bridgeOpencodeSkills?: boolean
 

@@ -88,7 +88,7 @@ Defaults below describe normal headless opencode use when the key is absent.
 | `controlRequestDenyMessage` | string | built-in text | Override ordinary deny text. `AskUserQuestion` always uses its own stop-and-wait message. |
 | `proxyTools` | string[] | `["Bash", "Edit", "Write", "WebFetch", "Task"]` | Case-insensitive replacement list, not additive and not a capability allowlist. Known entries expose `mcp__opencode_proxy__<name>`; omitted/unknown tools are not disabled. `Task` also brings `task_batch`; `[]` disables this list, not MCP proxying. See the proxy table for exceptions. |
 | `extraDisallowedTools` | string[] | unset | Claude built-ins to switch off outright with `--disallowedTools`, for tools that have no proxy (`["NotebookEdit"]`). Removes the capability rather than routing it. |
-| `proxyToolTimeoutMs` | object of proxy tool name to ms | unset | Positive deadlines, case-insensitive keys. Fallback 10 min (including dynamic MCP tools); `task` and `task_batch` 60 min each; `question` 30 min. Set both task keys to override both. Zero/negative values do not disable deadlines; values above 2147483647 are clamped. Bash `input.timeout` raises the resolved deadline, but executor/client ceilings still apply. `compress` is intercepted without a deadline. |
+| `proxyToolTimeoutMs` | object of proxy tool name to ms | unset | Optional wall-clock backstop per tool, in ms, case-insensitive keys. A proxied call normally ends on an event the plugin listens for, not on a timer: opencode's result, an abort (the CLI is interrupted), the next user message (calls the previous turn left pending are rejected as orphaned), the `claude` process exiting, the chat being deleted, or opencode exiting. Fallback 10 min (including dynamic MCP tools); `task` and `task_batch` have no deadline, so a subagent runs to completion and a chat parked in one holds its worker until one of those events; `question` 30 min. Set both task keys to cover both. A positive value replaces the default, `0` removes that tool's deadline, negative or non-numeric values are ignored, and values above 2147483647 are clamped. Bash `input.timeout` raises the resolved deadline (and restores one after `bash: 0`); executor ceilings still apply. The generated MCP client timeout is the largest effective deadline, or the CLI's maximum while any tool has none. `compress` is intercepted without a deadline. |
 | `planModeQuestion` | boolean | `false` | Bridge `ExitPlanMode` approval to opencode's `question` and return a real CLI tool result. Requires a live question registry entry; otherwise keeps text fallback. Cannot fire on the headless transport: CLI 2.1.258 does not offer `ExitPlanMode` under `--print`, measured directly and through a full plugin probe, so the text path is what runs. Prose yes/no is not a verified CLI plan-mode unlock. |
 | `webSearch` | `"claude"` / `"disabled"` / `"<opencode tool name>"` | `"claude"` | Default: CLI search with the query rendered as text. Custom target forwards a tool call to an existing opencode tool accepting `query`; this is mapping, not the authenticated proxy replacement, so do not assume CLI search is suppressed. `"disabled"` disallows headless `WebSearch`. |
 | `bridgeOpencodeMcp` | boolean | `true` | Discover/translate disk MCP config plus runtime enabled status. False stops this bridge, not explicit `mcpConfig`, the built-in-tool proxy, or Claude's own MCP settings. Only bridge trusted servers. |
@@ -100,10 +100,10 @@ Defaults below describe normal headless opencode use when the key is absent.
 | `autoContinueIncompleteTurns` | boolean or `"smart"` | `"smart"` | `true`/`"smart"` continue a turn truncated at `max_tokens`, bounded by 8 attempts and 10 minutes, and otherwise run the keyword heuristic only when stop reason is missing. Every other stop reason, plus error, abort or latched question, stops it. Current measured CLIs always report a reason, so truncation is the only case that resumes in practice. |
 | `compactionModel` | string | `"claude-haiku-4-5"` | `/compact` uses a fresh short-lived headless process without the usual bridge/proxy/skill wiring. Nonblank `CLAUDE_CODE_COMPACTION_MODEL` wins. This is inference and can be billed. |
 | `ignoreAnthropicApiKey` | boolean | `false` | Strip `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from headless/interactive spawn env, allowing stored auth to be used. Does not log in, change the parent env, or guarantee subscription billing if other CLI/cloud auth is configured. Warns at startup when either nonempty variable is present, regardless of the flag. |
-| `idleProcessTimeoutMs` | number | unset | Kill a conversation's idle `claude` worker this many ms after a finished turn. The session id is kept, so the next message resumes transparently. `0` or unset keeps workers until LRU eviction (16 processes). Values above `2147483647` are ignored. Not applied to the interactive transport. |
+| `idleProcessTimeoutMs` | number | `1800000` (30 min) | Kill a conversation's idle `claude` worker this many ms after a finished turn. The timer starts when a turn completes, reuse cancels it, and a worker found mid-turn when it fires is re-timed rather than killed. The session id is kept, so the next message resumes transparently. `0` keeps workers until LRU eviction (8 processes, oldest idle first). Values above `2147483647` are ignored. Not applied to the interactive transport. Deleting a chat in opencode releases its workers and session ids immediately regardless. |
 | `turnStats` | boolean | `false` | Append one `▌ **stats:**` line to each finished turn: cost, wall duration, CLI turn count, and input/output/cache-read/cache-write tokens, taken from the CLI's own `result`. Never on a compaction turn or a turn that ended in error. Its own text part, stripped from transcripts rebuilt for the CLI, so the model never sees it. The same numbers are logged at INFO regardless, and `modelUsage` plus `permission_denials` always reach `providerMetadata`. Reported cost is the CLI's figure, not a billing guarantee. |
-| `bridgeOpencodeSkills` | boolean | `false` | Opt-in user skill staging for ordinary headless streams, as `opencode-skills:<name>`. Requires the CLI's `--help` to advertise `--plugin-dir`; otherwise no-op. Adds prompt overhead and exposes skill instructions to Claude. Bundled skill staging does not require this opt-in, but still requires flag support and successful discovery/staging. |
-| `interactive` | boolean | unset (headless) | Experimental PTY transport; explicit boolean wins over `CLAUDE_CODE_INTERACTIVE_TRANSPORT`. Needs `Bun.Terminal`; otherwise headless fallback. Compaction stays headless. Does not wire the headless proxy server/skill bridge/disallowed-tools controls; no equivalent opencode permission guarantee or `/btw`. Never enable to bypass a billing/access restriction. |
+| `bridgeOpencodeSkills` | boolean | `true` | Stage the user's opencode skills for Claude's native Skill tool as `opencode-skills:<name>`, on headless, interactive and direct `doGenerate` spawns (never compaction). Requires the CLI's `--help` to advertise `--plugin-dir`; otherwise no-op. Bridged skills are also listed in opencode's forwarded system prompt, so a large skill set costs prompt tokens twice; `false` opts the user's skills out. Bundled skill staging ignores this option, but still requires flag support and successful discovery/staging. |
+| `interactive` | boolean | unset (headless) | Experimental PTY transport; explicit boolean wins over `CLAUDE_CODE_INTERACTIVE_TRANSPORT`. Needs `Bun.Terminal`; otherwise headless fallback. Compaction stays headless. Does not wire the headless proxy server or disallowed-tools controls; no equivalent opencode permission guarantee or `/btw`. The skill bridge does apply. Never enable to bypass a billing/access restriction. |
 | `interactiveBypass` | boolean | `false` | Deprecated no-op. The TUI asks for a manual safety confirmation on `bypassPermissions`, so the plugin never passes it. |
 | `interactiveAllowTools` | string[] | `["Bash", "Edit", "Write", "Read", "WebFetch"]` | With `interactive`: replaces the built-in pre-allow list. MCP wildcards from discovered bridge names plus `mcp__opencode_proxy__*` are added even with `[]`. Not a capability denylist; review permissions before enabling. |
 | `interactiveSystemPrompt` | boolean | `true` | With `interactive`: append the plugin's own prompt. opencode's forwarded system prompt is deliberately not sent on this transport (it can trip Claude's third-party usage gate). `false` is for diagnostics only. |
@@ -261,25 +261,40 @@ Names below become `mcp__opencode_proxy__<name>`; input config is case-insensiti
 | `edit` | `"Edit"`, default; replaces CLI Edit. |
 | `write` | `"Write"`, default; replaces CLI Write. |
 | `webfetch` | `"WebFetch"`, default; replaces CLI WebFetch. |
-| `task` | `"Task"`, default; disables CLI Agent and dispatches opencode subagents under its permissions. |
+| `task` | `"Task"`, default; disables CLI Agent and dispatches opencode subagents under its permissions. No proxy deadline by default; a positive `proxyToolTimeoutMs` entry adds one. |
 | `task_batch` | Included with Task; one MCP call fans out two or more independent task inputs concurrently. Separate task calls were measured serial on CLI 2.1.258. |
 | `question` | `"Question"`, opt-in; replaces AskUserQuestion only if the live opencode registry has question. Round-trip verified on plugin 0.18.0 / CLI 2.1.258 / opencode 1.18.29, headless and as a real TUI form, with no `permission` block; grant `permission.question` only if a subagent's form is refused. Opt-in because it disables Claude's own AskUserQuestion. |
 | `compress` | `"Compress"`, opt-in; in-process summary/reset interceptor, no opencode permission prompt and no built-in replacement. Discards prior CLI detail on a later eligible turn, retaining the summary, not the full transcript. Keep off unless explicitly requested; end-to-end reset remains unverified live. |
 
-### Let Claude load the user's opencode skills
+A proxied call is held open until an event ends it, and the plugin listens to the
+`claude` process, the stream and the control protocol for those events rather than
+inferring failure from elapsed time: opencode's result resolves the call; an abort
+interrupts the CLI and rejects the turn's pending calls, even when it lands while
+opencode is running the tool; the next user message rejects what the previous turn left pending
+and tells the CLI; the process exiting, the chat being deleted, or opencode exiting
+rejects the rest. That is why `task` and `task_batch` carry no default deadline and a
+subagent runs to completion. Three timers remain and are distinct from that: the
+optional per-tool deadlines above (a backstop the user chooses), the start and
+inactivity watchdogs (for a process that is alive but silent, which emits nothing to
+listen to; a CLI parked in a proxied call is exempt), and the connection keepalives
+(SSE comments or JSON whitespace every 15 s, so the CLI's HTTP client does not give up
+on a long call; they never extend a deadline). Do not present a raised deadline as the
+fix for a long subagent; the default already waits for it.
+
+### Keep Claude from loading the user's opencode skills
 
 ```json
-{ "bridgeOpencodeSkills": true }
+{ "bridgeOpencodeSkills": false }
 ```
 
-Use only after approval when `Skill("<name>")` fails for a trusted opencode skill.
-Headless bridged names are `opencode-skills:<name>`, including this bundled skill as
+The bridge is on by default, so `Skill("<name>")` works for any skill opencode
+advertises. Bridged names are `opencode-skills:<name>`, including this bundled skill as
 `opencode-skills:claude-code-plugin`. The package also registers its skill directory
 with opencode's `skills.paths`; older opencode versions may not support that surface.
-The native Claude bridge needs `--plugin-dir` support and is wired into ordinary
-headless streaming calls, not interactive, compaction or direct `doGenerate` calls.
-The bundled skill does not require `bridgeOpencodeSkills: true`; that option adds
-the user's skills. Reusing a process does not load a new skill catalog.
+The native Claude bridge needs `--plugin-dir` support and is wired into headless
+streaming, interactive and direct `doGenerate` spawns, never compaction. Set `false`
+only when the user wants to save the prompt tokens a large skill set costs twice; the
+bundled skill is staged either way. Reusing a process does not load a new skill catalog.
 
 User roots: `.opencode/skills` walking from cwd to filesystem root, home `.opencode/skills`,
 `OPENCODE_CONFIG_DIR/skills`, then `XDG_CONFIG_HOME/opencode/skills` (home `.config`
@@ -289,14 +304,16 @@ singular `skill/`, `~/.agents/skills` and `~/.claude/skills` are not scanned by 
 bridge; Claude can already discover its own skills independently. Broad bridging can
 duplicate advertised skill context and exposes every discovered skill, not just one.
 
-### Free idle workers
+### Change when idle workers are freed
 
 ```json
 { "idleProcessTimeoutMs": 900000 }
 ```
 
-Fifteen minutes after a turn ends with no new message, that conversation's `claude`
-process exits; the next message resumes the same conversation.
+The default is thirty minutes: that long after a turn ends with no new message, the
+conversation's `claude` process exits, and the next message resumes the same
+conversation. This example shortens it to fifteen; `0` keeps workers until the
+8-process LRU cap evicts the oldest idle one. Neither ever kills a worker mid-turn.
 
 ### Different `/compact` model
 
@@ -431,7 +448,7 @@ commands are preserved. Do not use it as an automatic diagnostic probe.
 | A config change did nothing | Options are read at startup; another opencode window is still running the old process | Fully quit every opencode window and relaunch |
 | New plugin version or model not in the picker after upgrading | Frozen `@latest` in opencode's package cache | Remove the cache dir (recipe "Upgrade the plugin") and relaunch |
 | `/btw` shows "Queued" or "requires an idle Claude Code session" | Plugin older than 0.15.2, or a window started before the current build | Upgrade and restart. `/btw` also needs Claude Code 2.1.258+ |
-| Model calls `Skill("x")` and gets `Unknown skill` | Wrong namespace, unsupported flag/transport, unscanned root, or user bridging off | Check catalog/`--help`/transport; enable `bridgeOpencodeSkills` only with approval |
+| Model calls `Skill("x")` and gets `Unknown skill` | Wrong namespace (`opencode-skills:x`), a CLI without `--plugin-dir`, an unscanned root, a compaction turn, or `bridgeOpencodeSkills: false` | Check the namespace, `claude --help` and the skill root; remove the `false` only with approval |
 | `Subagent failed (task_id …): Tool execution aborted` while the child finished fine | Bug fixed in 0.15.1 | Upgrade |
 | A `subtask: true` command's subagent output is "lost" | Bug fixed in 0.15.4 | Upgrade |
 | Two subagents run one after another | The CLI serialises MCP calls | Plugin 0.17.0+; the model must use `mcp__opencode_proxy__task_batch` |
@@ -452,7 +469,8 @@ commands are preserved. Do not use it as an automatic diagnostic probe.
 | Claude "forgot" the earlier part of a long conversation | Claude Code compacted its own context | Look for the `▌ **context compacted:**` note in the transcript |
 | Wanting the per-turn cost in the chat | Not shown by default | Set `turnStats: true` and restart opencode |
 | Turn ends with an error naming an exit code or signal and a stderr tail | The `claude` child died mid-turn without emitting its terminal `result` | Read the quoted stderr; that is the CLI's own reason. Older builds reported this as a normal stop, so a truncated answer looked finished |
-| An answer is cut off with no error, in a window with many open chats | Plugin older than this fix: LRU eviction could kill a process mid-turn | Upgrade. Eviction now takes the oldest idle process and skips the round when all 16 are busy |
+| An answer is cut off with no error, in a window with many open chats | Plugin older than this fix: LRU eviction could kill a process mid-turn | Upgrade. Eviction now takes the oldest idle process and skips the round when all 8 are busy; the 30-minute idle timer spares a busy worker too |
+| A `claude` worker lingers after its chat was deleted, or after opencode quit | Plugin older than this release | Upgrade. Deleting a chat now releases its workers; every retained worker is killed when opencode exits |
 
 ## Do not
 

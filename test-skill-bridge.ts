@@ -13,7 +13,13 @@ import {
   registerBundledSkillPath,
   resolveSkillPluginDirs,
 } from "./src/skill-bridge.js"
-import { buildCliArgs } from "./src/session-manager.js"
+import {
+  buildCliArgs,
+  deleteActiveProcessAndWait,
+  deleteClaudeSessionId,
+  sessionKey,
+} from "./src/session-manager.js"
+import { createClaudeCode } from "./src/index.js"
 
 /**
  * Skill names are prefixed so a stray `~/.opencode/skills` on the machine
@@ -275,6 +281,121 @@ require("node:readline").createInterface({ input: process.stdin }).on("close", (
     assert.equal(dirs.length, 1)
   })
 })
+
+// --- the spawn itself -----------------------------------------------------------
+//
+// Helper coverage above proves the pieces exist; these prove the `claude`
+// that actually gets spawned carries `--plugin-dir`, on both headless paths,
+// with the user's skills by default and without them on the explicit opt-out.
+
+/**
+ * A stand-in `claude` that records its argv, advertises `--plugin-dir` in
+ * `--help` (or not), and answers one turn with a text reply so both
+ * `doStream` and `doGenerate` complete.
+ */
+function recordingCli(dir: string, help: string): { cliPath: string; argvPath: string } {
+  const cliPath = path.join(dir, `recording-claude-${crypto.randomUUID()}.cjs`)
+  const argvPath = path.join(dir, `argv-${crypto.randomUUID()}.json`)
+  fs.writeFileSync(
+    cliPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const readline = require("node:readline")
+if (process.argv.includes("--version")) { process.stdout.write("2.1.258\\n"); process.exit(0) }
+if (process.argv.includes("--help")) { process.stdout.write(${JSON.stringify(help)}); process.exit(0) }
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)))
+readline.createInterface({ input: process.stdin }).on("line", () => {
+  const session_id = "fake-session"
+  process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id }) + "\\n")
+  process.stdout.write(JSON.stringify({
+    type: "assistant", session_id,
+    message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] },
+  }) + "\\n")
+  process.stdout.write(JSON.stringify({
+    type: "result", subtype: "success", session_id, is_error: false, duration_ms: 1, num_turns: 1,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  }) + "\\n")
+})
+`,
+  )
+  fs.chmodSync(cliPath, 0o755)
+  return { cliPath, argvPath }
+}
+
+const pluginDirsIn = (argv: string[]) =>
+  argv.reduce<string[]>((acc, arg, i) => {
+    if (arg === "--plugin-dir") acc.push(argv[i + 1]!)
+    return acc
+  }, [])
+
+const CALL = {
+  prompt: [{ role: "user", content: [{ type: "text", text: "Say done." }] }],
+  tools: [{ type: "function", name: "bash", description: "Run", inputSchema: { type: "object", properties: {} } }],
+} as any
+
+async function spawnArgsFor(
+  transport: "doStream" | "doGenerate",
+  settings: { bridgeOpencodeSkills?: boolean },
+  help = "--plugin-dir <path>  Load a plugin",
+): Promise<string[]> {
+  return withFixture(async ({ cwd, projectSkills }) => {
+    makeSkill(projectSkills, `${P}spawned`)
+    const cli = recordingCli(path.dirname(cwd), help)
+    const modelId = `claude-test-skills-${transport}`
+    const sk = sessionKey(cwd, `${modelId}::tools::default::context=["claude-code",null]`)
+    try {
+      const model = createClaudeCode({
+        cliPath: cli.cliPath,
+        cwd,
+        bridgeOpencodeMcp: false,
+        proxyOpencodeMcpTools: false,
+        proxyTools: [],
+        autoContinueIncompleteTurns: false,
+        ...settings,
+      }).languageModel(modelId)
+      if (transport === "doStream") {
+        const response = await model.doStream(CALL)
+        for await (const _ of response.stream) { /* drain */ }
+      } else {
+        const result = await model.doGenerate(CALL)
+        assert.equal(result.finishReason.unified, "stop")
+      }
+      return JSON.parse(fs.readFileSync(cli.argvPath, "utf8")) as string[]
+    } finally {
+      await deleteActiveProcessAndWait(sk)
+      deleteClaudeSessionId(sk)
+    }
+  })
+}
+
+test("createClaudeCode bridges the user's skills unless told otherwise", () => {
+  const configOf = (settings: Record<string, unknown>) =>
+    (createClaudeCode(settings).languageModel("claude-haiku-4-5") as any).config
+  assert.equal(configOf({}).bridgeOpencodeSkills, true)
+  assert.equal(configOf({ bridgeOpencodeSkills: true }).bridgeOpencodeSkills, true)
+  assert.equal(configOf({ bridgeOpencodeSkills: false }).bridgeOpencodeSkills, false)
+})
+
+for (const transport of ["doStream", "doGenerate"] as const) {
+  test(`${transport} spawns claude with --plugin-dir carrying the user's skills by default`, async () => {
+    const argv = await spawnArgsFor(transport, {})
+    const dirs = pluginDirsIn(argv)
+    assert.equal(dirs.length, 1, `expected one --plugin-dir in ${argv.join(" ")}`)
+    assert.deepEqual(skillNames(dirs[0]!), ["claude-code-plugin", `${P}spawned`])
+  })
+
+  test(`${transport} with bridgeOpencodeSkills: false stages only the bundled skill`, async () => {
+    const argv = await spawnArgsFor(transport, { bridgeOpencodeSkills: false })
+    const dirs = pluginDirsIn(argv)
+    assert.equal(dirs.length, 1)
+    assert.deepEqual(skillNames(dirs[0]!), ["claude-code-plugin"])
+  })
+
+  test(`${transport} passes no --plugin-dir to a CLI whose --help does not know the flag`, async () => {
+    const argv = await spawnArgsFor(transport, {}, "Usage: claude [options]\n  --model <model>")
+    assert.equal(argv.includes("--plugin-dir"), false, argv.join(" "))
+  })
+}
 
 test("buildCliArgs repeats --plugin-dir per directory", () => {
   const args = buildCliArgs({

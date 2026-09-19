@@ -3,6 +3,7 @@ import { ClaudeCodeLanguageModel } from "./claude-code-language-model.js"
 import { defaultModels, toConfigModel } from "./models.js"
 import type {
   OpenCodeConfig,
+  OpenCodeEvent,
   OpenCodeModel,
   OpenCodePlugin,
   OpenCodeProvider,
@@ -29,6 +30,10 @@ import { DOCTOR_COMMAND } from "./doctor.js"
 import { configureLogger, log } from "./logger.js"
 import { handleBtwCommand, type BtwSdkClient } from "./btw-command.js"
 import { registerBundledSkillPath } from "./skill-bridge.js"
+import {
+  deleteActiveProcessesForSession,
+  ensureProcessExitCleanup,
+} from "./session-manager.js"
 import { getOpencodeClient } from "./runtime-status.js"
 import {
   getOpencodeProjectDirectory,
@@ -198,7 +203,7 @@ export function createClaudeCode(
       compactionModel: settings.compactionModel,
       ignoreAnthropicApiKey: settings.ignoreAnthropicApiKey,
       idleProcessTimeoutMs: settings.idleProcessTimeoutMs,
-      bridgeOpencodeSkills: settings.bridgeOpencodeSkills === true,
+      bridgeOpencodeSkills: settings.bridgeOpencodeSkills !== false,
       turnStats: settings.turnStats === true,
       interactive: settings.interactive,
       interactiveBypass: settings.interactiveBypass,
@@ -490,8 +495,24 @@ async function buildAgentRegistry(config: OpenCodeConfig): Promise<void> {
   })
 }
 
+/**
+ * The opencode session id a `session.deleted` bus event names, or undefined
+ * for any other event. opencode publishes `{ type, properties: { info } }`
+ * under `payload`, and the deleted session's own record is `properties.info`.
+ */
+export function extractDeletedSessionId(event: OpenCodeEvent | undefined): string | undefined {
+  const payload = event?.payload ?? event
+  if (!payload || payload.type !== "session.deleted") return undefined
+  const properties = payload.properties as { info?: { id?: unknown } } | undefined
+  const id = properties?.info?.id
+  return typeof id === "string" && id.length > 0 ? id : undefined
+}
+
 const server: OpenCodePlugin = async (input) => {
   cleanupStaleUnscopedInstall()
+  // Retained `claude` children would otherwise outlive a hard opencode exit,
+  // reparented to init. Armed once per process however often this runs.
+  ensureProcessExitCleanup()
 
   const opencodeVersion = pickOpencodeVersion(input)
 
@@ -545,10 +566,21 @@ const server: OpenCodePlugin = async (input) => {
         opencodeVersion,
       )
     },
-    // No `event` hook: MCP config drift is detected at turn start by the
-    // hot-reload check in `claude-code-language-model.ts`, which respawns
-    // claude safely between turns. Eviction on `global.disposed` would kill
-    // an in-flight stream and abort the user's current turn.
+    // Only `session.deleted` is acted on. MCP config drift is still detected
+    // at turn start by the hot-reload check in `claude-code-language-model.ts`,
+    // which respawns claude safely between turns, and eviction on
+    // `global.disposed` would kill an in-flight stream and abort the user's
+    // current turn. A deleted session has no turn left to abort, and its
+    // `claude` child would otherwise linger until the idle timer or LRU
+    // pressure took it, with its session id kept for a resume that never comes.
+    event: async ({ event }) => {
+      const sessionID = extractDeletedSessionId(event)
+      if (!sessionID) return
+      const released = deleteActiveProcessesForSession(sessionID)
+      if (released.length > 0) {
+        log.info("released claude state for deleted session", { sessionID, released })
+      }
+    },
     provider: {
       id: PROVIDER_ID,
       models: async (provider) => defaultModelsForProvider(provider.models),

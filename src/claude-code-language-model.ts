@@ -58,6 +58,7 @@ import {
   deleteActiveProcess,
   deleteActiveProcessAndWait,
   respawnActiveProcess,
+  resolveIdleProcessTimeoutMs,
   scheduleIdleProcessEviction,
   noteTurnStarted,
   isTurnInFlight,
@@ -1818,6 +1819,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       { compressEnabled: false, compressionSummary: getCompressionSummary(sk) },
     )
     const { model: spawnModelId, fast: fastMode } = parseModelId(effectiveModelId)
+    // The same skill bridge as doStream's spawn: Claude's Skill tool is the
+    // only way a Claude-routed turn can load an opencode skill, on this path
+    // as much as on the streaming one.
+    const skillPluginDirs = await resolveSkillPluginDirs({
+      cwd,
+      cliPath: this.config.cliPath,
+      enabled: this.config.bridgeOpencodeSkills !== false,
+    })
     const cliArgs = buildCliArgs({
       sessionKey: sk,
       skipPermissions: this.config.skipPermissions !== false,
@@ -1829,6 +1838,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
       disallowedTools:
         this.config.webSearch === "disabled" ? ["WebSearch"] : undefined,
       appendSystemPromptFile: systemPromptFile,
+      pluginDirs: skillPluginDirs,
       ...this.thinkingCliOptions(),
       fastMode,
       cliVersion,
@@ -2661,6 +2671,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                   "interactiveBypass ignored: Claude Code prompts for bypassPermissions confirmation in the interactive TUI",
                 )
               }
+              // Same skill bridge as the headless spawn: the TUI's native
+              // Skill tool reads `--plugin-dir` too, and the flag probe
+              // keeps it off a CLI that does not know the flag.
+              const skillPluginDirs = await resolveSkillPluginDirs({
+                cwd,
+                cliPath,
+                enabled: self.config.bridgeOpencodeSkills !== false,
+              })
               const ap = spawnInteractiveProcess({
                 cwd,
                 cliPath,
@@ -2668,6 +2686,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 model: spawnModelId,
                 fastMode,
                 mcpConfigPaths: mcp.paths,
+                pluginDirs: skillPluginDirs,
                 permissionsAllow: allow,
                 systemPromptFile,
                 ignoreAnthropicApiKey: self.config.ignoreAnthropicApiKey,
@@ -2852,12 +2871,14 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                     compressionSummary: getCompressionSummary(sk),
                   },
                 )
-            // Opt-in skill bridge (@broskees): stage opencode skills as a
+            // Skill bridge (@broskees): stage opencode skills as a
             // session-scoped --plugin-dir so Claude's Skill tool can run them.
+            // On unless `bridgeOpencodeSkills: false`; the bundled skill is
+            // staged either way.
             const skillPluginDirs = await resolveSkillPluginDirs({
               cwd,
               cliPath,
-              enabled: self.config.bridgeOpencodeSkills === true,
+              enabled: self.config.bridgeOpencodeSkills !== false,
             })
             cliArgs = buildCliArgs({
               sessionKey: sk,
@@ -3111,6 +3132,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             if (entries.length === 0) return false
             endTextBlock()
             watchdogMessage = makeLateProxyResultMessage(entries)
+            // This write asks the CLI for work like any fresh envelope, so
+            // abort, LRU eviction and the idle timer must see it as busy.
+            if (activeProcess) noteTurnStarted(activeProcess)
             proc.stdin!.write(watchdogMessage + "\n")
             for (const { call } of entries) pending!.delete(call.toolCallId)
             log.warn("delivering proxy results after interrupted continuation", {
@@ -3446,7 +3470,10 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
           controllerClosed = true
           cleanupTurn()
           if (!useInteractive && !compactionMode) {
-            scheduleIdleProcessEviction(sk, self.config.idleProcessTimeoutMs)
+            scheduleIdleProcessEviction(
+              sk,
+              resolveIdleProcessTimeoutMs(self.config.idleProcessTimeoutMs),
+            )
           }
 
           try {
@@ -4548,9 +4575,39 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
 
         // On abort, keep process alive for next message
         if (options.abortSignal) {
+          // Proxy calls this turn handed to opencode will never get a result
+          // once the operator aborts: opencode stops its tool runs with the
+          // turn. Release them now, so the CLI's parked requests return and
+          // nothing waits for the next message to find out. Late-result
+          // recovery is untouched: it holds results that already arrived.
+          const releaseAbandonedProxyCalls = (reason: string) => {
+            if (drainBuffer.length === 0 && getPendingProxyCalls(sk).length === 0) return
+            rejectAllPendingProxyCallsForSession(sk, new Error(reason))
+            drainBuffer.length = 0
+          }
           options.abortSignal.addEventListener("abort", () => {
             autoContinueState.aborted = true
-            if (turnCompleted || controllerClosed) return
+            if (turnCompleted || controllerClosed) {
+              // This stream already ended on a proxy tool boundary and
+              // opencode was running the tool when the operator aborted.
+              // The CLI is parked in that call and nobody else will answer
+              // it; but only while no later turn has attached to the
+              // process, since that turn's calls are its own.
+              if (
+                activeProcess &&
+                activeProcess.lineEmitter.listenerCount("line") === 0 &&
+                getPendingProxyCalls(sk).length > 0
+              ) {
+                log.info("abort between proxy tool boundaries; releasing pending calls", { sk })
+                void interruptTurn(activeProcess).then((idle) => {
+                  log.info("interrupt sent for aborted turn", { sk, idle })
+                })
+                releaseAbandonedProxyCalls(
+                  "Provider stream was aborted while opencode was running its proxy tool calls",
+                )
+              }
+              return
+            }
 
             // Stop the CLI's turn, not just our end of the stream: it would
             // otherwise run the abandoned turn to completion, billing tokens
@@ -4567,18 +4624,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 "abort signal received before content, closing stream immediately",
                 { cwd },
               )
-              if (
-                drainBuffer.length > 0 ||
-                getPendingProxyCalls(sk).length > 0
-              ) {
-                rejectAllPendingProxyCallsForSession(
-                  sk,
-                  new Error(
-                    "Provider stream was aborted before pending proxy calls were emitted",
-                  ),
-                )
-                drainBuffer.length = 0
-              }
+              releaseAbandonedProxyCalls(
+                "Provider stream was aborted before pending proxy calls were emitted",
+              )
               controllerClosed = true
               cleanupTurn()
               try {
@@ -4590,6 +4638,9 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
             log.info(
               "abort signal received mid-turn, starting grace period",
               { cwd },
+            )
+            releaseAbandonedProxyCalls(
+              "Provider stream was aborted while proxy tool calls were pending",
             )
             // Abort grace period — short, since the user already asked to stop.
             startResultFallback(5_000)

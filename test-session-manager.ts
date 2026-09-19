@@ -5,14 +5,20 @@ import { test } from "node:test"
 import { spawn, type ChildProcess } from "node:child_process"
 import {
   buildCliArgs,
+  DEFAULT_IDLE_PROCESS_TIMEOUT_MS,
   deleteActiveProcess,
   deleteActiveProcessAndWait,
+  deleteActiveProcessesForSession,
   deleteClaudeSessionId,
   describeChildCrash,
+  ensureProcessExitCleanup,
   evictIfNeeded,
   getActiveProcess,
   getClaudeSessionId,
+  isIdleProcessEvictionScheduled,
+  killAllActiveProcesses,
   MAX_ACTIVE_PROCESSES,
+  resolveIdleProcessTimeoutMs,
   retainStderr,
   scheduleIdleProcessEviction,
   noteTurnStarted,
@@ -25,6 +31,13 @@ import {
   spawnClaudeProcess,
   type ActiveProcess,
 } from "./src/session-manager.js"
+import { getPendingProxyCalls, queuePendingProxyCall } from "./src/proxy-broker.js"
+import {
+  createProxyMcpServer,
+  DEFAULT_PROXY_TOOLS,
+  SERVER_CLOSED_MESSAGE,
+  type ProxyToolCall,
+} from "./src/proxy-mcp.js"
 
 function fakeActiveProcess(options: { exitOn: NodeJS.Signals; delayMs: number }): {
   activeProcess: ActiveProcess
@@ -232,6 +245,46 @@ test("reusing a process cancels its idle eviction", async () => {
   deleteActiveProcess(key)
 })
 
+test("idle eviction is on by default at 30 minutes, and an explicit 0 turns it off", () => {
+  assert.equal(DEFAULT_IDLE_PROCESS_TIMEOUT_MS, 30 * 60_000)
+  assert.equal(resolveIdleProcessTimeoutMs(undefined), DEFAULT_IDLE_PROCESS_TIMEOUT_MS)
+  assert.equal(resolveIdleProcessTimeoutMs(0), 0)
+  assert.equal(resolveIdleProcessTimeoutMs(900_000), 900_000)
+
+  const key = `idle-default-${Date.now()}`
+  setActiveProcess(key, fakeIdleProcess(() => {}))
+  try {
+    scheduleIdleProcessEviction(key, resolveIdleProcessTimeoutMs(undefined))
+    assert.equal(isIdleProcessEvictionScheduled(key), true)
+    scheduleIdleProcessEviction(key, resolveIdleProcessTimeoutMs(0))
+    assert.equal(isIdleProcessEvictionScheduled(key), false, "0 disarms")
+  } finally {
+    deleteActiveProcess(key)
+  }
+})
+
+// A recovered continuation, an auto-continue or a late tool result can put a
+// process back to work after the turn that armed the timer completed.
+test("the idle timer spares a process that is mid-turn and re-arms instead", async () => {
+  const key = `idle-in-flight-${Date.now()}`
+  let kills = 0
+  const ap = fakeIdleProcess(() => kills++)
+  setActiveProcess(key, ap)
+  try {
+    scheduleIdleProcessEviction(key, 10)
+    noteTurnStarted(ap)
+    await delay(30)
+    assert.equal(kills, 0, "a busy process is never evicted by the clock")
+    assert.equal(isIdleProcessEvictionScheduled(key), true, "re-armed for the next window")
+    noteTurnLine(ap, JSON.stringify({ type: "result", subtype: "success" }))
+    await delay(30)
+    assert.equal(kills, 1, "evicted once the turn settled and the window lapsed")
+    assert.equal(isIdleProcessEvictionScheduled(key), false)
+  } finally {
+    deleteActiveProcess(key)
+  }
+})
+
 test("timeouts above Node's maximum delay do not evict immediately", async () => {
   const key = `idle-overflow-${Date.now()}`
   let kills = 0
@@ -412,6 +465,146 @@ test("LRU eviction kills nothing while every process is mid-turn", () => {
     captured.lines.some((line) => line.includes("every claude process is mid-turn")),
     `expected a warning about the skipped eviction, got: ${captured.lines.join(" | ")}`,
   )
+})
+
+test("the process cap is 8 and the LRU never exceeds it while an idle victim exists", () => {
+  assert.equal(MAX_ACTIVE_PROCESSES, 8)
+})
+
+// A `task` call has no deadline, so once its proxy server is gone nothing
+// else would ever reap its broker entry.
+test("deleting a process rejects the broker calls its proxy server can no longer answer", async () => {
+  const key = `detach-rejects-${Date.now()}`
+  let serverClosed = false
+  const ap: ActiveProcess = {
+    ...fakeIdleProcess(() => {}),
+    proxyServer: { async close() { serverClosed = true } } as unknown as ActiveProcess["proxyServer"],
+  }
+  setActiveProcess(key, ap)
+  let rejection: Error | undefined
+  const settled = new Promise<void>((resolve) => {
+    queuePendingProxyCall(key, {
+      id: `call-${key}`,
+      toolName: "task",
+      input: {},
+      resolve: () => resolve(),
+      reject: (error) => { rejection = error; resolve() },
+    })
+  })
+  assert.equal(getPendingProxyCalls(key).length, 1)
+  deleteActiveProcess(key)
+  await settled
+  assert.equal(serverClosed, true)
+  assert.equal(getPendingProxyCalls(key).length, 0)
+  assert.equal(rejection?.message, SERVER_CLOSED_MESSAGE)
+})
+
+test("deleteActiveProcessesForSession releases every process and remembered id of one session only", async () => {
+  const stamp = Date.now()
+  const keyFor = (session: string, model = "claude-opus-5", scope = "tools") =>
+    scope === "compaction"
+      ? `/tmp/proj-${stamp}::${model}::compaction::${session}`
+      : `/tmp/proj-${stamp}::${model}::${scope}::${session}::context=["claude-code",null]`
+  const killed: string[] = []
+  const register = (key: string, opencodeSessionID?: string) => {
+    const { activeProcess } = fakeActiveProcess({ exitOn: "SIGTERM", delayMs: 0 })
+    activeProcess.proc.kill = ((signal?: NodeJS.Signals) => {
+      killed.push(key)
+      Object.defineProperty(activeProcess.proc, "exitCode", { configurable: true, value: 0 })
+      activeProcess.proc.emit("exit", 0, signal ?? null)
+      return true
+    }) as typeof activeProcess.proc.kill
+    if (opencodeSessionID) activeProcess.opencodeSessionID = opencodeSessionID
+    setActiveProcess(key, activeProcess)
+  }
+  const a1 = keyFor("ses_A")
+  const a2 = keyFor("ses_A", "claude-haiku-4-5", "compaction")
+  const aEffort = `${keyFor("ses_A")}::effort=high`
+  const b = keyFor("ses_B")
+  const shared = keyFor("default")
+  register(a1, "ses_A")
+  register(a2)
+  register(aEffort, "ses_A")
+  register(b, "ses_B")
+  register(shared)
+  setClaudeSessionId(a1, "claude-a1")
+  setClaudeSessionId(b, "claude-b")
+  // An idle-evicted process keeps its session id for a resume; a deleted
+  // session must drop that too.
+  const aEvicted = keyFor("ses_A", "claude-sonnet-5")
+  setClaudeSessionId(aEvicted, "claude-a-evicted")
+  try {
+    assert.deepEqual(deleteActiveProcessesForSession("default"), [], "the shared bucket is never matched")
+    assert.deepEqual(deleteActiveProcessesForSession(""), [])
+    const released = deleteActiveProcessesForSession("ses_A")
+    assert.deepEqual(released.sort(), [a1, a2, aEffort, aEvicted].sort())
+    assert.deepEqual(killed.sort(), [a1, a2, aEffort].sort())
+    assert.equal(getActiveProcess(a1), undefined)
+    assert.equal(getActiveProcess(a2), undefined)
+    assert.equal(getActiveProcess(aEffort), undefined)
+    assert.ok(getActiveProcess(b), "another session's process survives")
+    assert.ok(getActiveProcess(shared), "the shared bucket survives")
+    assert.equal(getClaudeSessionId(a1), undefined)
+    assert.equal(getClaudeSessionId(aEvicted), undefined)
+    assert.equal(getClaudeSessionId(b), "claude-b")
+    assert.deepEqual(deleteActiveProcessesForSession("ses_A"), [], "idempotent")
+  } finally {
+    for (const key of [a1, a2, aEffort, b, shared, aEvicted]) {
+      deleteActiveProcess(key)
+      deleteClaudeSessionId(key)
+    }
+  }
+})
+
+test("killAllActiveProcesses is synchronous, releases parked calls on both sides, and the exit hook is armed once", async () => {
+  const stamp = Date.now()
+  const killed: string[] = []
+  const keys = [`exit-a-${stamp}`, `exit-b-${stamp}`]
+  for (const key of keys) setActiveProcess(key, fakeIdleProcess(() => killed.push(key)))
+  setClaudeSessionId(keys[0]!, "claude-exit-a")
+  // A real proxy server holding a real `task` request, wired to the broker
+  // the way the language model wires it. opencode going away must release
+  // the HTTP side and the broker entry, not just kill the child.
+  const server = await createProxyMcpServer(DEFAULT_PROXY_TOOLS.filter((t) => t.name === "task"))
+  server.calls.on("call", (call: ProxyToolCall) => queuePendingProxyCall(keys[1]!, call))
+  const parked: ActiveProcess = { ...fakeIdleProcess(() => killed.push(keys[1]!)), proxyServer: server }
+  setActiveProcess(keys[1]!, parked)
+  const queued = new Promise<void>((resolve) => server.calls.once("call", () => resolve()))
+  const request = fetch(server.url, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${server.authToken}` },
+    body: JSON.stringify({
+      jsonrpc: "2.0", id: "parked", method: "tools/call",
+      params: { name: "task", arguments: { description: "d", prompt: "p", subagent_type: "general" } },
+    }),
+  }).then((response) => response.json() as Promise<any>)
+  await queued
+  assert.deepEqual(server.pendingCallIds().length, 1)
+  assert.equal(getPendingProxyCalls(keys[1]!).length, 1)
+  try {
+    assert.deepEqual(killAllActiveProcesses().sort(), keys.sort())
+    assert.deepEqual(killed.sort(), keys.sort(), "killed before the call returned")
+    assert.equal(getPendingProxyCalls(keys[1]!).length, 0, "broker entry released synchronously")
+    const answer = await request
+    assert.equal(answer.result.isError, true)
+    assert.equal(answer.result.content[0].text, SERVER_CLOSED_MESSAGE)
+    assert.deepEqual(server.pendingCallIds(), [], "HTTP entry released")
+    assert.equal(getActiveProcess(keys[0]!), undefined)
+    assert.equal(getClaudeSessionId(keys[0]!), "claude-exit-a", "ids are left alone at exit")
+    assert.deepEqual(killAllActiveProcesses(), [])
+
+    const before = process.listenerCount("exit")
+    const armed = ensureProcessExitCleanup()
+    const afterFirst = process.listenerCount("exit")
+    assert.equal(ensureProcessExitCleanup(), false, "a second call never adds a listener")
+    assert.equal(process.listenerCount("exit"), afterFirst)
+    assert.equal(afterFirst - before, armed ? 1 : 0)
+  } finally {
+    for (const key of keys) {
+      deleteActiveProcess(key)
+      deleteClaudeSessionId(key)
+    }
+  }
 })
 
 test("retained stderr keeps the newest 2 KB", () => {
