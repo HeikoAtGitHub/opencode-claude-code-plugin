@@ -36,6 +36,8 @@ type InternalPending = PendingProxyCall & {
   timer: ReturnType<typeof setTimeout> | null
   /** Stall heartbeat; only armed for calls that have no deadline. */
   stallTimer: ReturnType<typeof setInterval> | null
+  /** One-shot "this is going to run out" notice; deadline-bearing calls only. */
+  deadlineWarnTimer: ReturnType<typeof setTimeout> | null
   resolve(result: ProxyToolResult): void
   reject(error: Error): void
 }
@@ -55,10 +57,30 @@ type InternalPending = PendingProxyCall & {
  */
 export const PROXY_STALL_WARNING_MS = 5 * 60_000
 
-/** Both timers a pending call can hold. Every removal site must use this. */
+/**
+ * Where in a deadline-bearing call's life to say it is going to run out.
+ *
+ * The heartbeat above deliberately skips these calls, on the reasoning that
+ * their deadline already reports them. It does, but only by killing them:
+ * the first and last thing you hear is the failure. Measured the hard way on
+ * 2026-09-19, when two proxied calls that were still working were rejected at
+ * their 10-minute deadline with no prior signal, and the operator had to
+ * infer from silence what was happening.
+ *
+ * So one notice, at 60% of the deadline, saying how long is left. Once, never
+ * repeating, because the deadline itself is the next thing that will speak.
+ * Calls whose deadline is under `PROXY_DEADLINE_WARNING_MIN_MS` are skipped:
+ * on a short deadline the notice and the rejection would arrive together and
+ * tell you nothing you are not about to be told anyway.
+ */
+export const PROXY_DEADLINE_WARNING_FRACTION = 0.6
+export const PROXY_DEADLINE_WARNING_MIN_MS = 60_000
+
+/** Every timer a pending call can hold. Each removal site must use this. */
 function clearPendingTimers(pending: InternalPending): void {
   if (pending.timer) clearTimeout(pending.timer)
   if (pending.stallTimer) clearInterval(pending.stallTimer)
+  if (pending.deadlineWarnTimer) clearTimeout(pending.deadlineWarnTimer)
 }
 
 /** One pending call, flattened for `/claude-code-doctor`. */
@@ -116,6 +138,8 @@ export function queuePendingProxyCall(
   timeoutOverrides?: Record<string, number>,
   /** Test seam, same shape as `createProxyMcpServer`'s `keepaliveMs`. */
   stallWarningMs: number = PROXY_STALL_WARNING_MS,
+  /** Test seam: lower it so a short test deadline still warns. */
+  deadlineWarningMinMs: number = PROXY_DEADLINE_WARNING_MIN_MS,
 ): PendingProxyCall {
   // Defensive: if this exact callId is somehow already pending (UUID
   // collision or retry storm), replace it cleanly so we never leak two
@@ -183,6 +207,31 @@ export function queuePendingProxyCall(
   // Never hold opencode's process open for a heartbeat.
   stallTimer?.unref?.()
 
+  // The other half: a call that DOES have a deadline says so before the
+  // deadline takes it, rather than only by dying. Same WARN reasoning, and
+  // one-shot, since the rejection is the next thing that will report.
+  const warnAtMs = Math.floor(deadlineMs * PROXY_DEADLINE_WARNING_FRACTION)
+  const deadlineWarnTimer =
+    deadlineMs >= deadlineWarningMinMs && deadlineMs > 0 && warnAtMs > 0
+      ? setTimeout(() => {
+          const current = pendingByCallId.get(call.id)
+          if (!current) return
+          const waitedMs = Date.now() - current.createdAt
+          log.warn("proxy call still waiting, deadline approaching", {
+            sessionKey: current.sessionKey,
+            toolCallId: current.toolCallId,
+            toolName: current.toolName,
+            waitedMs,
+            deadlineMs,
+            remainingMs: Math.max(0, deadlineMs - waitedMs),
+            emitted: current.emitted === true,
+            channelClosed: current.channel?.closed === true,
+            note: "it will be rejected when the deadline passes; raise this tool's proxyToolTimeoutMs if the work is legitimately this long",
+          })
+        }, warnAtMs)
+      : null
+  deadlineWarnTimer?.unref?.()
+
   const pending: InternalPending = {
     sessionKey,
     toolCallId: call.id,
@@ -193,6 +242,7 @@ export function queuePendingProxyCall(
     deadlineMs,
     timer,
     stallTimer,
+    deadlineWarnTimer,
     resolve: call.resolve,
     reject: call.reject,
   }

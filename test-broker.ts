@@ -21,6 +21,8 @@ import {
   markPendingProxyCallEmitted,
   snapshotPendingProxyCalls,
   PROXY_STALL_WARNING_MS,
+  PROXY_DEADLINE_WARNING_FRACTION,
+  PROXY_DEADLINE_WARNING_MIN_MS,
   type PendingProxyCall,
 } from "./src/proxy-broker.js"
 import { configureLogger, _resetLoggerForTests } from "./src/logger.js"
@@ -341,7 +343,9 @@ test("isPendingProxyCallChannelClosed treats a call without a channel as open", 
 // --- stall warning for calls with no deadline -----------------------------
 
 /** Like test-cli-args.ts's helper, but it spans awaits. */
-async function captureLogsAsync(fn: () => Promise<void>): Promise<string[]> {
+async function captureLogsAsync(
+  fn: (lines: readonly string[]) => Promise<void>,
+): Promise<string[]> {
   const lines: string[] = []
   const original = console.error
   console.error = (line: unknown) => {
@@ -350,7 +354,7 @@ async function captureLogsAsync(fn: () => Promise<void>): Promise<string[]> {
   try {
     _resetLoggerForTests()
     configureLogger({ mode: "debug", level: "debug" })
-    await fn()
+    await fn(lines)
   } finally {
     console.error = original
     _resetLoggerForTests()
@@ -429,4 +433,72 @@ test("stallWarningMs of 0 arms nothing", async () => {
 
 test("the shipped threshold is 5 minutes", () => {
   assert.equal(PROXY_STALL_WARNING_MS, 5 * 60_000)
+})
+
+// --- one notice before a deadline takes the call --------------------------
+
+function deadlineLines(lines: string[]): string[] {
+  return lines.filter((line) => line.includes("deadline approaching"))
+}
+
+test("a deadline-bearing call warns once, before the deadline rejects it", async () => {
+  const handle = makeCall("bash", {})
+  const lines = await captureLogsAsync(async (live) => {
+    // 200 ms deadline with the minimum lowered to 1 ms, so it arms and warns
+    // at 60 percent, which is 120 ms.
+    queuePendingProxyCall("sess-warn", handle.call, { bash: 200 }, 0, 1)
+    await pause(160)
+    // Warned, and the call is still alive: the point is a notice BEFORE
+    // death, so both halves are asserted while it is still pending.
+    assert.equal(deadlineLines([...live]).length, 1, "expected exactly one notice")
+    assert.equal(getPendingProxyCalls("sess-warn").length, 1, "still pending")
+    await pause(120)
+  })
+  const warnings = deadlineLines(lines)
+  assert.equal(warnings.length, 1, "one-shot, never repeating")
+  assert.match(warnings[0]!, /WARN/)
+  assert.match(warnings[0]!, new RegExp(handle.id))
+  assert.match(warnings[0]!, /"remainingMs":/)
+  assert.match(warnings[0]!, /proxyToolTimeoutMs/)
+  // The deadline still did its job afterwards.
+  assert.equal(getPendingProxyCalls("sess-warn").length, 0)
+  await handle.promise.catch(() => undefined)
+})
+
+test("resolving before the warning point means no notice at all", async () => {
+  const handle = makeCall("bash", {})
+  const lines = await captureLogsAsync(async () => {
+    queuePendingProxyCall("sess-warn-fast", handle.call, { bash: 200 }, 0, 1)
+    await pause(30)
+    resolvePendingProxyCallById(handle.id, { kind: "text", text: "quick" })
+    await pause(160)
+  })
+  assert.deepEqual(deadlineLines(lines), [])
+})
+
+test("a short deadline is not armed: the notice would arrive with the rejection", async () => {
+  const handle = makeCall("bash", {})
+  const lines = await captureLogsAsync(async () => {
+    // Real minimum this time, so a 200 ms deadline is below the floor.
+    queuePendingProxyCall("sess-warn-short", handle.call, { bash: 200 }, 0)
+    await pause(280)
+  })
+  assert.deepEqual(deadlineLines(lines), [])
+  await handle.promise.catch(() => undefined)
+})
+
+test("a call with no deadline gets the heartbeat, never this notice", async () => {
+  const handle = makeCall("task")
+  const lines = await captureLogsAsync(async () => {
+    queuePendingProxyCall("sess-warn-none", handle.call, undefined, 15, 1)
+    await pause(55)
+  })
+  assert.deepEqual(deadlineLines(lines), [])
+  assert.ok(stallLines(lines).length >= 2, "heartbeat still runs")
+  rejectAllPendingProxyCallsForSession("sess-warn-none", new Error("cleanup"))
+})
+
+test("the shipped notice point is 60 percent, with a one minute floor", () => {
+  assert.equal(PROXY_DEADLINE_WARNING_FRACTION, 0.6)
+  assert.equal(PROXY_DEADLINE_WARNING_MIN_MS, 60_000)
 })

@@ -307,9 +307,13 @@ on a long call; they never extend a deadline). Do not present a raised deadline 
 fix for a long subagent; the default already waits for it. A deadline-free call is not
 silent while it waits: it logs `proxy call still waiting, no deadline` at WARN after
 five minutes and every five minutes after, with tool, call id and elapsed time. That
-line is a status report, never a failure; it does not end the call and a call with a
-deadline never emits it. Use it, or `/claude-code-doctor`, to tell a working subagent
-from a wedged one before suggesting any timeout change.
+line is a status report, never a failure; it does not end the call. A call that HAS a
+deadline instead logs `proxy call still waiting, deadline approaching` once, at 60% of
+that deadline, carrying `remainingMs` and naming `proxyToolTimeoutMs`; deadlines under
+a minute are not announced, because there the notice and the rejection would arrive
+together. Neither line means something is wrong and neither ends a call. Use them, or
+`/claude-code-doctor`, to tell a working subagent from a wedged one before suggesting
+any timeout change.
 
 ### Let Claude load the user's opencode skills
 
