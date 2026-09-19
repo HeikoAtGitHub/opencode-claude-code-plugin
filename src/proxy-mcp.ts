@@ -13,9 +13,13 @@ import { pluginTmpDir } from "./tmp.js"
  * equivalents are disabled via --disallowedTools. Our handler blocks until
  * an external broker resolves the call, then responds to Claude.
  *
- * Wire protocol: JSON-RPC 2.0 over plain HTTP POST to `/mcp`. MCP spec
- * also supports SSE streaming, but Claude's HTTP transport accepts single
- * JSON responses for short-lived tool calls, so we keep it simple.
+ * Wire protocol: JSON-RPC 2.0 over plain HTTP POST to `/mcp`. Protocol
+ * methods (`initialize`, `tools/list`) and calls answered in-process get a
+ * single JSON reply. A broker-backed `tools/call` can block for as long as
+ * opencode takes to run the tool, so its reply is streamed: SSE when the
+ * client accepts it, otherwise a chunked JSON body whose headers go out at
+ * once and which carries keepalive whitespace until the result is ready
+ * (see `openEventStream` / `openJsonStream`).
  */
 
 export interface ProxyMcpServer {
@@ -32,6 +36,13 @@ export interface ProxyMcpServer {
   calls: EventEmitter
   /** Write `--mcp-config <path>`-compatible scratch file and return its path. */
   configPath(): string
+  /**
+   * Ids of the `tools/call` requests this server is still holding open.
+   * Read-only. An entry leaves this list only when its promise settles, so
+   * it is the direct evidence that a lifecycle event released the HTTP side
+   * of a call and not just the broker's entry for it.
+   */
+  pendingCallIds(): string[]
   close(): Promise<void>
 }
 
@@ -65,9 +76,11 @@ export interface ProxyToolCall {
 /**
  * Keep unanswered HTTP calls active independently of the tool deadline.
  * A held call timed out before delivery on CLI 2.1.258; with immediate
- * headers and these comments, the same 390-second hold completed.
+ * headers and these comments, the same 390-second hold completed. The same
+ * cadence drives the whitespace keepalive of a JSON-only reply: both must
+ * stay well under the ~300 s header/body timers in the CLI's HTTP client.
  */
-export const SSE_KEEPALIVE_MS = 15_000
+export const PROXY_KEEPALIVE_MS = 15_000
 
 /** True when the client advertised `text/event-stream` in Accept. */
 export function acceptsEventStream(acceptHeader: unknown): boolean {
@@ -118,21 +131,27 @@ export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
 // effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
 export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
 
-// Per-tool default deadlines, keyed by lowercase proxy tool name. `task`
-// dispatches an opencode subagent that routinely runs 20-40 min; the old
-// flat ceiling fired mid-subagent, made Claude believe its dispatch had
-// failed, and (because the proxy had already returned a timeout error) the
-// late subagent result was dropped on the floor -- the operator had to
-// nudge "please check now, it seems the task succeeded" (@jknlsn, live
-// session ses_0cfc0da6, 2026-07-05).
+/** A resolved deadline of 0 means the call waits until a lifecycle event
+ * releases it: a result, an abort, the next user turn's orphan sweep, the
+ * child closing, or the proxy server closing with its process. */
+export const PROXY_NO_DEADLINE_MS = 0
+
+// Per-tool default deadlines, keyed by lowercase proxy tool name. `task` and
+// `task_batch` dispatch opencode subagents, and the wall clock is the wrong
+// unit for those: a 10-min flat ceiling fired mid-subagent and dropped the
+// late result on the floor (@jknlsn, live session ses_0cfc0da6, 2026-07-05),
+// and a 60-min one did the same to any subagent that ran longer (@broskees'
+// dd494a8). So they carry no deadline at all: an abandoned task call is
+// released by the same lifecycle events that already release every other
+// call, and a positive `proxyToolTimeoutMs` override restores a backstop.
 //
 // `question` blocks on a human reading a TUI form, so the flat ceiling is
 // the wrong unit entirely: a question posed just before the operator steps
 // away would be rejected mid-answer. 30 min is jknlsn's original figure and
 // matches the "prefer fewer, high-signal questions" guidance in the def.
 export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
-  task: 60 * 60 * 1000, // 60 min
-  task_batch: 60 * 60 * 1000, // 60 min, same reasoning: it IS task calls
+  task: PROXY_NO_DEADLINE_MS,
+  task_batch: PROXY_NO_DEADLINE_MS, // same reasoning: it IS task calls
   question: 30 * 60 * 1000, // 30 min
 }
 
@@ -145,13 +164,19 @@ export const MAX_PROXY_TIMEOUT_MS = 2 ** 31 - 1
 /**
  * Resolve the proxy deadline for a tool call. Layers, most-specific last:
  *  1. flat default (`PROXY_DEFAULT_TIMEOUT_MS`, 10 min)
- *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`)
- *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key)
+ *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`; `task` and
+ *     `task_batch` have none)
+ *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key).
+ *     A positive value replaces the default, `0` disables the deadline for
+ *     that tool, and a negative or non-finite value is ignored.
  *  4. for `bash`, the call's own `input.timeout` -- the proxy must never
  *     undercut a build the caller explicitly asked to run long. The bash
  *     proxy def advertises a `timeout` field; before this fix the proxy
- *     ignored it and killed the call at the flat ceiling anyway.
+ *     ignored it and killed the call at the flat ceiling anyway. It only
+ *     ever raises, so it also turns a disabled bash deadline back into one.
  * Finally clamped to `MAX_PROXY_TIMEOUT_MS` to stay within Node's timer range.
+ * Returns `PROXY_NO_DEADLINE_MS` (0) when the call has no deadline; callers
+ * must not arm a timer for that value.
  */
 export function resolveProxyCallTimeoutMs(
   toolName: string,
@@ -162,13 +187,18 @@ export function resolveProxyCallTimeoutMs(
   let ms = PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS[key] ?? PROXY_DEFAULT_TIMEOUT_MS
   if (overrides) {
     const ov = lookupCaseInsensitive(overrides, key)
-    if (typeof ov === "number" && ov > 0) ms = ov
+    if (isDeadlineOverride(ov)) ms = ov
   }
   if (key === "bash") {
     const requested = input?.timeout
     if (typeof requested === "number" && requested > ms) ms = requested
   }
   return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+/** `0` (no deadline) or a positive finite number of milliseconds. */
+function isDeadlineOverride(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
 }
 
 function lookupCaseInsensitive(
@@ -188,7 +218,11 @@ function lookupCaseInsensitive(
  * client aborts each call at its 60-second default even while an opencode
  * subagent is still running (@broskees, PR #18). It must be >= the largest
  * server-side deadline or the client gives up before the broker does, so it
- * tracks the max of the flat default, per-tool defaults, and user overrides.
+ * tracks the max of every tool's effective deadline: the flat default, the
+ * per-tool defaults, and the user's overrides applied on top of them. A tool
+ * with no deadline needs the largest value the client accepts, because the
+ * CLI rejects `timeout: 0` in the MCP config outright (measured on the fork
+ * this came from, @broskees' dd494a8), and this is also Node's timer max.
  * (A bash call raising its own `input.timeout` above this ceiling is a known
  * edge; Claude CLI caps bash at 10 min anyway.)
  */
@@ -196,13 +230,19 @@ export function resolveProxyClientCeilingMs(
   overrides: Record<string, number> | undefined,
 ): number {
   let ms = PROXY_DEFAULT_TIMEOUT_MS
-  for (const v of Object.values(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
-    if (v > ms) ms = v
+  const consider = (deadlineMs: number): boolean => {
+    if (deadlineMs === PROXY_NO_DEADLINE_MS) return true
+    if (deadlineMs > ms) ms = deadlineMs
+    return false
   }
-  if (overrides) {
-    for (const v of Object.values(overrides)) {
-      if (typeof v === "number" && v > ms) ms = v
+  for (const [toolName, defaultMs] of Object.entries(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
+    const override = overrides ? lookupCaseInsensitive(overrides, toolName) : undefined
+    if (consider(isDeadlineOverride(override) ? override : defaultMs)) {
+      return MAX_PROXY_TIMEOUT_MS
     }
+  }
+  for (const value of Object.values(overrides ?? {})) {
+    if (isDeadlineOverride(value) && consider(value)) return MAX_PROXY_TIMEOUT_MS
   }
   return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
 }
@@ -251,8 +291,9 @@ export const TASK_PROXY_NOTE =
   " with a clear error. Foreground calls block until the subagent finishes;" +
   " set `background` to request opencode's background execution mode. For" +
   " two or more independent subagents in one response use task_batch, not" +
-  " several task calls: those run one after another. Task calls get a" +
-  " 60-minute proxy deadline by default (configurable via proxyToolTimeoutMs)."
+  " several task calls: those run one after another. Task calls have no" +
+  " proxy deadline by default: the call waits for the subagent to finish" +
+  " (a positive proxyToolTimeoutMs override adds a deadline)."
 
 /**
  * `task_batch`: one MCP call that opencode runs as N parallel `task` calls.
@@ -277,8 +318,9 @@ export const TASK_BATCH_PROXY_NOTE =
   " MCP tool calls one at a time, so separate task calls run serially even" +
   " when emitted together, while one task_batch call fans them out as" +
   " parallel opencode task calls. Each task takes the same fields as the" +
-  " task tool. Results come back in task order, each labelled. Same" +
-  " 60-minute proxy deadline as task (configurable via proxyToolTimeoutMs)."
+  " task tool. Results come back in task order, each labelled. Like task it" +
+  " has no proxy deadline by default (a positive proxyToolTimeoutMs override" +
+  " adds one)."
 
 export const TASK_INPUT_REQUIRED = ["description", "prompt", "subagent_type"]
 
@@ -731,9 +773,14 @@ export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
   timeoutOverrides?: Record<string, number>,
   interceptors?: Map<string, ProxyToolInterceptor>,
+  options: {
+    /** Keepalive cadence for streamed replies; a test seam, defaults to `PROXY_KEEPALIVE_MS`. */
+    keepaliveMs?: number
+  } = {},
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
+  const keepaliveMs = options.keepaliveMs ?? PROXY_KEEPALIVE_MS
 
   // Per-server bearer secret (256 bits). This endpoint executes Bash/Edit/
   // Write through opencode's executor, so an unauthenticated caller on
@@ -848,10 +895,10 @@ export async function createProxyMcpServer(
     // result that failed schema validation" (seen live 2026-07-04).
     let requestId: number | string | null = null
     let requestMethod: string | null = null
-    // Hoisted for the same reason: once SSE headers are out, an error must
-    // travel down the stream instead of through writeJson (which would try
-    // to set headers again and throw inside the catch).
-    let sse: EventStream | null = null
+    // Hoisted for the same reason: once a streamed reply's headers are out,
+    // an error must travel down that stream instead of through writeJson
+    // (which would try to set headers again and throw inside the catch).
+    let reply: ReplyStream | null = null
     try {
       const body = await readBody(req)
       const request = JSON.parse(body) as {
@@ -975,16 +1022,20 @@ export async function createProxyMcpServer(
           sse: acceptsEventStream(req.headers.accept),
         })
 
-        // Broker-backed calls can block for an hour on a subagent. Use SSE when the
-        // client accepts one: headers and a comment go out now, keepalive
-        // comments follow, and the JSON-RPC result is the final event. A
-        // client that only accepts JSON gets the old single-shot reply.
+        // Broker-backed calls can block for as long as a subagent runs. The
+        // reply is streamed either way so the client's own HTTP timers never
+        // fire on a silent connection: SSE when the client accepts it
+        // (headers and a comment now, keepalive comments, the JSON-RPC result
+        // as the final event), otherwise a chunked JSON body whose headers go
+        // out now and which carries keepalive whitespace until the result.
+        // Every guard above has already run, so nothing is flushed for an
+        // unauthenticated peer, an unknown tool, or a rejected batch.
         const channel: ProxyCallChannel = { closed: false }
-        if (acceptsEventStream(req.headers.accept)) {
-          sse = openEventStream(res)
-        }
+        reply = acceptsEventStream(req.headers.accept)
+          ? openEventStream(res, keepaliveMs)
+          : openJsonStream(res, keepaliveMs)
         res.once("close", () => {
-          sse?.stop()
+          reply?.stop()
           if (res.writableFinished) return
           channel.closed = true
           log.notice("proxy-mcp client closed a tool call before its result", {
@@ -1010,20 +1061,25 @@ export async function createProxyMcpServer(
               input,
               timeoutOverrides,
             )
-            timer = setTimeout(() => {
-              if (!pending.has(callId)) return
-              pending.delete(callId)
-              // v0.4.13: demoted from warn to notice. Timeouts are usually
-              // permission-pending while the user is AFK — surfacing each as
-              // a yellow UI bubble produces a wall of noise on return. The
-              // file log still captures the event for diagnostics.
-              log.notice("proxy-mcp tool call timed out", {
-                callId,
-                toolName,
-                deadlineMs,
-              })
-              reject(buildProxyTimeoutError(toolName, deadlineMs))
-            }, deadlineMs)
+            // No deadline means no timer at all: `setTimeout(fn, 0)` would
+            // reject the call on the next tick. The broker applies the same
+            // rule to the same resolved value, so the two layers agree.
+            if (deadlineMs > PROXY_NO_DEADLINE_MS) {
+              timer = setTimeout(() => {
+                if (!pending.has(callId)) return
+                pending.delete(callId)
+                // v0.4.13: demoted from warn to notice. Timeouts are usually
+                // permission-pending while the user is AFK — surfacing each as
+                // a yellow UI bubble produces a wall of noise on return. The
+                // file log still captures the event for diagnostics.
+                log.notice("proxy-mcp tool call timed out", {
+                  callId,
+                  toolName,
+                  deadlineMs,
+                })
+                reject(buildProxyTimeoutError(toolName, deadlineMs))
+              }, deadlineMs)
+            }
             calls.emit("call", entry)
           },
         ).finally(() => {
@@ -1040,7 +1096,7 @@ export async function createProxyMcpServer(
           })
           return
         }
-        writeToolCallResult(res, requestId, result, sse)
+        writeToolCallResult(res, requestId, result, reply)
         return
       }
 
@@ -1065,7 +1121,7 @@ export async function createProxyMcpServer(
             res,
             requestId,
             { kind: "error", message: errorMessage },
-            sse,
+            reply,
           )
         } catch {
           try {
@@ -1160,6 +1216,9 @@ export async function createProxyMcpServer(
       fs.writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 })
       configFilePath = outPath
       return outPath
+    },
+    pendingCallIds() {
+      return [...pending.keys()]
     },
     async close() {
       for (const entry of pending.values()) {
@@ -1272,7 +1331,7 @@ function writeToolCallResult(
   res: ServerResponse,
   requestId: unknown,
   result: ProxyToolResult,
-  sse: EventStream | null = null,
+  reply: ReplyStream | null = null,
 ): void {
   const text = result.kind === "error" ? result.message : result.text
   const isError = result.kind === "error" || result.isError === true
@@ -1284,39 +1343,39 @@ function writeToolCallResult(
       isError,
     },
   }
-  if (sse) {
-    sse.finish(envelope)
+  if (reply) {
+    reply.finish(envelope)
     return
   }
   writeJson(res, envelope)
 }
 
 /**
- * An in-flight SSE reply. `finish` writes the JSON-RPC response as the
- * single `message` event and ends the stream, which is what the MCP
- * Streamable HTTP client expects for a request answered over SSE.
+ * An in-flight streamed reply whose headers are already on the wire.
+ * `finish` writes the JSON-RPC response and ends the body; `stop` only
+ * cancels the keepalive, for when the client went away first.
  */
-interface EventStream {
+interface ReplyStream {
   finish(envelope: unknown): void
   stop(): void
 }
 
-function openEventStream(res: ServerResponse): EventStream {
-  res.statusCode = 200
-  res.setHeader("Content-Type", "text/event-stream")
-  res.setHeader("Cache-Control", "no-cache, no-transform")
-  res.setHeader("Connection", "keep-alive")
-  res.flushHeaders()
-  // Start the response body without waiting for the tool result.
-  res.write(": open\n\n")
+/**
+ * Write `ping` every `keepaliveMs` until stopped or the response is gone.
+ * Never keeps the host process alive on its own.
+ */
+function startKeepalive(
+  res: ServerResponse,
+  keepaliveMs: number,
+  ping: string,
+): () => void {
   let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
     if (res.writableEnded || res.destroyed) {
       stop()
       return
     }
-    res.write(": keepalive\n\n")
-  }, SSE_KEEPALIVE_MS)
-  // Never keep the host process alive for a keepalive alone.
+    res.write(ping)
+  }, keepaliveMs)
   timer.unref?.()
   const stop = () => {
     if (timer) {
@@ -1324,12 +1383,54 @@ function openEventStream(res: ServerResponse): EventStream {
       timer = null
     }
   }
+  return stop
+}
+
+/**
+ * SSE reply: the JSON-RPC response goes out as the single `message` event,
+ * which is what the MCP Streamable HTTP client expects for a request
+ * answered over SSE.
+ */
+function openEventStream(res: ServerResponse, keepaliveMs: number): ReplyStream {
+  res.statusCode = 200
+  res.setHeader("Content-Type", "text/event-stream")
+  res.setHeader("Cache-Control", "no-cache, no-transform")
+  res.setHeader("Connection", "keep-alive")
+  res.flushHeaders()
+  // Start the response body without waiting for the tool result.
+  res.write(": open\n\n")
+  const stop = startKeepalive(res, keepaliveMs, ": keepalive\n\n")
   return {
     stop,
     finish(envelope) {
       stop()
       if (res.writableEnded || res.destroyed) return
       res.end(`event: message\ndata: ${JSON.stringify(envelope)}\n\n`)
+    },
+  }
+}
+
+/**
+ * JSON reply for a client that did not ask for SSE (@broskees' 68ed142,
+ * adapted). Headers are flushed at once, which stops the client's header
+ * timer, and whitespace is written on the keepalive cadence, which stops its
+ * body timer. There is no `Content-Length`, so the body is chunked, and the
+ * envelope is written last: whitespace before a JSON value is insignificant
+ * (RFC 8259), so the whole body still parses as the one JSON-RPC response,
+ * on success and on error alike.
+ */
+function openJsonStream(res: ServerResponse, keepaliveMs: number): ReplyStream {
+  res.statusCode = 200
+  res.setHeader("Content-Type", "application/json")
+  res.setHeader("Cache-Control", "no-cache, no-transform")
+  res.flushHeaders()
+  const stop = startKeepalive(res, keepaliveMs, " ")
+  return {
+    stop,
+    finish(envelope) {
+      stop()
+      if (res.writableEnded || res.destroyed) return
+      res.end(JSON.stringify(envelope))
     },
   }
 }

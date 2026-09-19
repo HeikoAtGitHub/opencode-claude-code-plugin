@@ -19,9 +19,10 @@ import {
   rejectAllPendingProxyCallsForSession,
   isPendingProxyCallChannelClosed,
   markPendingProxyCallEmitted,
+  snapshotPendingProxyCalls,
   type PendingProxyCall,
 } from "./src/proxy-broker.js"
-import type { ProxyToolCall, ProxyToolResult } from "./src/proxy-mcp.js"
+import { PROXY_NO_DEADLINE_MS, type ProxyToolCall, type ProxyToolResult } from "./src/proxy-mcp.js"
 
 type CallHandle = {
   id: string
@@ -223,6 +224,33 @@ test("queuePendingProxyCall: task timeout text warns against scheduling a wake-u
   queuePendingProxyCall(sk, a.call, { task: 40 })
 
   await assert.rejects(a.promise, /wake-up/)
+})
+
+test("queuePendingProxyCall: a call with no deadline arms no timer and stays pending", async () => {
+  // `task` has no default deadline. The broker must not turn 0 into a
+  // zero-delay timer (which would reject on the next tick); the call waits
+  // until a lifecycle event releases it.
+  const sk = `sk-no-deadline-${Date.now()}`
+  const a = makeCall("task")
+  queuePendingProxyCall(sk, a.call)
+  const b = makeCall("bash")
+  queuePendingProxyCall(sk, b.call, { bash: 0 })
+
+  await new Promise((r) => setTimeout(r, 60))
+  assert.equal(a.rejected, false, "task must not time out")
+  assert.equal(b.rejected, false, "a 0 override disables the bash deadline")
+  const snapshot = snapshotPendingProxyCalls().filter((c) => c.sessionKey === sk)
+  assert.deepEqual(
+    snapshot.map((c) => c.deadlineMs),
+    [PROXY_NO_DEADLINE_MS, PROXY_NO_DEADLINE_MS],
+    "the doctor sees 0 as the deadline",
+  )
+
+  // The next user turn's orphan sweep is one such lifecycle event.
+  assert.equal(rejectAllPendingProxyCallsForSession(sk, new Error("orphaned")), 2)
+  await assert.rejects(a.promise, /orphaned/)
+  await assert.rejects(b.promise, /orphaned/)
+  assert.equal(getPendingProxyCalls(sk).length, 0)
 })
 
 test("queuePendingProxyCall: bash input.timeout keeps the call alive past a shorter override", async () => {

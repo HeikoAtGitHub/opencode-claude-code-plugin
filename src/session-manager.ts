@@ -4,8 +4,12 @@ import { randomUUID } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { unlink } from "node:fs/promises"
 import { log } from "./logger.js"
-import type { ProxyMcpServer, ProxyToolResult } from "./proxy-mcp.js"
-import { getPendingProxyCalls, type PendingProxyCall } from "./proxy-broker.js"
+import { SERVER_CLOSED_MESSAGE, type ProxyMcpServer, type ProxyToolResult } from "./proxy-mcp.js"
+import {
+  getPendingProxyCalls,
+  rejectAllPendingProxyCallsForSession,
+  type PendingProxyCall,
+} from "./proxy-broker.js"
 import { clearLedger } from "./todo-ledger.js"
 import { clearExitPlanModeQuestions, hasExitPlanModeQuestions } from "./plan-mode-question.js"
 import { clearCompression } from "./compression-store.js"
@@ -162,12 +166,34 @@ const claudeSessions = new Map<string, string>()
 const idleEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const MAX_IDLE_TIMEOUT_MS = 2_147_483_647
 
+/**
+ * Idle eviction is on by default (30 min, @broskees' 68ed142 reaper figure).
+ * An idle `claude --print` holds roughly 250 MB resident, and LRU pressure
+ * alone never frees one: a user who opens a few chats and walks away keeps
+ * every one of them alive for as long as opencode runs. The Claude session id
+ * survives eviction, so the next turn resumes the same conversation. An
+ * explicit `idleProcessTimeoutMs: 0` keeps workers until LRU eviction.
+ */
+export const DEFAULT_IDLE_PROCESS_TIMEOUT_MS = 30 * 60_000
+
+/** The idle timeout a caller-facing option resolves to: unset means the default. */
+export function resolveIdleProcessTimeoutMs(configured: number | undefined): number {
+  return configured === undefined ? DEFAULT_IDLE_PROCESS_TIMEOUT_MS : configured
+}
+
 // Cap on live CLI subprocesses. Session-affinity-keyed entries accumulate
 // one-per-chat, so an unbounded map would leak processes as users open new
-// chats. This caps at a reasonable working-set and evicts the oldest.
-export const MAX_ACTIVE_PROCESSES = 16
+// chats. This caps at a reasonable working-set and evicts the oldest idle
+// one. Kept modest (8, from @broskees' 68ed142; it was 16) because the idle
+// timer above does the real work; this is the backstop for a burst of chats
+// inside one idle window, and it never takes a process that is mid-turn.
+export const MAX_ACTIVE_PROCESSES = 8
 const PROCESS_EXIT_TIMEOUT_MS = 1_500
 const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
+/** Same wording the attached turn's close handler uses, so one log line
+ * shape covers a child that died mid-turn and one that died between turns. */
+export const CHILD_EXITED_MESSAGE =
+  "Claude CLI subprocess closed before pending tool calls were resolved"
 
 function envFlagEnabled(value: string | undefined): boolean {
   if (value === undefined) return false
@@ -392,9 +418,13 @@ export function setActiveProcess(key: string, ap: ActiveProcess): void {
 
 /**
  * Evict a headless Claude worker after a completed turn has stayed idle.
- * Reusing the worker through `getActiveProcess` cancels the timer. The
- * Claude session id is intentionally retained so the next turn can continue
- * the same conversation via `--resume`.
+ * Armed by the turn's `completeResult`, so the clock starts when a turn
+ * finishes, not when the child was spawned. Reusing the worker through
+ * `getActiveProcess` cancels the timer. The Claude session id is
+ * intentionally retained so the next turn can continue the same conversation
+ * via `--resume`. A process found mid-turn when the timer fires (a recovered
+ * continuation, an auto-continue, a late tool result) is not evicted; the
+ * timer is re-armed instead, the same rule the LRU cap follows.
  */
 export function scheduleIdleProcessEviction(
   key: string,
@@ -416,6 +446,11 @@ export function scheduleIdleProcessEviction(
   const timer = setTimeout(() => {
     idleEvictionTimers.delete(key)
     if (activeProcesses.get(key) !== scheduledProcess) return
+    if (isTurnInFlight(scheduledProcess)) {
+      log.info("idle timer found a turn in flight; re-arming", { sessionKey: key, timeoutMs })
+      scheduleIdleProcessEviction(key, timeoutMs)
+      return
+    }
     log.info("evicting idle claude process", { sessionKey: key, timeoutMs })
     deleteActiveProcess(key)
   }, timeoutMs)
@@ -423,13 +458,82 @@ export function scheduleIdleProcessEviction(
   idleEvictionTimers.set(key, timer)
 }
 
+/** Whether an idle-eviction timer is armed for the key (read-only, for tests). */
+export function isIdleProcessEvictionScheduled(key: string): boolean {
+  return idleEvictionTimers.has(key)
+}
+
 function detachActiveProcess(key: string): ActiveProcess | undefined {
   cancelIdleProcessEviction(key)
   const ap = activeProcesses.get(key)
   if (!ap) return undefined
   activeProcesses.delete(key)
-  void ap.proxyServer?.close()
+  if (ap.proxyServer) {
+    void ap.proxyServer.close()
+    // The server's close already answered every open HTTP request with an
+    // error; the broker's entries for them can never be resolved to anyone
+    // now, and a `task` call has no deadline that would otherwise reap them.
+    rejectAllPendingProxyCallsForSession(key, new Error(SERVER_CLOSED_MESSAGE))
+  }
   return ap
+}
+
+/**
+ * Release everything this plugin holds for one opencode session that was
+ * deleted: its live `claude` children (any model, effort, or compaction
+ * spawn), the remembered Claude session ids, and per-session state. Unlike
+ * idle eviction this is a real deletion, so nothing is kept for a resume.
+ * The `"default"` affinity is the shared bucket used when no session id is
+ * known and is deliberately never matched. Returns the released keys.
+ */
+export function deleteActiveProcessesForSession(sessionID: string): string[] {
+  if (!sessionID || sessionID === "default") return []
+  const released: string[] = []
+  for (const [key, ap] of [...activeProcesses]) {
+    const owned =
+      ap.opencodeSessionID === sessionID || describeSessionKey(key).session === sessionID
+    if (!owned) continue
+    log.info("releasing claude process for deleted session", { sessionKey: key, sessionID })
+    void deleteActiveProcessAndWait(key)
+    released.push(key)
+  }
+  // Session ids and per-session state can outlive their process (idle
+  // eviction keeps them for `--resume`); a deleted session never resumes.
+  for (const key of [...claudeSessions.keys()]) {
+    if (describeSessionKey(key).session !== sessionID) continue
+    deleteClaudeSessionId(key)
+    clearCompression(key)
+    if (!released.includes(key)) released.push(key)
+  }
+  return released
+}
+
+/**
+ * Synchronous best-effort sweep for host process exit. Node does not kill
+ * children on exit, so without this a hard opencode shutdown reparents every
+ * live `claude` to init. Must stay sync: `process.on("exit")` runs no async
+ * work. Session ids are left alone; the process is going away with them.
+ */
+export function killAllActiveProcesses(): string[] {
+  const keys = [...activeProcesses.keys()]
+  for (const key of keys) deleteActiveProcess(key)
+  return keys
+}
+
+let processExitCleanupWired = false
+
+/**
+ * Arm `killAllActiveProcesses` for host process exit, once per process. The
+ * plugin entry can run more than once (tests, account expansion), and each
+ * run must not add another `exit` listener. Returns whether this call armed it.
+ */
+export function ensureProcessExitCleanup(): boolean {
+  if (processExitCleanupWired) return false
+  processExitCleanupWired = true
+  process.once("exit", () => {
+    killAllActiveProcesses()
+  })
+  return true
 }
 
 export function deleteActiveProcess(key: string): void {
@@ -636,6 +740,16 @@ export function spawnClaudeProcess(
     if (ownsSessionKey) {
       cancelIdleProcessEviction(sessionKey)
       activeProcesses.delete(sessionKey)
+      // The child is the only thing that could still consume these calls'
+      // results. A turn that is attached rejects them from its own close
+      // handler; this covers a child that dies between turns, which no
+      // deadline would otherwise reap now that `task` has none.
+      if (getPendingProxyCalls(sessionKey).length > 0) {
+        rejectAllPendingProxyCallsForSession(
+          sessionKey,
+          new Error(CHILD_EXITED_MESSAGE),
+        )
+      }
     }
     if (ownsSessionKey && code !== 0 && code !== null) {
       log.info("process exited with error, clearing session", {
@@ -721,6 +835,13 @@ export function appendResumeIfNeeded(
  * `spawnClaudeProcess`. `claudeSessions` is left intact so the respawn can
  * add `--resume` (see `appendResumeIfNeeded`).
  *
+ * The respawn happens in the middle of the same logical turn, and the caller
+ * re-sends that turn's envelope at once. Turn state lives on the
+ * `ActiveProcess`, so the replacement inherits the old process's in-flight
+ * marker (@broskees' b719497); without that handoff abort, LRU eviction, the
+ * idle timer and the next turn's quiesce all mistake the busy replacement
+ * for an idle process.
+ *
  * Returns the new `ActiveProcess`, or `undefined` if there was no active
  * process for the key (caller should treat that as "nothing to respawn").
  */
@@ -733,6 +854,7 @@ export function respawnActiveProcess(
 ): ActiveProcess | undefined {
   const old = activeProcesses.get(sessionKey)
   if (!old) return undefined
+  const turnWasInFlight = isTurnInFlight(old)
   activeProcesses.delete(sessionKey)
   // Silence the old exit handler so it doesn't close the proxy server,
   // unlink the system-prompt file, or touch claudeSessions on its way out
@@ -755,6 +877,7 @@ export function respawnActiveProcess(
   )
   replacement.pendingProxyCompletions = old.pendingProxyCompletions
   delete old.pendingProxyCompletions
+  if (turnWasInFlight) noteTurnStarted(replacement)
   return replacement
 }
 

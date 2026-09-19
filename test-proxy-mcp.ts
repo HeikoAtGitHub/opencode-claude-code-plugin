@@ -26,7 +26,9 @@ import {
   TASK_BATCH_TOOL_NAME,
   DEFAULT_PROXY_TOOLS,
   PROXY_DEFAULT_TIMEOUT_MS,
+  PROXY_NO_DEADLINE_MS,
   MAX_PROXY_TIMEOUT_MS,
+  SERVER_CLOSED_MESSAGE,
   type ProxyMcpServer,
   type ProxyToolCall,
   type ProxyToolResult,
@@ -236,22 +238,54 @@ test("resolveProxyCallTimeoutMs: unknown tool uses the flat 10-min default", () 
   )
 })
 
-test("resolveProxyCallTimeoutMs: task defaults to 60 min", () => {
-  assert.equal(resolveProxyCallTimeoutMs("task", undefined, undefined), 60 * MIN)
+test("resolveProxyCallTimeoutMs: task and task_batch have no deadline by default", () => {
+  // A subagent runs as long as it runs; the call waits for it. Abandoned
+  // calls are released by lifecycle events, not by the clock.
+  assert.equal(resolveProxyCallTimeoutMs("task", undefined, undefined), PROXY_NO_DEADLINE_MS)
+  assert.equal(
+    resolveProxyCallTimeoutMs(TASK_BATCH_TOOL_NAME, undefined, undefined),
+    PROXY_NO_DEADLINE_MS,
+  )
+  assert.equal(PROXY_NO_DEADLINE_MS, 0)
 })
 
-test("resolveProxyClientCeilingMs covers the largest deadline", () => {
-  // No overrides: ceiling is the biggest per-tool default (task, 60 min).
-  assert.equal(resolveProxyClientCeilingMs(undefined), 60 * MIN)
-  // Overrides above the defaults raise the ceiling so Claude's HTTP MCP
-  // client never aborts before the broker deadline fires.
-  assert.equal(resolveProxyClientCeilingMs({ task: 90 * MIN }), 90 * MIN)
-  // Overrides below the defaults do not lower it.
-  assert.equal(resolveProxyClientCeilingMs({ bash: 1 * MIN }), 60 * MIN)
-  // Absurd values are clamped to Node's timer max.
+test("resolveProxyCallTimeoutMs: a 0 override disables a tool's deadline", () => {
+  assert.equal(resolveProxyCallTimeoutMs("edit", undefined, { edit: 0 }), 0)
+  assert.equal(resolveProxyCallTimeoutMs("question", undefined, { Question: 0 }), 0)
+})
+
+test("resolveProxyClientCeilingMs covers the largest effective deadline", () => {
+  // No overrides: task has no deadline, and the CLI rejects `timeout: 0`,
+  // so the client ceiling is the largest value it (and Node's timers) accept.
+  assert.equal(resolveProxyClientCeilingMs(undefined), MAX_PROXY_TIMEOUT_MS)
+  // Once every unlimited tool has a positive override, the ceiling tracks
+  // the largest effective deadline so Claude's HTTP MCP client never aborts
+  // before the broker deadline fires.
   assert.equal(
-    resolveProxyClientCeilingMs({ task: 2 ** 40 }),
+    resolveProxyClientCeilingMs({ task: 90 * MIN, task_batch: 90 * MIN }),
+    90 * MIN,
+  )
+  // ...and it is the per-tool default that counts when it is the largest.
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 5 * MIN, task_batch: 5 * MIN, bash: 1 * MIN }),
+    30 * MIN,
+  )
+  // One unlimited tool is enough to need the maximum: overriding `task`
+  // alone leaves `task_batch` without a deadline.
+  assert.equal(resolveProxyClientCeilingMs({ task: 90 * MIN }), MAX_PROXY_TIMEOUT_MS)
+  // A 0 override on any tool does the same.
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 5 * MIN, task_batch: 5 * MIN, bash: 0 }),
     MAX_PROXY_TIMEOUT_MS,
+  )
+  // Absurd values are clamped to Node's timer max; invalid ones are ignored.
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 2 ** 40, task_batch: 2 ** 40 }),
+    MAX_PROXY_TIMEOUT_MS,
+  )
+  assert.equal(
+    resolveProxyClientCeilingMs({ task: 5 * MIN, task_batch: 5 * MIN, bash: -1, edit: NaN }),
+    30 * MIN,
   )
 })
 
@@ -295,20 +329,38 @@ test("resolveProxyCallTimeoutMs: bash input.timeout only ever raises", () => {
 })
 
 test("resolveProxyCallTimeoutMs: invalid overrides are ignored", () => {
-  // 0 / negative / NaN must not replace the default — a misformed config
-  // entry should never collapse the deadline.
+  // Negative / NaN / Infinity must not replace the default: a misformed
+  // config entry should never collapse a deadline, nor silently remove one.
   assert.equal(
-    resolveProxyCallTimeoutMs("task", undefined, { task: 0 }),
-    60 * MIN,
+    resolveProxyCallTimeoutMs("edit", undefined, { edit: -100 }),
+    PROXY_DEFAULT_TIMEOUT_MS,
   )
   assert.equal(
-    resolveProxyCallTimeoutMs("task", undefined, { task: -100 }),
-    60 * MIN,
+    resolveProxyCallTimeoutMs("edit", undefined, { edit: NaN as any }),
+    PROXY_DEFAULT_TIMEOUT_MS,
   )
   assert.equal(
-    resolveProxyCallTimeoutMs("task", undefined, { task: NaN as any }),
-    60 * MIN,
+    resolveProxyCallTimeoutMs("edit", undefined, { edit: Infinity }),
+    PROXY_DEFAULT_TIMEOUT_MS,
   )
+  assert.equal(
+    resolveProxyCallTimeoutMs("question", undefined, { question: -1 }),
+    30 * MIN,
+  )
+  assert.equal(
+    resolveProxyCallTimeoutMs("task", undefined, { task: "60" as any }),
+    PROXY_NO_DEADLINE_MS,
+  )
+})
+
+test("resolveProxyCallTimeoutMs: a bash input.timeout restores a deadline the override disabled", () => {
+  // The floor only ever raises, and a disabled deadline is the lowest value
+  // there is, so the caller's own timeout wins over `bash: 0`.
+  assert.equal(
+    resolveProxyCallTimeoutMs("bash", { timeout: 30_000 }, { bash: 0 }),
+    30_000,
+  )
+  assert.equal(resolveProxyCallTimeoutMs("bash", undefined, { bash: 0 }), 0)
 })
 
 test("resolveProxyCallTimeoutMs: absurd values are clamped to Node's timer max", () => {
@@ -415,10 +467,215 @@ test("question gets a 30-min default deadline (a human has to read the form)", (
   )
 })
 
-test("resolveProxyClientCeilingMs covers the longest per-tool default", () => {
-  // The ceiling is written into Claude's --mcp-config entry; if it were
-  // below task's 60 min the client would abort before the broker resolved.
-  assert.ok(resolveProxyClientCeilingMs(undefined) >= 60 * MIN)
+test("resolveProxyClientCeilingMs is always a positive, timer-safe value", () => {
+  // The ceiling is written into Claude's --mcp-config entry. It can never be
+  // 0 (the CLI rejects the server config) and never above Node's timer max,
+  // whatever the overrides say.
+  for (const overrides of [undefined, {}, { task: 0 }, { task: 2 ** 40 }, { bash: 1 }]) {
+    const ceiling = resolveProxyClientCeilingMs(overrides)
+    assert.ok(ceiling > 0, `ceiling must be positive for ${JSON.stringify(overrides)}`)
+    assert.ok(ceiling <= MAX_PROXY_TIMEOUT_MS)
+    assert.ok(ceiling >= 30 * MIN, "never below the longest positive per-tool default")
+  }
+})
+
+test("tools/call with no deadline stays pending instead of timing out on the next tick", async () => {
+  // A zero deadline must mean "no timer", not `setTimeout(fn, 0)`: the
+  // latter rejects the call immediately with "timed out after 0ms".
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS)
+  try {
+    let settled: string | null = null
+    const callReceived = new Promise<void>((resolve) => srv.calls.once("call", () => resolve()))
+    const response = authedPost(srv, {
+      jsonrpc: "2.0",
+      id: "unlimited-1",
+      method: "tools/call",
+      params: {
+        name: "task",
+        arguments: { description: "x", subagent_type: "general", prompt: "y" },
+      },
+    }).then((res) => {
+      settled = String(res.json.result.content[0].text)
+      return res
+    })
+    await callReceived
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(settled, null, "an unlimited call must not be rejected by a timer")
+    // Closing the server is one of the lifecycle events that releases it.
+    await srv.close()
+    const res = await response
+    assert.equal(res.json.id, "unlimited-1")
+    assert.equal(res.json.result.isError, true)
+    assert.equal(res.json.result.content[0].text, SERVER_CLOSED_MESSAGE)
+  } finally {
+    await srv.close()
+  }
+})
+
+// --- JSON-only long calls -----------------------------------------------------
+//
+// Claude's MCP client used to abandon a silent JSON reply at its own HTTP
+// timers (~300 s) whatever the per-tool deadline said. SSE clients got
+// immediate headers and keepalive comments in 0.15.0; a client that only
+// accepts JSON now gets the same liveness as a chunked JSON body.
+
+/** POST and hand back the response as soon as its headers arrive. */
+function openPost(
+  srv: ProxyMcpServer,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<http.IncomingMessage> {
+  const payload = JSON.stringify(body)
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      srv.url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload).toString(),
+          Authorization: `Bearer ${srv.authToken}`,
+          ...extraHeaders,
+        },
+      },
+      resolve,
+    )
+    req.on("error", reject)
+    req.end(payload)
+  })
+}
+
+function readAll(res: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    res.on("data", (c: Buffer) => chunks.push(c))
+    res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+    res.on("error", reject)
+  })
+}
+
+test("a JSON-only tools/call gets its headers and keepalive whitespace before the result", async () => {
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS, undefined, undefined, { keepaliveMs: 20 })
+  try {
+    let call: ProxyToolCall | undefined
+    srv.calls.once("call", (c: ProxyToolCall) => { call = c })
+    const res = await openPost(srv, {
+      jsonrpc: "2.0",
+      id: "json-keepalive-1",
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "sleep 600" } },
+    })
+    // Headers are in hand while the call is still pending, with no
+    // Content-Length: chunked is what lets whitespace precede the result.
+    assert.equal(res.statusCode, 200)
+    assert.match(String(res.headers["content-type"]), /^application\/json/)
+    assert.equal(res.headers["content-length"], undefined)
+    assert.equal(res.headers["transfer-encoding"], "chunked")
+    assert.ok(call, "the call reached the broker before the reply finished")
+
+    const chunks: string[] = []
+    res.setEncoding("utf8")
+    res.on("data", (chunk: string) => chunks.push(chunk))
+    await new Promise((r) => setTimeout(r, 90))
+    assert.ok(
+      chunks.length > 0 && chunks.every((chunk) => chunk.trim() === ""),
+      `expected only keepalive whitespace before the result, got ${JSON.stringify(chunks)}`,
+    )
+
+    call!.resolve({ kind: "text", text: "late but fine" })
+    await new Promise<void>((resolve) => res.once("end", resolve))
+    const parsed = JSON.parse(chunks.join(""))
+    assert.equal(parsed.id, "json-keepalive-1")
+    assert.equal(parsed.result.isError, false)
+    assert.equal(parsed.result.content[0].text, "late but fine")
+  } finally {
+    await srv.close()
+  }
+})
+
+test("a JSON-only tools/call that fails after its headers went out still ends as valid JSON", async () => {
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS, undefined, undefined, { keepaliveMs: 10 })
+  try {
+    srv.calls.once("call", (c: ProxyToolCall) => {
+      setTimeout(() => c.reject(new Error("simulated late broker rejection")), 40)
+    })
+    const res = await openPost(srv, {
+      jsonrpc: "2.0",
+      id: "json-keepalive-err",
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "false" } },
+    })
+    assert.equal(res.statusCode, 200)
+    const body = await readAll(res)
+    assert.match(body, /^\s+\{/, "keepalive whitespace precedes the envelope")
+    const parsed = JSON.parse(body)
+    assert.equal(parsed.id, "json-keepalive-err")
+    assert.equal(parsed.error, undefined, "still an MCP result, never a JSON-RPC error envelope")
+    assert.equal(parsed.result.isError, true)
+    assert.match(parsed.result.content[0].text, /simulated late broker rejection/)
+  } finally {
+    await srv.close()
+  }
+})
+
+test("a JSON-only client that hangs up stops its keepalive and the result is dropped, not thrown", async () => {
+  const srv = await createProxyMcpServer(DEFAULT_PROXY_TOOLS, undefined, undefined, { keepaliveMs: 10 })
+  try {
+    const callReceived = new Promise<ProxyToolCall>((resolve) => srv.calls.once("call", resolve))
+    const res = await openPost(srv, {
+      jsonrpc: "2.0",
+      id: "json-keepalive-gone",
+      method: "tools/call",
+      params: { name: "bash", arguments: { command: "sleep 600" } },
+    })
+    const call = await callReceived
+    assert.equal(call.channel?.closed, false)
+    res.destroy()
+    await new Promise((r) => setTimeout(r, 50))
+    // The reply channel is what the language model reads before answering;
+    // the entry itself stays so a late result can still be recovered.
+    assert.equal(call.channel?.closed, true)
+    // Resolving now must not throw into the server (no write to a dead socket).
+    call.resolve({ kind: "text", text: "nobody is listening" })
+    await new Promise((r) => setTimeout(r, 30))
+  } finally {
+    await srv.close()
+  }
+})
+
+test("protocol methods keep the single-shot JSON reply with a Content-Length", async () => {
+  // Only broker-backed tools/call replies are streamed; initialize and
+  // tools/list are answered in one write as before.
+  await withServer(async (srv) => {
+    for (const body of [
+      { jsonrpc: "2.0", id: "init", method: "initialize", params: {} },
+      { jsonrpc: "2.0", id: "list", method: "tools/list" },
+    ]) {
+      const res = await openPost(srv, body)
+      assert.equal(res.statusCode, 200)
+      assert.ok(res.headers["content-length"], `${body.method} must carry a Content-Length`)
+      assert.equal(res.headers["transfer-encoding"], undefined)
+      const parsed = JSON.parse(await readAll(res))
+      assert.equal(parsed.id, body.id)
+      assert.ok(parsed.result)
+    }
+  })
+})
+
+test("an SSE client still gets the event-stream reply", async () => {
+  await withServer(async (srv) => {
+    srv.calls.once("call", (c: ProxyToolCall) => c.resolve({ kind: "text", text: "over sse" }))
+    const res = await openPost(
+      srv,
+      { jsonrpc: "2.0", id: "sse-1", method: "tools/call", params: { name: "bash", arguments: { command: "true" } } },
+      { Accept: "application/json, text/event-stream" },
+    )
+    assert.match(String(res.headers["content-type"]), /^text\/event-stream/)
+    const body = await readAll(res)
+    const data = body.split("\n").find((line) => line.startsWith("data: "))
+    assert.ok(data, "SSE reply carries the JSON-RPC result as a data line")
+    assert.equal(JSON.parse(data!.slice(6)).result.content[0].text, "over sse")
+  })
 })
 
 test("filterQuestionProxyByOpencodeSupport drops the def on older opencode", () => {
@@ -912,7 +1169,10 @@ test("task_batch input validation names the first problem", () => {
 })
 
 test("task_batch shares the task deadline and its timeout guidance", () => {
-  assert.equal(resolveProxyCallTimeoutMs(TASK_BATCH_TOOL_NAME, undefined, undefined), 60 * MIN)
+  assert.equal(
+    resolveProxyCallTimeoutMs(TASK_BATCH_TOOL_NAME, undefined, undefined),
+    resolveProxyCallTimeoutMs("task", undefined, undefined),
+  )
   assert.equal(resolveProxyCallTimeoutMs("Task_Batch", undefined, { task_batch: 5 * MIN }), 5 * MIN)
   const err = buildProxyTimeoutError(TASK_BATCH_TOOL_NAME, 1234)
   assert.match(err.message, /timed out after 1234ms waiting for opencode to resolve/)

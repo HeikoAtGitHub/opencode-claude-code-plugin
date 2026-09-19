@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events"
 import {
   buildProxyTimeoutError,
+  PROXY_NO_DEADLINE_MS,
   resolveProxyCallTimeoutMs,
   type ProxyCallChannel,
   type ProxyToolCall,
@@ -29,8 +30,10 @@ export interface PendingProxyCall {
 
 type InternalPending = PendingProxyCall & {
   createdAt: number
+  /** `PROXY_NO_DEADLINE_MS` (0) when the call has no deadline. */
   deadlineMs: number
-  timer: ReturnType<typeof setTimeout>
+  /** Absent when the call has no deadline. */
+  timer: ReturnType<typeof setTimeout> | null
   resolve(result: ProxyToolResult): void
   reject(error: Error): void
 }
@@ -94,7 +97,7 @@ export function queuePendingProxyCall(
   // entries for the same id.
   const previous = pendingByCallId.get(call.id)
   if (previous) {
-    clearTimeout(previous.timer)
+    if (previous.timer) clearTimeout(previous.timer)
     previous.reject(
       new Error(`Replaced pending proxy call ${call.id} with a fresh one`),
     )
@@ -108,22 +111,28 @@ export function queuePendingProxyCall(
     timeoutOverrides,
   )
 
-  const timer = setTimeout(() => {
-    const current = pendingByCallId.get(call.id)
-    if (!current) return
-    pendingByCallId.delete(call.id)
-    indexRemove(current.sessionKey, call.id)
-    current.reject(buildProxyTimeoutError(call.toolName, deadlineMs))
-    // v0.4.13: demoted from warn to notice. AFK-permission-pending
-    // sessions can stack many of these; demoting keeps the UI quiet on
-    // return while preserving the audit trail in plugin.log.
-    log.notice("timed out pending proxy call", {
-      sessionKey: current.sessionKey,
-      toolCallId: call.id,
-      toolName: call.toolName,
-      deadlineMs,
-    })
-  }, deadlineMs)
+  // Same rule as the proxy-mcp handler: a call with no deadline gets no timer
+  // (a zero-delay timer would fire on the next tick). It stays pending until
+  // a result, an abort, the next turn's orphan sweep, or its process going.
+  const timer =
+    deadlineMs > PROXY_NO_DEADLINE_MS
+      ? setTimeout(() => {
+          const current = pendingByCallId.get(call.id)
+          if (!current) return
+          pendingByCallId.delete(call.id)
+          indexRemove(current.sessionKey, call.id)
+          current.reject(buildProxyTimeoutError(call.toolName, deadlineMs))
+          // v0.4.13: demoted from warn to notice. AFK-permission-pending
+          // sessions can stack many of these; demoting keeps the UI quiet on
+          // return while preserving the audit trail in plugin.log.
+          log.notice("timed out pending proxy call", {
+            sessionKey: current.sessionKey,
+            toolCallId: call.id,
+            toolName: call.toolName,
+            deadlineMs,
+          })
+        }, deadlineMs)
+      : null
 
   const pending: InternalPending = {
     sessionKey,
@@ -202,7 +211,7 @@ export function resolvePendingProxyCallById(
   if (!pending) return false
   pendingByCallId.delete(toolCallId)
   indexRemove(pending.sessionKey, toolCallId)
-  clearTimeout(pending.timer)
+  if (pending.timer) clearTimeout(pending.timer)
   pending.resolve(result)
   log.info("resolved pending proxy call", {
     sessionKey: pending.sessionKey,
@@ -220,7 +229,7 @@ export function rejectPendingProxyCallById(
   if (!pending) return false
   pendingByCallId.delete(toolCallId)
   indexRemove(pending.sessionKey, toolCallId)
-  clearTimeout(pending.timer)
+  if (pending.timer) clearTimeout(pending.timer)
   pending.reject(error)
   // Rejection is the broker's cleanup mechanism — fires on timeouts, orphans,
   // stream closes, etc. None are user-actionable. File-log them at NOTICE so

@@ -20,6 +20,8 @@ import {
   deleteActiveProcessAndWait,
   getActiveProcess,
   getClaudeSessionId,
+  isTurnInFlight,
+  noteTurnStarted,
   respawnActiveProcess,
   setClaudeSessionId,
   deleteClaudeSessionId,
@@ -136,6 +138,41 @@ test("appendResumeIfNeeded: does not mutate the input array", () => {
     appendResumeIfNeeded(sk, args)
     assert.deepEqual(args, snapshot)
   } finally {
+    deleteClaudeSessionId(sk)
+  }
+})
+
+// The start watchdog respawns in the middle of a turn and re-sends its
+// envelope at once. Turn state is keyed by ActiveProcess, so without the
+// handoff abort, LRU eviction and the idle timer all read the busy
+// replacement as idle (@broskees' b719497).
+test("respawnActiveProcess preserves an in-flight turn on the replacement", async () => {
+  const sk = `sk-inflight-${Date.now()}`
+  const args = ["-e", "setInterval(() => {}, 1000)"]
+  const old = spawnClaudeProcess(process.execPath, args, process.cwd(), sk)
+  noteTurnStarted(old)
+  try {
+    const replacement = respawnActiveProcess(sk, process.execPath, args, process.cwd())
+    assert.ok(replacement)
+    assert.notEqual(replacement, old)
+    assert.equal(isTurnInFlight(replacement), true)
+    assert.equal(getActiveProcess(sk), replacement)
+  } finally {
+    await deleteActiveProcessAndWait(sk)
+    deleteClaudeSessionId(sk)
+  }
+})
+
+test("respawnActiveProcess leaves an idle replacement idle", async () => {
+  const sk = `sk-idle-respawn-${Date.now()}`
+  const args = ["-e", "setInterval(() => {}, 1000)"]
+  spawnClaudeProcess(process.execPath, args, process.cwd(), sk)
+  try {
+    const replacement = respawnActiveProcess(sk, process.execPath, args, process.cwd())
+    assert.ok(replacement)
+    assert.equal(isTurnInFlight(replacement), false)
+  } finally {
+    await deleteActiveProcessAndWait(sk)
     deleteClaudeSessionId(sk)
   }
 })

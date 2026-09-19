@@ -17,6 +17,10 @@ export interface InteractiveSpawnOptions {
   fastMode?: boolean
   /** Bridged Claude `--mcp-config` file paths (from effectiveMcpConfig). */
   mcpConfigPaths?: string[]
+  /** Session-scoped `--plugin-dir` paths (from `resolveSkillPluginDirs`),
+   *  which expose opencode skills to the TUI's native Skill tool. Already
+   *  filtered for CLI support, and empty when there is nothing to bridge. */
+  pluginDirs?: string[]
   /** permissions.allow rules (e.g. mcp__server__*, Bash, Edit). */
   permissionsAllow?: string[]
   /** Optional permission mode. `bypassPermissions` is ignored for interactive
@@ -98,9 +102,12 @@ export function decodeUserEnvelope(chunk: string): string {
  * No node-pty, no node sidecar: runs in-process under opencode's Bun (which
  * bundles a Bun version with native ConPTY). Interactive = subscription billing.
  */
-export function spawnInteractiveProcess(
-  opts: InteractiveSpawnOptions,
-): ActiveProcess {
+/**
+ * The CLI flags an interactive spawn adds after `ClaudeSession`'s own
+ * `--session-id` / `--model` / `--setting-sources`. Exported so the spawn
+ * arguments can be checked without a PTY.
+ */
+export function interactiveExtraArgs(opts: InteractiveSpawnOptions): string[] {
   const extraArgs: string[] = []
   if (opts.mcpConfigPaths && opts.mcpConfigPaths.length > 0) {
     extraArgs.push(
@@ -108,6 +115,10 @@ export function spawnInteractiveProcess(
       ...opts.mcpConfigPaths,
       "--strict-mcp-config",
     )
+  }
+  // `--plugin-dir` is repeatable and scoped to this session only.
+  for (const dir of opts.pluginDirs ?? []) {
+    extraArgs.push("--plugin-dir", dir)
   }
   // One `--settings` for the whole flag-settings layer. The CLI accepts the
   // flag once, so pushing a second occurrence would silently drop the first
@@ -132,6 +143,13 @@ export function spawnInteractiveProcess(
   if (opts.systemPromptFile) {
     extraArgs.push("--append-system-prompt-file", opts.systemPromptFile)
   }
+  return extraArgs
+}
+
+export function spawnInteractiveProcess(
+  opts: InteractiveSpawnOptions,
+): ActiveProcess {
+  const extraArgs = interactiveExtraArgs(opts)
 
   const session = new ClaudeSession({
     cwd: opts.cwd,

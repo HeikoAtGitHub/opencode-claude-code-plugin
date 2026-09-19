@@ -185,10 +185,10 @@ export function formatDoctorReport(report: DoctorReport): string {
     lines.push("| tool | call id | age | deadline |")
     lines.push("|---|---|---|---|")
     for (const call of report.pendingCalls) {
+      // A deadline of 0 is "none": task calls wait for the subagent by default.
+      const deadline = call.deadlineMs > 0 ? formatAge(call.deadlineMs) : "none"
       lines.push(
-        `| ${call.toolName} | \`${call.toolCallId}\` | ${formatAge(call.ageMs)} | ${formatAge(
-          call.deadlineMs,
-        )} |`,
+        `| ${call.toolName} | \`${call.toolCallId}\` | ${formatAge(call.ageMs)} | ${deadline} |`,
       )
     }
   }
