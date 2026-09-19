@@ -205,6 +205,26 @@ test("workstream_manage exposes a Claude-compatible object-root schema", () => {
   }
 })
 
+test("workstream_manage transports authorized_through to the native owner", () => {
+  const schema = WORKSTREAM_PROXY_INPUT_SCHEMA as any
+  assert.deepEqual(schema.properties.authorized_through, {
+    type: "string", enum: ["apply", "push"],
+  })
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "sync_batch_preview", repo_root: "/repo", repo_roots: ["/repo"],
+    scope: "current", on_conflict: "skip", authorized_through: "push",
+  }), null)
+  assert.equal(validateProxyToolInput("workstream_manage", {
+    action: "sync_preview", slug: "one", authorized_through: "apply",
+  }), null)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "sync_batch_preview", repo_root: "/repo", repo_roots: ["/repo"], authorized_through: "finish",
+  }) ?? "", /authorized_through is invalid/)
+  assert.match(validateProxyToolInput("workstream_manage", {
+    action: "sync_apply", slug: "one", authorized_through: "push",
+  }) ?? "", /accepts only/)
+})
+
 test("workstream_manage exports pinned transport contract evidence", () => {
   assert.equal(WORKSTREAM_CONTRACT_VERSION, WORKSTREAM_CONTRACT.version)
   assert.equal(WORKSTREAM_TRANSPORT_CONTRACT_VERSION, WORKSTREAM_CONTRACT_VERSION)
@@ -224,6 +244,7 @@ test("workstream_manage validates native action-specific inputs", () => {
         else if (arg === "repo_root") input[arg] = "/repo"
         else if (arg === "scope") input[arg] = "all"
         else if (arg === "on_conflict") input[arg] = "skip"
+        else if (arg === "authorized_through") input[arg] = "push"
         else input[arg] = `${arg}-value`
       }
     }

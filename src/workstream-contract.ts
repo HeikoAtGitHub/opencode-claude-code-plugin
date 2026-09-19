@@ -42,6 +42,7 @@ function propertySchema(name: string): Record<string, unknown> {
   if (name === "repo_root") return { type: "string", minLength: 1, maxLength: 1000 }
   if (name === "scope") return { type: "string", enum: ["current", "all"] }
   if (name === "on_conflict") return { type: "string", enum: ["skip", "stop"] }
+  if (name === "authorized_through") return { type: "string", enum: ["apply", "push"] }
   return identifierSchema
 }
 
@@ -94,6 +95,7 @@ export const WORKSTREAM_PROXY_INPUT_SCHEMA: Record<string, unknown> = {
     repo_roots: propertySchema("repo_roots"),
     scope: propertySchema("scope"),
     on_conflict: propertySchema("on_conflict"),
+    authorized_through: propertySchema("authorized_through"),
   },
   required: ["action"],
 }
@@ -139,6 +141,8 @@ export function validateWorkstreamInput(input: Record<string, unknown>): string 
       if (value !== "current" && value !== "all") return "workstream_manage scope is invalid"
     } else if (name === "on_conflict") {
       if (value !== "skip" && value !== "stop") return "workstream_manage on_conflict is invalid"
+    } else if (name === "authorized_through") {
+      if (value !== "apply" && value !== "push") return "workstream_manage authorized_through is invalid"
     } else if (typeof value !== "string" || !identifier.test(value)) {
       return `workstream_manage ${name} is invalid`
     }
