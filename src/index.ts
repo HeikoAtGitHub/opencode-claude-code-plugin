@@ -203,7 +203,7 @@ export function createClaudeCode(
       compactionModel: settings.compactionModel,
       ignoreAnthropicApiKey: settings.ignoreAnthropicApiKey,
       idleProcessTimeoutMs: settings.idleProcessTimeoutMs,
-      bridgeOpencodeSkills: settings.bridgeOpencodeSkills !== false,
+      bridgeOpencodeSkills: settings.bridgeOpencodeSkills === true,
       turnStats: settings.turnStats === true,
       interactive: settings.interactive,
       interactiveBypass: settings.interactiveBypass,

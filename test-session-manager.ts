@@ -245,9 +245,9 @@ test("reusing a process cancels its idle eviction", async () => {
   deleteActiveProcess(key)
 })
 
-test("idle eviction is on by default at 30 minutes, and an explicit 0 turns it off", () => {
-  assert.equal(DEFAULT_IDLE_PROCESS_TIMEOUT_MS, 30 * 60_000)
-  assert.equal(resolveIdleProcessTimeoutMs(undefined), DEFAULT_IDLE_PROCESS_TIMEOUT_MS)
+test("idle eviction is off unless set, and an explicit value arms it", () => {
+  assert.equal(DEFAULT_IDLE_PROCESS_TIMEOUT_MS, 0)
+  assert.equal(resolveIdleProcessTimeoutMs(undefined), 0)
   assert.equal(resolveIdleProcessTimeoutMs(0), 0)
   assert.equal(resolveIdleProcessTimeoutMs(900_000), 900_000)
 
@@ -255,6 +255,8 @@ test("idle eviction is on by default at 30 minutes, and an explicit 0 turns it o
   setActiveProcess(key, fakeIdleProcess(() => {}))
   try {
     scheduleIdleProcessEviction(key, resolveIdleProcessTimeoutMs(undefined))
+    assert.equal(isIdleProcessEvictionScheduled(key), false, "unset arms nothing")
+    scheduleIdleProcessEviction(key, resolveIdleProcessTimeoutMs(900_000))
     assert.equal(isIdleProcessEvictionScheduled(key), true)
     scheduleIdleProcessEviction(key, resolveIdleProcessTimeoutMs(0))
     assert.equal(isIdleProcessEvictionScheduled(key), false, "0 disarms")
@@ -467,8 +469,8 @@ test("LRU eviction kills nothing while every process is mid-turn", () => {
   )
 })
 
-test("the process cap is 8 and the LRU never exceeds it while an idle victim exists", () => {
-  assert.equal(MAX_ACTIVE_PROCESSES, 8)
+test("the process cap is 16 and the LRU never exceeds it while an idle victim exists", () => {
+  assert.equal(MAX_ACTIVE_PROCESSES, 16)
 })
 
 // A `task` call has no deadline, so once its proxy server is gone nothing

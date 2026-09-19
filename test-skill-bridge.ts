@@ -368,31 +368,31 @@ async function spawnArgsFor(
   })
 }
 
-test("createClaudeCode bridges the user's skills unless told otherwise", () => {
+test("createClaudeCode leaves the user's skills unbridged unless asked", () => {
   const configOf = (settings: Record<string, unknown>) =>
     (createClaudeCode(settings).languageModel("claude-haiku-4-5") as any).config
-  assert.equal(configOf({}).bridgeOpencodeSkills, true)
+  assert.equal(configOf({}).bridgeOpencodeSkills, false)
   assert.equal(configOf({ bridgeOpencodeSkills: true }).bridgeOpencodeSkills, true)
   assert.equal(configOf({ bridgeOpencodeSkills: false }).bridgeOpencodeSkills, false)
 })
 
 for (const transport of ["doStream", "doGenerate"] as const) {
-  test(`${transport} spawns claude with --plugin-dir carrying the user's skills by default`, async () => {
-    const argv = await spawnArgsFor(transport, {})
+  test(`${transport} with bridgeOpencodeSkills: true spawns claude with --plugin-dir carrying the user's skills`, async () => {
+    const argv = await spawnArgsFor(transport, { bridgeOpencodeSkills: true })
     const dirs = pluginDirsIn(argv)
     assert.equal(dirs.length, 1, `expected one --plugin-dir in ${argv.join(" ")}`)
     assert.deepEqual(skillNames(dirs[0]!), ["claude-code-plugin", `${P}spawned`])
   })
 
-  test(`${transport} with bridgeOpencodeSkills: false stages only the bundled skill`, async () => {
-    const argv = await spawnArgsFor(transport, { bridgeOpencodeSkills: false })
+  test(`${transport} stages only the bundled skill by default`, async () => {
+    const argv = await spawnArgsFor(transport, {})
     const dirs = pluginDirsIn(argv)
     assert.equal(dirs.length, 1)
     assert.deepEqual(skillNames(dirs[0]!), ["claude-code-plugin"])
   })
 
   test(`${transport} passes no --plugin-dir to a CLI whose --help does not know the flag`, async () => {
-    const argv = await spawnArgsFor(transport, {}, "Usage: claude [options]\n  --model <model>")
+    const argv = await spawnArgsFor(transport, { bridgeOpencodeSkills: true }, "Usage: claude [options]\n  --model <model>")
     assert.equal(argv.includes("--plugin-dir"), false, argv.join(" "))
   })
 }

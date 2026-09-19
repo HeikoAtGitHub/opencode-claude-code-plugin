@@ -100,9 +100,9 @@ Defaults below describe normal headless opencode use when the key is absent.
 | `autoContinueIncompleteTurns` | boolean or `"smart"` | `"smart"` | `true`/`"smart"` continue a turn truncated at `max_tokens`, bounded by 8 attempts and 10 minutes, and otherwise run the keyword heuristic only when stop reason is missing. Every other stop reason, plus error, abort or latched question, stops it. Current measured CLIs always report a reason, so truncation is the only case that resumes in practice. |
 | `compactionModel` | string | `"claude-haiku-4-5"` | `/compact` uses a fresh short-lived headless process without the usual bridge/proxy/skill wiring. Nonblank `CLAUDE_CODE_COMPACTION_MODEL` wins. This is inference and can be billed. |
 | `ignoreAnthropicApiKey` | boolean | `false` | Strip `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` from headless/interactive spawn env, allowing stored auth to be used. Does not log in, change the parent env, or guarantee subscription billing if other CLI/cloud auth is configured. Warns at startup when either nonempty variable is present, regardless of the flag. |
-| `idleProcessTimeoutMs` | number | `1800000` (30 min) | Kill a conversation's idle `claude` worker this many ms after a finished turn. The timer starts when a turn completes, reuse cancels it, and a worker found mid-turn when it fires is re-timed rather than killed. The session id is kept, so the next message resumes transparently. `0` keeps workers until LRU eviction (8 processes, oldest idle first). Values above `2147483647` are ignored. Not applied to the interactive transport. Deleting a chat in opencode releases its workers and session ids immediately regardless. |
+| `idleProcessTimeoutMs` | number | unset | Kill a conversation's idle `claude` worker this many ms after a finished turn. The timer starts when a turn completes, reuse cancels it, and a worker found mid-turn when it fires is re-timed rather than killed. The session id is kept, so the next message resumes transparently. Unset or `0` keeps workers until LRU eviction (16 processes, oldest idle first). Values above `2147483647` are ignored. Not applied to the interactive transport. Deleting a chat in opencode releases its workers and session ids immediately regardless. |
 | `turnStats` | boolean | `false` | Append one `▌ **stats:**` line to each finished turn: cost, wall duration, CLI turn count, and input/output/cache-read/cache-write tokens, taken from the CLI's own `result`. Never on a compaction turn or a turn that ended in error. Its own text part, stripped from transcripts rebuilt for the CLI, so the model never sees it. The same numbers are logged at INFO regardless, and `modelUsage` plus `permission_denials` always reach `providerMetadata`. Reported cost is the CLI's figure, not a billing guarantee. |
-| `bridgeOpencodeSkills` | boolean | `true` | Stage the user's opencode skills for Claude's native Skill tool as `opencode-skills:<name>`, on headless, interactive and direct `doGenerate` spawns (never compaction). Requires the CLI's `--help` to advertise `--plugin-dir`; otherwise no-op. Bridged skills are also listed in opencode's forwarded system prompt, so a large skill set costs prompt tokens twice; `false` opts the user's skills out. Bundled skill staging ignores this option, but still requires flag support and successful discovery/staging. |
+| `bridgeOpencodeSkills` | boolean | `false` | Stage the user's opencode skills for Claude's native Skill tool as `opencode-skills:<name>`, on headless, interactive and direct `doGenerate` spawns (never compaction). Requires the CLI's `--help` to advertise `--plugin-dir`; otherwise no-op. Bridged skills are also listed in opencode's forwarded system prompt, so a large skill set costs prompt tokens twice, which is why it is off by default; `true` opts the user's skills in. Bundled skill staging ignores this option, but still requires flag support and successful discovery/staging. |
 | `interactive` | boolean | unset (headless) | Experimental PTY transport; explicit boolean wins over `CLAUDE_CODE_INTERACTIVE_TRANSPORT`. Needs `Bun.Terminal`; otherwise headless fallback. Compaction stays headless. Does not wire the headless proxy server or disallowed-tools controls; no equivalent opencode permission guarantee or `/btw`. The skill bridge does apply. Never enable to bypass a billing/access restriction. |
 | `interactiveBypass` | boolean | `false` | Deprecated no-op. The TUI asks for a manual safety confirmation on `bypassPermissions`, so the plugin never passes it. |
 | `interactiveAllowTools` | string[] | `["Bash", "Edit", "Write", "Read", "WebFetch"]` | With `interactive`: replaces the built-in pre-allow list. MCP wildcards from discovered bridge names plus `mcp__opencode_proxy__*` are added even with `[]`. Not a capability denylist; review permissions before enabling. |
@@ -281,19 +281,19 @@ listen to; a CLI parked in a proxied call is exempt), and the connection keepali
 on a long call; they never extend a deadline). Do not present a raised deadline as the
 fix for a long subagent; the default already waits for it.
 
-### Keep Claude from loading the user's opencode skills
+### Let Claude load the user's opencode skills
 
 ```json
-{ "bridgeOpencodeSkills": false }
+{ "bridgeOpencodeSkills": true }
 ```
 
-The bridge is on by default, so `Skill("<name>")` works for any skill opencode
+The bridge is off by default. With it on, `Skill("<name>")` works for any skill opencode
 advertises. Bridged names are `opencode-skills:<name>`, including this bundled skill as
 `opencode-skills:claude-code-plugin`. The package also registers its skill directory
 with opencode's `skills.paths`; older opencode versions may not support that surface.
 The native Claude bridge needs `--plugin-dir` support and is wired into headless
-streaming, interactive and direct `doGenerate` spawns, never compaction. Set `false`
-only when the user wants to save the prompt tokens a large skill set costs twice; the
+streaming, interactive and direct `doGenerate` spawns, never compaction. Set `true`
+only when the user asks for it, since a large skill set costs prompt tokens twice; the
 bundled skill is staged either way. Reusing a process does not load a new skill catalog.
 
 User roots: `.opencode/skills` walking from cwd to filesystem root, home `.opencode/skills`,

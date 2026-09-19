@@ -1825,7 +1825,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
     const skillPluginDirs = await resolveSkillPluginDirs({
       cwd,
       cliPath: this.config.cliPath,
-      enabled: this.config.bridgeOpencodeSkills !== false,
+      enabled: this.config.bridgeOpencodeSkills === true,
     })
     const cliArgs = buildCliArgs({
       sessionKey: sk,
@@ -2677,7 +2677,7 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               const skillPluginDirs = await resolveSkillPluginDirs({
                 cwd,
                 cliPath,
-                enabled: self.config.bridgeOpencodeSkills !== false,
+                enabled: self.config.bridgeOpencodeSkills === true,
               })
               const ap = spawnInteractiveProcess({
                 cwd,
@@ -2873,12 +2873,12 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
                 )
             // Skill bridge (@broskees): stage opencode skills as a
             // session-scoped --plugin-dir so Claude's Skill tool can run them.
-            // On unless `bridgeOpencodeSkills: false`; the bundled skill is
+            // Opt-in via `bridgeOpencodeSkills: true`; the bundled skill is
             // staged either way.
             const skillPluginDirs = await resolveSkillPluginDirs({
               cwd,
               cliPath,
-              enabled: self.config.bridgeOpencodeSkills !== false,
+              enabled: self.config.bridgeOpencodeSkills === true,
             })
             cliArgs = buildCliArgs({
               sessionKey: sk,

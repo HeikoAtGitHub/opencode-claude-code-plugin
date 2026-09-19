@@ -167,14 +167,15 @@ const idleEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const MAX_IDLE_TIMEOUT_MS = 2_147_483_647
 
 /**
- * Idle eviction is on by default (30 min, @broskees' 68ed142 reaper figure).
- * An idle `claude --print` holds roughly 250 MB resident, and LRU pressure
- * alone never frees one: a user who opens a few chats and walks away keeps
- * every one of them alive for as long as opencode runs. The Claude session id
- * survives eviction, so the next turn resumes the same conversation. An
- * explicit `idleProcessTimeoutMs: 0` keeps workers until LRU eviction.
+ * Idle eviction is off unless `idleProcessTimeoutMs` is set: an unset option
+ * resolves to 0, which arms no timer, so workers live until LRU eviction as
+ * they always have. PR #36 (@broskees) proposed 30 minutes by default; that
+ * was reverted at merge because it changes when a resumed chat pays for a
+ * fresh `--resume` spawn, which is the user's call. An idle `claude --print`
+ * holds roughly 250 MB resident, so setting it is worth documenting, not
+ * imposing. The Claude session id survives eviction either way.
  */
-export const DEFAULT_IDLE_PROCESS_TIMEOUT_MS = 30 * 60_000
+export const DEFAULT_IDLE_PROCESS_TIMEOUT_MS = 0
 
 /** The idle timeout a caller-facing option resolves to: unset means the default. */
 export function resolveIdleProcessTimeoutMs(configured: number | undefined): number {
@@ -184,10 +185,10 @@ export function resolveIdleProcessTimeoutMs(configured: number | undefined): num
 // Cap on live CLI subprocesses. Session-affinity-keyed entries accumulate
 // one-per-chat, so an unbounded map would leak processes as users open new
 // chats. This caps at a reasonable working-set and evicts the oldest idle
-// one. Kept modest (8, from @broskees' 68ed142; it was 16) because the idle
-// timer above does the real work; this is the backstop for a burst of chats
-// inside one idle window, and it never takes a process that is mid-turn.
-export const MAX_ACTIVE_PROCESSES = 8
+// one, never a process that is mid-turn. Kept at 16: PR #36 proposed 8 on
+// the assumption that a default idle timer does the real work, and that
+// default was not adopted, so the cap is still the only bound.
+export const MAX_ACTIVE_PROCESSES = 16
 const PROCESS_EXIT_TIMEOUT_MS = 1_500
 const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
 /** Same wording the attached turn's close handler uses, so one log line

@@ -216,10 +216,11 @@ async function completeOneTurn(settings: { idleProcessTimeoutMs?: number }) {
 }
 
 // The timer is armed by a completed turn, which is the caller-facing
-// boundary: no option set means the worker is on the 30-minute clock.
-test("a completed turn arms idle eviction by default, and idleProcessTimeoutMs: 0 keeps the worker", async () => {
-  assert.equal(await completeOneTurn({}), true)
+// boundary: it is armed only when the option is set, and never for 0 or unset.
+test("a completed turn arms idle eviction only when idleProcessTimeoutMs is set", async () => {
+  assert.equal(await completeOneTurn({}), false)
   assert.equal(await completeOneTurn({ idleProcessTimeoutMs: 0 }), false)
+  assert.equal(await completeOneTurn({ idleProcessTimeoutMs: 900_000 }), true)
 })
 
 // --- what ends a proxied call --------------------------------------------------
