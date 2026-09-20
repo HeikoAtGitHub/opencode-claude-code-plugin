@@ -8,6 +8,7 @@ import {
   COMPACT_BOUNDARY_MARKER,
   RATE_LIMIT_MARKER,
   RESULT_ERROR_MARKER,
+  STREAM_TIMEOUT_MARKER,
 } from "./cli-events.js"
 import { DOCTOR_MARKER, parseDoctorCommandContent } from "./doctor.js"
 import { log } from "./logger.js"
@@ -33,6 +34,7 @@ const PLUGIN_NOTE_MARKERS = [
   RATE_LIMIT_MARKER,
   RESULT_ERROR_MARKER,
   DOCTOR_MARKER,
+  STREAM_TIMEOUT_MARKER,
   FAILOVER_MARKER,
 ]
 
