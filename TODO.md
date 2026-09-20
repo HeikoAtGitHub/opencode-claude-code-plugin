@@ -59,3 +59,23 @@
   is dormant is that headless `--print` offers no `ExitPlanMode` tool. The equivalent comments
   in `src/types.ts` were corrected on the `readme-quickstart` branch; this one was left alone
   because that lane was scoped to `src/types.ts` only.
+
+## Open from you
+
+Questions the maintainer still owes an answer on. Written here the turn they are
+raised, so they survive context compaction; removed when answered, done or dropped.
+
+- 2026-09-20: five Appical repos have no `opencode.json` and so do not opt into the
+  `linear` / `sentry` / `aikido` project block that `webapp` and its seven worktrees
+  carry: `Appical.IaC`, `Cl-nica-Aurora---Player-team`, `Manager-toolkit`,
+  `NOW-player-web`, `workshop-sep-2026`. The file is tracked in git in `webapp`, so
+  adding one commits a config into a shared repo. Do it (likely one small PR each),
+  or leave those repos without linear?
+- 2026-09-20: `slack` fails everywhere with `Operation timed out after 30000ms`,
+  which is `op run` waiting on a 1Password unlock, and that stall is paid on every
+  opencode start in every project. Three fixes offered: unlock 1Password before
+  launching, switch the entry to a service-account token so `op run` never prompts,
+  or turn it off globally and opt in per project the way linear does. Which?
+- 2026-09-20: `linear` reads `needs_auth` even inside Appical repos. opencode's
+  OAuth is separate from Claude's and is global once done, not per repo. Maintainer
+  action, not a code change.
