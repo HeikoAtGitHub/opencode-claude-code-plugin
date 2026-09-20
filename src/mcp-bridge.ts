@@ -592,9 +592,23 @@ function finishBridge(input: {
   }
 
   const body = JSON.stringify({ mcpServers: servers }, null, 2)
+  // Content-addressed on purpose. `hash` covers the merged opencode config and
+  // NOT `excludeServers`, so two calls that differ only in exclusions share it,
+  // and the file is written only when absent. Naming the file after `hash`
+  // alone therefore let the first writer win: the hot-reload probe runs first
+  // with no exclusions, so the spawn's own exclusions never reached disk and a
+  // server being routed through the proxy stayed in the bridged config as well,
+  // reachable by both routes. That is the double execution this whole option
+  // exists to prevent. The returned `hash` is unchanged, because drift
+  // detection still wants to track the config rather than the exclusions.
+  const bodyDigest = crypto
+    .createHash("sha256")
+    .update(body)
+    .digest("hex")
+    .slice(0, 12)
   const outPath = path.join(
     pluginTmpDir(),
-    `mcp-${hash}.json`,
+    `mcp-${bodyDigest}.json`,
   )
   try {
     if (!fileExists(outPath)) {

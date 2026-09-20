@@ -1346,3 +1346,159 @@ test("non-function and unnamed entries are skipped", () => {
   })
   assert.deepEqual(defs.map((def) => def.name), ["figma_ok"])
 })
+
+// --- the wiring: what actually reaches the spawned `claude` ----------------
+//
+// The tests above pin `resolveMcpProxyToolDefs` as a function. These pin the
+// consequence, which is where the real risk was: the caller excludes
+// `coveredServers` from `--mcp-config`, so a server that contributed no tools
+// must still be bridged. Get that wrong and it is dropped from the bridge
+// without being added to the proxy, reachable by neither route. A live check
+// cannot produce that state on demand (every connected server happened to
+// contribute tools), so it is pinned here against a real spawn.
+
+/** A stand-in `claude` that records its argv and answers one turn. */
+function argvRecordingCli(dir: string, fsMod: typeof import("node:fs"), pathMod: typeof import("node:path"), id: string) {
+  const cliPath = pathMod.join(dir, `mcp-argv-claude-${id}.cjs`)
+  const argvPath = pathMod.join(dir, `mcp-argv-${id}.json`)
+  fsMod.writeFileSync(
+    cliPath,
+    `#!/usr/bin/env node
+const fs = require("node:fs")
+const readline = require("node:readline")
+if (process.argv.includes("--version")) { process.stdout.write("2.1.258\\n"); process.exit(0) }
+if (process.argv.includes("--help")) { process.stdout.write("Usage: claude [options]\\n"); process.exit(0) }
+fs.writeFileSync(${JSON.stringify(argvPath)}, JSON.stringify(process.argv.slice(2)))
+readline.createInterface({ input: process.stdin }).on("line", () => {
+  const session_id = "fake-mcp-argv-session"
+  process.stdout.write(JSON.stringify({ type: "system", subtype: "init", session_id }) + "\\n")
+  process.stdout.write(JSON.stringify({ type: "assistant", session_id, message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "done" }] } }) + "\\n")
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success", session_id, is_error: false, duration_ms: 1, num_turns: 1, usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n")
+})
+`,
+  )
+  fsMod.chmodSync(cliPath, 0o755)
+  return { cliPath, argvPath }
+}
+
+/**
+ * Spawn one real turn with two enabled MCP servers on disk and a model tool
+ * set naming only the tools in `modelToolNames`, then return every
+ * `--mcp-config` payload the CLI was actually given, split into the proxy's
+ * own config and the bridged one.
+ */
+async function mcpConfigsForSpawn(servers: string[], modelToolNames: string[]) {
+  const fsMod = await import("node:fs")
+  const pathMod = await import("node:path")
+  const osMod = await import("node:os")
+  const cryptoMod = await import("node:crypto")
+  const { createClaudeCode } = await import("./src/index.js")
+  const { sessionKey, deleteActiveProcessAndWait, deleteClaudeSessionId } =
+    await import("./src/session-manager.js")
+
+  const id = cryptoMod.randomUUID().slice(0, 8)
+  const root = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), "oc-mcp-argv-"))
+  const cwd = pathMod.join(root, "project")
+  fsMod.mkdirSync(cwd, { recursive: true })
+
+  // Distinct server names per scenario on purpose: the bridged config is
+  // cached as `mcp-<hash>.json` and skipped when the file already exists, and
+  // the hash covers the merged server set rather than the exclusions, so two
+  // scenarios sharing a server set would read each other's stale file.
+  fsMod.mkdirSync(pathMod.join(root, "opencode"), { recursive: true })
+  fsMod.writeFileSync(
+    pathMod.join(root, "opencode", "opencode.json"),
+    JSON.stringify({
+      mcp: Object.fromEntries(
+        servers.map((name) => [
+          name,
+          { type: "remote", url: `https://${name}.invalid/mcp`, enabled: true },
+        ]),
+      ),
+    }),
+  )
+
+  const saved = {
+    XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+    OPENCODE_CONFIG: process.env.OPENCODE_CONFIG,
+    OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
+    OPENCODE_WORKTREE: process.env.OPENCODE_WORKTREE,
+    HOME: process.env.HOME,
+  }
+  process.env.XDG_CONFIG_HOME = root
+  process.env.HOME = root
+  delete process.env.OPENCODE_CONFIG
+  delete process.env.OPENCODE_CONFIG_DIR
+  delete process.env.OPENCODE_WORKTREE
+
+  const cli = argvRecordingCli(root, fsMod, pathMod, id)
+  const modelId = `claude-test-mcp-argv-${id}`
+  const sk = sessionKey(cwd, `${modelId}::tools::default::context=["claude-code",null]`)
+  try {
+    const model = createClaudeCode({
+      cliPath: cli.cliPath,
+      cwd,
+      proxyOpencodeMcpTools: true,
+      proxyTools: [],
+      bridgeOpencodeSkills: false,
+      autoContinueIncompleteTurns: false,
+    }).languageModel(modelId)
+    const response = await model.doStream({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Say done." }] }],
+      tools: modelToolNames.map((name) => ({
+        type: "function",
+        name,
+        description: `${name} tool`,
+        inputSchema: { type: "object", properties: {} },
+      })),
+    } as any)
+    for await (const _ of response.stream) { /* drain */ }
+
+    const argv = JSON.parse(fsMod.readFileSync(cli.argvPath, "utf8")) as string[]
+    // `--mcp-config <configs...>` is variadic (space-separated), so every
+    // argument after the flag belongs to it until the next option.
+    const paths: string[] = []
+    for (let i = 0; i < argv.length; i += 1) {
+      if (argv[i] !== "--mcp-config") continue
+      for (let j = i + 1; j < argv.length && !argv[j]!.startsWith("--"); j += 1) {
+        paths.push(argv[j]!)
+      }
+    }
+    let proxyConfigs = 0
+    const bridged: string[][] = []
+    for (const configPath of paths) {
+      const names = Object.keys(
+        (JSON.parse(fsMod.readFileSync(configPath, "utf8")).mcpServers ?? {}) as Record<
+          string,
+          unknown
+        >,
+      )
+      if (names.includes("opencode_proxy")) proxyConfigs += 1
+      else bridged.push(names.sort())
+    }
+    return { count: paths.length, proxyConfigs, bridged }
+  } finally {
+    await deleteActiveProcessAndWait(sk)
+    deleteClaudeSessionId(sk)
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+    fsMod.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+// One test, not two: the helper swaps `XDG_CONFIG_HOME` and `HOME` for the
+// duration of a spawn, so two top-level tests doing that can interleave and
+// read each other's environment. Kept sequential here instead.
+test("a server contributing no tools is still bridged, and a fully covered set needs no bridge", async () => {
+  // Only alpha is in the model tool set, so only alpha is proxied. beta must
+  // keep its place in `--mcp-config` or it is reachable by neither route.
+  const partial = await mcpConfigsForSpawn(["alpha", "beta"], ["alpha_thing"])
+  assert.deepEqual(partial, { count: 2, proxyConfigs: 1, bridged: [["beta"]] })
+
+  // The shape observed live: every connected server contributed tools, the
+  // bridge returns no path, and the CLI gets a single --mcp-config.
+  const full = await mcpConfigsForSpawn(["gamma", "delta"], ["gamma_thing", "delta_thing"])
+  assert.deepEqual(full, { count: 1, proxyConfigs: 1, bridged: [] })
+})
