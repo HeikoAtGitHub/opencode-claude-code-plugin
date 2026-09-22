@@ -423,12 +423,14 @@ No manual skill copy/update is needed. Do not publish or release as part of conf
 Registered ids: `claude-haiku-4-5`, `claude-sonnet-4-5`, `claude-sonnet-4-6`,
 `claude-sonnet-5`, `claude-opus-4-5`, `claude-opus-4-6`, `claude-opus-4-7`,
 `claude-opus-4-8`, `claude-opus-4-8-fast`, `claude-opus-5`, `claude-opus-5-fast`,
-`claude-fable-5`, `claude-fable-5-1`, `claude-mythos-5`, `claude-mythos-5-1`.
+`claude-opus-5-5`, `claude-opus-5-5-fast`, `claude-fable-5`, `claude-fable-5-1`,
+`claude-mythos-5`, `claude-mythos-5-1`.
 
 ### Variants and costs
 
 - Display names end in a `(N×)` list-price multiplier relative to Haiku: 1× haiku,
-  3× sonnet, 5× opus, 10× fable, mythos and fast-mode opus. It is display only.
+  3× sonnet, 4× opus 5.5, 5× other opus, 8× fast-mode opus 5.5, 10× fable, mythos
+  and fast-mode opus 5 / 4.8. It is display only.
 - Every model except Haiku has reasoning variants `low`, `medium`, `high`, `xhigh`,
   `max`, picked in opencode's model selector. A variant becomes
   `CLAUDE_CODE_EFFORT_LEVEL` on the spawned CLI unless an agent effort wins. For direct
@@ -477,7 +479,9 @@ Useful log lines to search for (redact payloads): `spawning new claude process`,
 `evicting idle claude process`, `fast mode` warnings.
 
 Version requirements: Claude Code CLI 2.1.142+ recommended (thinking summaries),
-2.1.220+ for fast mode, 2.1.258+ for `/btw`. Check with `claude --version`.
+2.1.220+ for fast mode, 2.1.258+ for `/btw`, 2.1.280+ for `claude-opus-5-5` (the
+API rejects it from an older CLI with a 400 naming that floor). Check with
+`claude --version`.
 
 Only if a proxy security check is specifically requested: identify the exact local
 proxy port first, not every opencode listener. An unauthenticated `initialize` with
