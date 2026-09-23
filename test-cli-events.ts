@@ -24,6 +24,7 @@ import {
   formatCompactBoundaryNote,
   formatResetsAt,
   formatResultFailureNote,
+  isRateLimitRejected,
   parseCompactBoundary,
   parseRateLimitEvent,
   parseSystemInit,
@@ -85,6 +86,27 @@ test("a rejection warns, explains the reason, and says what can be done", () => 
   assert.match(report!.message, /Resets at 2025-09-04T15:33:20\.000Z/)
   assert.match(report!.message, /wait for the window to reset/)
   assert.ok(report!.transcript?.startsWith(`\n${RATE_LIMIT_MARKER} `))
+})
+
+test("a rejected overage inside an allowed window is not a rejection", () => {
+  // Observed live 2026-09-23 on CLI 2.1.280: the turn after this event succeeded.
+  const info = parseRateLimitEvent({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "allowed",
+      rateLimitType: "five_hour",
+      resetsAt: 1_790_173_800,
+      isUsingOverage: false,
+      overageStatus: "rejected",
+      overageDisabledReason: "org_level_disabled",
+    },
+  })!
+  assert.equal(isRateLimitRejected(info), false)
+  const report = describeRateLimit(info)
+  assert.equal(report?.level, "info")
+  assert.equal(report!.transcript, null)
+  assert.equal(isRateLimitRejected({ ...info, status: "allowed_warning" }), false)
+  assert.equal(isRateLimitRejected({ ...info, status: undefined }), true)
 })
 
 test("a warning state is a notice with nothing in the transcript", () => {

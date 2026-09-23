@@ -121,8 +121,16 @@ export function rateLimitKey(info: RateLimitInfo): string {
   ].join("|")
 }
 
+/**
+ * A rejected overage only blocks once the plan window itself is exhausted. An
+ * org with extra usage disabled reports `overageStatus: "rejected"` on every
+ * event, including `status: "allowed"` ones whose turn then succeeds, so that
+ * pair must not read as a rejection. A missing `status` stays conservative.
+ */
 export function isRateLimitRejected(info: RateLimitInfo): boolean {
-  return info.status === "rejected" || info.overageStatus === "rejected"
+  if (info.status === "rejected") return true
+  if (info.overageStatus !== "rejected") return false
+  return info.status !== "allowed" && info.status !== "allowed_warning"
 }
 
 export interface RateLimitReport {

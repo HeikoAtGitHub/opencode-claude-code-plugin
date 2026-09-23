@@ -79,6 +79,23 @@ test("a rejected rate-limit event is an account limit", () => {
   assert.equal(isAccountLimitError({ rateLimit: { overageStatus: "rejected" } }), true)
 })
 
+test("a rejected overage inside an allowed window is not an account limit", () => {
+  // An org with extra usage disabled reports this on every event; the turn succeeds.
+  for (const status of ["allowed", "allowed_warning"]) {
+    assert.equal(
+      isAccountLimitError({
+        rateLimit: {
+          status,
+          rateLimitType: "five_hour",
+          overageStatus: "rejected",
+          overageDisabledReason: "org_level_disabled",
+        },
+      }),
+      false,
+    )
+  }
+})
+
 test("both known limit error texts are recognised", () => {
   assert.equal(
     isAccountLimitError({
