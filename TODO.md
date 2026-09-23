@@ -71,12 +71,31 @@ raised, so they survive context compaction; removed when answered, done or dropp
 
 No pending questions.
 
+## Parked
+
+- 2026-09-23: the skill-bridge native-dedup work (expanded discovery roots,
+  `bridgeSkipNativeSkills`, and the README/SKILL.md/AGENTS.md copy that goes with it)
+  was parked mid-flight on branch `skill-bridge-native-dedup`, commit `50df301`, so
+  master could be clean for the V2 lane. It is 9 files and roughly 830 lines, it is
+  **not gated** (no typecheck, test or build run since the last edits), and AGENTS.md
+  already describes it as offline-verified only with no live Claude session behind it.
+  To resume: `git checkout skill-bridge-native-dedup`, run the full gate, then open a PR.
+  Nothing is lost by leaving it there, but note the maintainer's local `file://` install
+  builds from the working tree, so master builds no longer carry these changes.
+
 ## In progress
 
-- 2026-09-20: two lanes dispatched after the maintainer said `go` to every recommendation.
-  Lane 1, account failover: on whenever more than one account is configured; a synthetic
-  `question` tool-call on a recognised limit rejection; the pick applies inside the same
-  opencode turn; sticky for the limited account until its reset time; subagents follow
-  the parent's pick and never ask; a dismissed form ends the turn as the rate-limit error
-  does today. Lane 2, small cleanup: stale plan-mode comment, visible result-fallback
-  timeout, bounded serve-mode maps, silent-turn nudge.
+- 2026-09-23: opencode **V2 support**. The plan lives in `V2.md` and is the active lane.
+  Short version: V2 is a new major of opencode, not a second API inside 1.x, and V1
+  plugin implementations do not run in it at all, so this plugin disappears the day the
+  maintainer's opencode moves to 2.x. The blocking capability question is answered:
+  `@opencode/plugin@2.0.11` ships an undocumented `ctx.aisdk` domain whose `language`
+  hook takes a `LanguageModelV3`, which is exactly what `ClaudeCodeLanguageModel`
+  already is, against the same `@ai-sdk/provider` major we already depend on. Dual V1
+  and V2 support from one package is officially supported and our default export is
+  already the right shape. Next step is phase 0, the six probes listed in `V2.md`.
+
+## Done
+
+- 2026-09-20: two lanes, account failover (PR #41) and small cleanup (PR #42), both
+  merged and shipped in v0.24.0.
