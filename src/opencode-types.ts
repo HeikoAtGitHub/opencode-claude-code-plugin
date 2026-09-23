@@ -32,8 +32,12 @@ export type OpenCodeModel = {
     }
     // opencode widened this between 1.18.5 and 1.18.18: `reasoning_details`
     // became `reasoning_text`, and bare strings are now accepted. This is a
-    // hand-written mirror of opencode's schema, so it drifts silently —
-    // re-check it when auditing a new opencode version.
+    // hand-written mirror of opencode's schema, so it drifts silently:
+    // re-check it when auditing a new opencode version. Audited clean at
+    // 1.18.29 on 2026-09-07. Note the type below is deliberately a BLEND of
+    // two upstream schemas (v1 config for `release_date` and the flat
+    // provider entry, v2 runtime for nested `capabilities`/`interleaved`),
+    // so do not "correct" it by copying either one wholesale. See AGENTS.md.
     interleaved:
       | boolean
       | string
@@ -68,6 +72,14 @@ export type OpenCodeProvider = {
 }
 
 export type OpenCodeConfig = {
+  command?: Record<string, {
+    template: string
+    description?: string
+    agent?: string
+    model?: string
+    variant?: string
+    subtask?: boolean
+  }>
   provider?: Record<
     string,
     {
@@ -78,13 +90,20 @@ export type OpenCodeConfig = {
       models?: Record<string, unknown>
     }
   >
+  // Agent definitions. Kept loose (opencode adds agent fields over time) and
+  // only ever added to: `expandAccountAgents` never overwrites an entry the
+  // user defined.
+  agent?: Record<string, Record<string, unknown>>
+  // Extra skill roots opencode scans for `**/SKILL.md` (absolute or `~/`
+  // paths). The plugin adds its bundled skills directory here.
+  skills?: { paths?: string[]; urls?: string[] }
 }
 
 /**
  * Bus events surface to plugins. Shape mirrors what opencode core publishes
  * via `GlobalBus.emit("event", { directory, payload: { type, properties } })`
  * but kept loose since opencode adds events over time and this plugin only
- * reacts to a small subset (currently just `global.disposed`).
+ * reacts to a small subset (currently just `session.deleted`).
  */
 export type OpenCodeEvent = {
   type?: string
@@ -129,12 +148,21 @@ export type OpenCodeHooks = {
     id: string
     models?: (provider: OpenCodeProvider) => Promise<Record<string, OpenCodeModel>>
   }
-  // Called for every bus event opencode publishes. Optional; this plugin
-  // doesn't currently subscribe — MCP config drift is handled at turn start.
+  // Called for every bus event opencode publishes. This plugin only acts on
+  // `session.deleted` (releasing that session's `claude` children); MCP
+  // config drift is handled at turn start.
   event?: (input: { event: OpenCodeEvent }) => Promise<void>
   "chat.params"?: (
     input: OpenCodeChatParamsInput,
     output: OpenCodeChatParamsOutput,
+  ) => Promise<void>
+  // Fires as soon as a slash command is submitted, even while the session is
+  // busy; the resulting prompt is what gets queued, not the hook. Throwing
+  // drops that prompt (opencode answers the command route with a 500 the
+  // TUI ignores). Used for /btw.
+  "command.execute.before"?: (
+    input: { command: string; sessionID: string; arguments: string },
+    output: { parts: unknown[] },
   ) => Promise<void>
 }
 

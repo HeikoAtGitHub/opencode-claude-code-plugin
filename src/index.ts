@@ -1,7 +1,13 @@
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { ClaudeCodeLanguageModel } from "./claude-code-language-model.js"
 import { defaultModels, toConfigModel } from "./models.js"
-import type { OpenCodeModel, OpenCodePlugin, OpenCodeProvider } from "./opencode-types.js"
+import type {
+  OpenCodeConfig,
+  OpenCodeEvent,
+  OpenCodeModel,
+  OpenCodePlugin,
+  OpenCodeProvider,
+} from "./opencode-types.js"
 import type { ClaudeCodeProviderSettings } from "./types.js"
 import {
   BASE_PROVIDER_ID,
@@ -11,9 +17,26 @@ import {
   ensureAccountRuntime,
   resolveAccounts,
 } from "./accounts.js"
-import { cleanupStaleUnscopedInstall } from "./cleanup-stale.js"
-import { configureLogger, log } from "./logger.js"
 import {
+  type AgentRecord,
+  agentDirectories,
+  getDefaultSubagentModel,
+  readAgentMarkdownRecords,
+  setAgentRegistry,
+  setDefaultSubagentModel,
+} from "./agent-models.js"
+import { cleanupStaleUnscopedInstall } from "./cleanup-stale.js"
+import { DOCTOR_COMMAND } from "./doctor.js"
+import { configureLogger, log } from "./logger.js"
+import { handleBtwCommand, type BtwSdkClient } from "./btw-command.js"
+import { registerBundledSkillPath } from "./skill-bridge.js"
+import {
+  deleteActiveProcessesForSession,
+  ensureProcessExitCleanup,
+} from "./session-manager.js"
+import { getOpencodeClient } from "./runtime-status.js"
+import {
+  getOpencodeProjectDirectory,
   isUsableDirectory,
   setOpencodeClient,
   setOpencodeProjectDirectory,
@@ -43,6 +66,7 @@ function pickOpencodeDirectory(input: unknown): string | undefined {
 }
 
 let warnedAnthropicApiKey = false
+let warnedPlanModeNoExit = false
 
 // `Question` is deliberately absent: enabling it disables Claude Code's
 // built-in AskUserQuestion (via --disallowedTools) and replaces the
@@ -57,6 +81,43 @@ export const DEFAULT_PROXY_TOOL_NAMES = [
   "WebFetch",
   "Task",
 ]
+
+/**
+ * Registers `/btw` unless the user defined their own. Returns whether the
+ * registration is ours: the command hook only intercepts `btw` in that case,
+ * so a user-defined command keeps opencode's normal behaviour end to end.
+ */
+export function registerSideQuestionCommand(config: OpenCodeConfig): boolean {
+  config.command ??= {}
+  if (config.command.btw) return false
+  config.command.btw = {
+    template: "/btw $ARGUMENTS",
+    description: "Ask a side question in the live Claude Code session without changing its context",
+  }
+  return true
+}
+
+/**
+ * Registers `/claude-code-doctor` unless the user defined their own command of
+ * that name. Unlike `/btw` there is no hook to guard: the command is a plain
+ * template and the language model answers the message it produces, so leaving
+ * a user definition alone here is the whole guard.
+ *
+ * The name carries no slash. opencode invokes a command as `/<key>` and takes
+ * everything after the first space as `$ARGUMENTS`, so `claude-code doctor`
+ * would be the command `claude-code` with the argument `doctor`.
+ */
+export function registerDoctorCommand(config: OpenCodeConfig): boolean {
+  config.command ??= {}
+  if (config.command[DOCTOR_COMMAND]) return false
+  config.command[DOCTOR_COMMAND] = {
+    template: `/${DOCTOR_COMMAND} $ARGUMENTS`,
+    description: "Report what the Claude Code plugin sees: versions, cwd, live processes, pending proxy calls",
+  }
+  return true
+}
+
+let ownsSideQuestionCommand = false
 
 // One-time heads-up: an API key in the environment makes Claude Code bill
 // pay-as-you-go (Console) instead of the logged-in Pro/Max subscription, which
@@ -76,6 +137,25 @@ function warnIfAnthropicApiKey(ignore: boolean | undefined): void {
   }
 }
 
+// Plan mode is enforced (buildCliArgs drops the skip-permissions flag for it),
+// so the read-only guarantee holds. The cost is that headless Claude Code is
+// not offered an `ExitPlanMode` tool, measured on 2.1.258, so nothing can
+// release plan mode mid-session and approving a plan in chat will not let
+// Claude write. Say so once per process rather than let it look like a hang.
+export function _resetPlanModeWarningForTests(): void {
+  warnedPlanModeNoExit = false
+}
+
+export function warnIfPlanModeCannotExit(permissionMode: string | undefined): void {
+  if (permissionMode !== "plan") return
+  if (warnedPlanModeNoExit) return
+  warnedPlanModeNoExit = true
+  log.warn(
+    "permissionMode \"plan\" is enforced: claude cannot edit files or run commands, and --dangerously-skip-permissions is deliberately not passed so it stays that way. Headless Claude Code is not offered an ExitPlanMode tool, so nothing releases plan mode mid-session; approving a plan in chat does not unlock writes. Leaving plan mode means changing the config and restarting opencode.",
+    { permissionMode, measuredOn: "claude-code 2.1.258" },
+  )
+}
+
 export function createClaudeCode(
   settings: ClaudeCodeProviderSettings = {},
 ): ClaudeCodeProvider {
@@ -88,6 +168,7 @@ export function createClaudeCode(
     })
   }
   warnIfAnthropicApiKey(settings.ignoreAnthropicApiKey)
+  warnIfPlanModeCannotExit(settings.permissionMode)
   const cliPath =
     settings.cliPath ?? process.env.CLAUDE_CLI_PATH ?? "claude"
   const providerName = settings.providerID ?? settings.name ?? "claude-code"
@@ -100,6 +181,9 @@ export function createClaudeCode(
       cwd: settings.cwd,
       account: settings.account,
       configDir: settings.configDir,
+      failoverAccounts: settings.failoverAccounts,
+      baseCliPath: settings.baseCliPath ?? cliPath,
+      accountFailover: settings.accountFailover ?? "ask",
       providerID: settings.providerID,
       skipPermissions: settings.skipPermissions ?? true,
       permissionMode: settings.permissionMode,
@@ -110,17 +194,22 @@ export function createClaudeCode(
       controlRequestToolBehaviors: settings.controlRequestToolBehaviors,
       controlRequestDenyMessage: settings.controlRequestDenyMessage,
       proxyTools,
+      proxyOpencodeTools: settings.proxyOpencodeTools,
+      stripContextReminders: settings.stripContextReminders === true,
       extraDisallowedTools: settings.extraDisallowedTools,
       proxyToolTimeoutMs: settings.proxyToolTimeoutMs,
       planModeQuestion: settings.planModeQuestion ?? false,
       webSearch: settings.webSearch,
       hotReloadMcp: settings.hotReloadMcp ?? true,
-      proxyOpencodeMcpTools: settings.proxyOpencodeMcpTools ?? true,
+      proxyOpencodeMcpTools: settings.proxyOpencodeMcpTools === true,
       multiStepContinuation: settings.multiStepContinuation ?? true,
       autoContinueIncompleteTurns:
         settings.autoContinueIncompleteTurns ?? "smart",
       compactionModel: settings.compactionModel,
       ignoreAnthropicApiKey: settings.ignoreAnthropicApiKey,
+      idleProcessTimeoutMs: settings.idleProcessTimeoutMs,
+      bridgeOpencodeSkills: settings.bridgeOpencodeSkills === true,
+      turnStats: settings.turnStats === true,
       interactive: settings.interactive,
       interactiveBypass: settings.interactiveBypass,
       interactiveAllowTools: settings.interactiveAllowTools,
@@ -154,6 +243,8 @@ function cleanProviderOptions(
 ): Record<string, unknown> {
   const result = { ...options }
   delete result.accounts
+  // Consumed by the config hook (agent registry), not by the language model.
+  delete result.defaultSubagentModel
   return result
 }
 
@@ -273,6 +364,10 @@ async function providerConfig(
     options: {
       ...mergedOptions,
       ...runtime,
+      // The pre-wrapper binary, kept because `runtime` replaces `cliPath`
+      // with the account's wrapper and a failover has to build ANOTHER
+      // account's wrapper on top of the same base (src/account-failover.ts).
+      baseCliPath: cliPath,
     },
     // models is intentionally omitted: both callers overwrite it with
     // configModelsForProvider(), which emits the flat config schema
@@ -330,6 +425,10 @@ async function expandAccountProviders(config: {
           {
             ...seedOptions,
             account,
+            // The resolved list, so this account's language model can offer
+            // the others when it runs out of usage. `accounts` itself stays
+            // stripped by cleanProviderOptions.
+            failoverAccounts: accounts,
           },
           accountDisplayName(account),
         )),
@@ -356,8 +455,77 @@ async function expandAccountProviders(config: {
   return expandedCount > 0
 }
 
+/**
+ * Record what every known agent asked for, so `resolveAgentModel` and
+ * `resolveAgentEffort` can answer at spawn time without the language model
+ * needing to see opencode's config.
+ *
+ * Runs BEFORE `expandAccountProviders`, which deletes the seed provider entry
+ * once it has expanded it: `defaultSubagentModel` has to be read while it is
+ * still there.
+ *
+ * Purely observational. It defines no agents and changes no agent's config;
+ * an agent this plugin never heard of is simply absent from the registry,
+ * which is what keeps opencode's built-ins out of the override path.
+ */
+async function buildAgentRegistry(config: OpenCodeConfig): Promise<void> {
+  const options = config.provider?.[PROVIDER_ID]?.options
+  const configured = options?.defaultSubagentModel
+  setDefaultSubagentModel(
+    typeof configured === "string" ? configured : undefined,
+  )
+
+  // Markdown agents may or may not reach a plugin's config hook (undocumented
+  // either way), so they are read from disk and then overlaid with whatever
+  // config does carry, which is authoritative when both describe one agent.
+  const records: Record<string, AgentRecord> = await readAgentMarkdownRecords(
+    agentDirectories(
+      process.env.HOME ?? process.env.USERPROFILE,
+      getOpencodeProjectDirectory(),
+    ),
+  )
+
+  for (const [name, agent] of Object.entries(config.agent ?? {})) {
+    const bag = (agent.options ?? {}) as Record<string, unknown>
+    const pick = (key: string): string | undefined => {
+      const value = agent[key] ?? bag[key]
+      return typeof value === "string" ? value : undefined
+    }
+
+    records[name] = {
+      mode: pick("mode") ?? records[name]?.mode,
+      model: pick("model") ?? records[name]?.model,
+      forceModel: pick("forceModel") ?? records[name]?.forceModel,
+      reasoningEffort:
+        pick("reasoningEffort") ?? records[name]?.reasoningEffort,
+    }
+  }
+
+  setAgentRegistry(records)
+  log.debug("agent registry built", {
+    agents: Object.keys(records).length,
+    defaultSubagentModel: getDefaultSubagentModel(),
+  })
+}
+
+/**
+ * The opencode session id a `session.deleted` bus event names, or undefined
+ * for any other event. opencode publishes `{ type, properties: { info } }`
+ * under `payload`, and the deleted session's own record is `properties.info`.
+ */
+export function extractDeletedSessionId(event: OpenCodeEvent | undefined): string | undefined {
+  const payload = event?.payload ?? event
+  if (!payload || payload.type !== "session.deleted") return undefined
+  const properties = payload.properties as { info?: { id?: unknown } } | undefined
+  const id = properties?.info?.id
+  return typeof id === "string" && id.length > 0 ? id : undefined
+}
+
 const server: OpenCodePlugin = async (input) => {
   cleanupStaleUnscopedInstall()
+  // Retained `claude` children would otherwise outlive a hard opencode exit,
+  // reparented to init. Armed once per process however often this runs.
+  ensureProcessExitCleanup()
 
   const opencodeVersion = pickOpencodeVersion(input)
 
@@ -378,7 +546,15 @@ const server: OpenCodePlugin = async (input) => {
 
   return {
     config: async (config) => {
+      if (registerSideQuestionCommand(config)) ownsSideQuestionCommand = true
+      registerDoctorCommand(config)
+      // The bundled `claude-code-plugin` skill: opencode lists it for every
+      // provider via skills.paths; the spawn path also stages it as a
+      // --plugin-dir so Claude's own Skill tool can load it.
+      registerBundledSkillPath(config)
       config.provider ??= {}
+
+      await buildAgentRegistry(config)
 
       const expanded = await expandAccountProviders(config)
       if (expanded) {
@@ -403,10 +579,21 @@ const server: OpenCodePlugin = async (input) => {
         opencodeVersion,
       )
     },
-    // No `event` hook: MCP config drift is detected at turn start by the
-    // hot-reload check in `claude-code-language-model.ts`, which respawns
-    // claude safely between turns. Eviction on `global.disposed` would kill
-    // an in-flight stream and abort the user's current turn.
+    // Only `session.deleted` is acted on. MCP config drift is still detected
+    // at turn start by the hot-reload check in `claude-code-language-model.ts`,
+    // which respawns claude safely between turns, and eviction on
+    // `global.disposed` would kill an in-flight stream and abort the user's
+    // current turn. A deleted session has no turn left to abort, and its
+    // `claude` child would otherwise linger until the idle timer or LRU
+    // pressure took it, with its session id kept for a resume that never comes.
+    event: async ({ event }) => {
+      const sessionID = extractDeletedSessionId(event)
+      if (!sessionID) return
+      const released = deleteActiveProcessesForSession(sessionID)
+      if (released.length > 0) {
+        log.info("released claude state for deleted session", { sessionID, released })
+      }
+    },
     provider: {
       id: PROVIDER_ID,
       models: async (provider) => defaultModelsForProvider(provider.models),
@@ -415,6 +602,14 @@ const server: OpenCodePlugin = async (input) => {
     // model can distinguish /compact (and title) calls from normal turns.
     // Without this, every no-tools call looks like a title request and
     // gets short-circuited to a synthetic stub.
+    // /btw is asked from here, the moment the command is typed, busy or not.
+    // The message itself still goes through: opencode queues it behind the
+    // running turn and the aside branch in the language model then answers it
+    // from the early answer, so the exchange is kept in this conversation.
+    "command.execute.before": async (input) => {
+      if (input.command !== "btw" || !ownsSideQuestionCommand) return
+      await handleBtwCommand(getOpencodeClient() as BtwSdkClient | null, input)
+    },
     "chat.params": async (input, output) => {
       const providerID = input.model?.providerID ?? input.provider?.info?.id
       // The hook fires for every provider opencode is configured with, not
@@ -465,6 +660,12 @@ export default {
 
 export { ClaudeCodeLanguageModel } from "./claude-code-language-model.js"
 export { bridgeOpencodeMcp } from "./mcp-bridge.js"
+export {
+  type AgentRecord,
+  getAgentRegistry,
+  getDefaultSubagentModel,
+  resolveAgentModel,
+} from "./agent-models.js"
 export { defaultModels } from "./models.js"
 export {
   WORKSTREAM_CONTRACT,

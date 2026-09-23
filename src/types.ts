@@ -18,6 +18,18 @@ export interface ClaudeCodeConfig {
   cwd?: string
   account?: string
   configDir?: string
+  /**
+   * Every account the provider expansion produced, so a limited account can
+   * offer the others. Set by `providerConfig`, not by the user.
+   */
+  failoverAccounts?: string[]
+  /**
+   * The CLI path BEFORE the per-account wrapper substitution, so a failover
+   * can build another account's wrapper on top of the same binary. Set by
+   * `providerConfig`, not by the user.
+   */
+  baseCliPath?: string
+  accountFailover?: AccountFailoverMode
   providerID?: string
   skipPermissions?: boolean
   permissionMode?: PermissionMode
@@ -28,14 +40,16 @@ export interface ClaudeCodeConfig {
   controlRequestToolBehaviors?: Record<string, ControlRequestBehavior>
   controlRequestDenyMessage?: string
   proxyTools?: string[]
+  proxyOpencodeTools?: string[]
+  stripContextReminders?: boolean
   extraDisallowedTools?: string[]
   proxyToolTimeoutMs?: Record<string, number>
   /**
    * Route `ExitPlanMode` through opencode's native `question` tool so plan
    * approval is a real form instead of a "(yes/no)" line the operator has to
-   * answer in prose. Off by default: opencode's question form is currently
-   * broken upstream, so enabling this trades a working text prompt for a
-   * silent hang. See the plan-mode gotcha in AGENTS.md.
+   * answer in prose. Off by default because it cannot currently fire: headless
+   * `--print` is not offered an `ExitPlanMode` tool at all, and this bridge
+   * keys on that tool call. See the plan-mode gotcha in AGENTS.md.
    */
   planModeQuestion?: boolean
   webSearch?: WebSearchRouting
@@ -45,6 +59,12 @@ export interface ClaudeCodeConfig {
   autoContinueIncompleteTurns?: boolean | "smart"
   compactionModel?: string
   ignoreAnthropicApiKey?: boolean
+  /** Kill an idle headless Claude worker after this many milliseconds. */
+  idleProcessTimeoutMs?: number
+  /** Stage opencode skills as a `--plugin-dir` so Claude's Skill tool can run them. */
+  bridgeOpencodeSkills?: boolean
+  /** Append a one-line cost / duration / cache footer to each finished turn. */
+  turnStats?: boolean
   logging?: LoggingConfig
 }
 
@@ -79,6 +99,14 @@ export interface LoggingConfig {
 
 export type WebSearchRouting = "claude" | "disabled" | (string & {})
 
+/**
+ * What happens when the account a conversation runs on is out of usage.
+ * `"ask"` (default) shows the operator a form listing the other configured
+ * accounts and applies the pick inside the same turn; `"off"` keeps today's
+ * behaviour, where the turn ends with the rate-limit error.
+ */
+export type AccountFailoverMode = "ask" | "off"
+
 export interface ClaudeCodeProviderSettings {
   cliPath?: string
   /** Drive interactive claude (subscription) instead of headless --print. */
@@ -97,6 +125,27 @@ export interface ClaudeCodeProviderSettings {
   account?: string
   configDir?: string
   accounts?: string[]
+  /**
+   * Every account the provider expansion produced. Written by the config
+   * hook; setting it by hand only limits what a limited account may offer.
+   */
+  failoverAccounts?: string[]
+  /** The CLI path before the per-account wrapper substitution. */
+  baseCliPath?: string
+  /**
+   * When this account is out of usage, show the operator a form listing the
+   * other configured accounts and continue the task on the pick, inside the
+   * same opencode turn. `"ask"` by default, which only does anything when
+   * more than one account is configured. `"off"` keeps the plain rate-limit
+   * error. See README "Account failover".
+   */
+  accountFailover?: AccountFailoverMode
+  /**
+   * Model that subagents run on when their own definition pins nothing.
+   * Unset means no implicit override at all, so an agent keeps inheriting the
+   * caller's model exactly as opencode intends. See `src/agent-models.ts`.
+   */
+  defaultSubagentModel?: string
   skipPermissions?: boolean
   permissionMode?: PermissionMode
   mcpConfig?: string | string[]
@@ -140,9 +189,7 @@ export interface ClaudeCodeProviderSettings {
    *     opencode's tool executor (with its native permission UI) and returns
    *     the result.
    *
-   * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`,
-   * `submit_plan`, `repo_policy_scope`, `workstream_manage`. Leave empty or
-   * unset to disable proxying.
+    * Supported: `bash`, `write`, `edit`, `webfetch`, `task`, `question`. Leave empty or unset to disable proxying.
     *
     * `task` proxies Claude CLI's `Agent` (subagent dispatch) tool through
     * opencode's `task` tool, so subagent calls run under opencode's
@@ -152,22 +199,6 @@ export interface ClaudeCodeProviderSettings {
     * agent must have `permission.task: allow` for the target subagent
     * (see opencode's agent docs).
     *
-   * `submit_plan` proxies the Plannotator approval tool and may wait for
-   * browser review. Its default deadline is 24 hours.
-   *
-    * `workstream_manage` transports the native lifecycle, finish, sync, repair,
-    * cleanup, and group actions without exposing refs, paths, hashes, remotes,
-    * force flags, or raw argv. OpenCode's native tool remains the sole owner of
-    * caller authorization, session-bound state, approvals, and execution. This
-    * provider never executes Git for these calls. It is exposed only when both
-    * the current request tool set and OpenCode's live native catalog contain
-    * `workstream_manage`; unavailable live catalog data fails closed.
-    *
-    * `repo_policy_scope` transports OpenCode's native session-bound overlay
-    * resolver. Like `workstream_manage`, it is exposed only when the current
-    * request and live native catalog both contain the tool; unavailable live
-    * catalog or mismatched session identity fails closed.
-    *
     * `question` proxies Claude CLI's `AskUserQuestion` through opencode's
     * native `question` tool (TUI form with options + custom answer). The
     * calling agent must have `permission.question: allow`. Version-gated:
@@ -175,6 +206,47 @@ export interface ClaudeCodeProviderSettings {
     * entry, in which case the deny/markdown fallback applies.
     */
   proxyTools?: string[]
+
+  /**
+   * opencode tools to forward through the proxy by name, on top of the
+   * built-in `proxyTools` defs. Empty by default.
+   *
+   * MCP-backed opencode tools are already routed automatically (see
+   * `proxyOpencodeMcpTools`), but that match is `<server>` or
+   * `<server>_<tool>`, so a tool another opencode plugin declares directly
+   * belongs to no server and is never offered to Claude. opencode-dcp's
+   * `compress` is the motivating case: dcp injects "MAX CONTEXT LIMIT
+   * REACHED ... You MUST use the `compress` tool now" reminders that the
+   * model could not act on, because the tool was never in its list.
+   *
+   * Names are opencode's tool ids as `client.tool.list()` reports them
+   * (matched case-insensitively): `["compress"]`. An unknown name is
+   * skipped with a warning. This is an explicit allowlist and never
+   * automatic: a forwarded tool executes inside opencode with the calling
+   * agent's permissions.
+   *
+   * A name already held by a proxy def is NOT taken over. Listing
+   * `"compress"` here while `proxyTools` also contains `"Compress"` leaves
+   * the plugin's own in-process compress in charge and drops the forwarded
+   * one with a warning, because the two do different things: the plugin's
+   * resets the Claude Code session, opencode's compresses opencode's
+   * transcript. Pick one.
+   */
+  proxyOpencodeTools?: string[]
+
+  /**
+   * Remove `<dcp-system-reminder>` blocks from message text when no
+   * `compress` tool is being proxied. Off by default.
+   *
+   * opencode-dcp anchors those reminders into messages, so they are re-sent
+   * with every message that carries one. When compress is not reachable
+   * they are an instruction the model cannot follow, and the plugin already
+   * tells it to ignore them in the appended system prompt. Turning this on
+   * stops paying for them as well. It is inert whenever `compress` is
+   * proxied (via either `proxyTools` or `proxyOpencodeTools`), since the
+   * reminder is then something the model can actually act on.
+   */
+  stripContextReminders?: boolean
 
   /**
    * Extra Claude Code built-ins to switch off with `--disallowedTools`,
@@ -193,21 +265,23 @@ export interface ClaudeCodeProviderSettings {
 
   /**
    * Per-tool proxy call timeouts in milliseconds, keyed by the proxy tool
-   * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question`,
-   * `submit_plan`, `repo_policy_scope`, `workstream_manage` —
+   * name (`bash`, `edit`, `write`, `webfetch`, `task`, `question` —
    * case-insensitive). When a proxied tool call waits longer than its
    * deadline for opencode to resolve it, the call is rejected and Claude
    * receives a timeout error.
    *
    * Defaults (used when a tool is absent here): `bash`/`edit`/`write`/
-    * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` →
-    * 60 min (subagents routinely run 20–40 min); `question` → 30 min
-    * (operator AFK); `submit_plan` → 24 hours (browser plan review).
-    * Setting a key here replaces the default for that tool.
+   * `webfetch` → 10 min (matches Claude CLI's Bash ceiling); `task` and
+   * `task_batch` → no deadline (the call waits for the subagent; abandoned
+   * calls are released by aborts, the next user turn, and the process going
+   * away); `question` → 30 min (operator AFK). A positive value here replaces
+   * the default for that tool, `0` disables its deadline, and a negative or
+   * non-finite value is ignored.
    *
    * For `bash` specifically the call's own `input.timeout` is honoured on
    * top: the effective deadline is `max(resolved, input.timeout)`, so a
-   * long build the caller explicitly asked to run is never undercut.
+   * long build the caller explicitly asked to run is never undercut, and a
+   * positive `input.timeout` restores a deadline that `bash: 0` disabled.
    */
   proxyToolTimeoutMs?: Record<string, number>
 
@@ -221,11 +295,15 @@ export interface ClaudeCodeProviderSettings {
    * real form; the answer is fed back to the CLI as the `tool_result` for
    * the original `ExitPlanMode` call, which is what unlocks plan mode.
    *
-   * Two reasons it is opt-in. opencode's `question` form does not currently
-   * render (upstream anomalyco/opencode#36604), so an enabled bridge hangs
-   * the turn until the operator interrupts; and older opencode builds have
-   * no `question` registry entry at all, in which case the plugin silently
-   * keeps the text path. See the plan-mode gotcha in AGENTS.md.
+   * Opt-in, and currently dormant. The delivery surface works: opencode's
+   * `question` form renders and round-trips (verified 2026-09-06, correcting
+   * an earlier claim here that it was broken upstream). What does not work is
+   * the trigger: headless `--print` does not offer the model an
+   * `ExitPlanMode` tool, measured on CLI 2.1.258, so the bridge has nothing
+   * to key on and the text path is what you get. Older opencode builds also
+   * have no `question` registry entry, in which case the plugin silently
+   * keeps the text path. Re-run the probes in AGENTS.md on a newer CLI before
+   * assuming the bridge is reachable.
    */
   planModeQuestion?: boolean
 
@@ -240,6 +318,44 @@ export interface ClaudeCodeProviderSettings {
    * plugin logs a one-time warning at startup when an API key is detected.
    */
   ignoreAnthropicApiKey?: boolean
+
+  /**
+   * Kill a retained headless Claude worker after this many milliseconds of
+   * inactivity following a completed turn. Off unless set. The timer
+   * starts when a turn completes (not at spawn), starting another turn cancels
+   * it, a worker found mid-turn when it fires is left alone and re-timed, and
+   * the Claude session id is retained for a transparent resume. Omit or set 0
+   * to keep workers until LRU eviction (16 processes). Interactive transport is
+   * excluded because it does not currently guarantee session-id resume.
+   */
+  idleProcessTimeoutMs?: number
+  /**
+   * Expose your opencode skills (`.opencode/skills`, `~/.config/opencode/skills`)
+   * to Claude Code's native Skill tool by staging them as a session-scoped
+   * `--plugin-dir`, so a `Skill("<name>")` call for a skill opencode advertises
+   * does not fail with `Unknown skill`. Off by default: every bridged skill
+   * is also listed in the system prompt opencode forwards, so a large skill
+   * set costs prompt tokens twice per turn. When on it applies to the
+   * headless, interactive and direct `doGenerate` spawns alike; compaction
+   * never loads it, and the bundled configuration skill is staged either way.
+   * No-op on CLIs without `--plugin-dir`.
+   */
+  bridgeOpencodeSkills?: boolean
+
+  /**
+   * Append one compact line to the end of every finished (non-compaction,
+   * non-error) turn with what that turn cost: dollars, wall duration, how many
+   * internal CLI turns it took, and input / output / cache-read / cache-write
+   * tokens. It is rendered as its own text part led by `▌ **stats:**` and is
+   * stripped again from any transcript rebuilt for the CLI, so the model never
+   * reads its own accounting.
+   *
+   * Off by default, because a cost line under every reply is a preference.
+   * The same numbers are logged at INFO regardless of this setting, and
+   * `total_cost_usd`, `duration_ms`, `usage`, `modelUsage` and
+   * `permission_denials` always reach `providerMetadata`.
+   */
+  turnStats?: boolean
 
   /**
    * Routing for Claude's built-in `WebSearch` tool.
@@ -259,7 +375,7 @@ export interface ClaudeCodeProviderSettings {
    * underlying claude process so newly enabled / disabled MCPs become
    * visible to the model without restarting opencode or starting a new
    * chat. Eviction happens at the start of the next user turn (never mid
-   * tool-call) and `--session-id` is preserved so the conversation
+   * tool-call) and the session id is preserved for `--resume` so the conversation
    * continues seamlessly. Defaults to `true`.
    *
    * Set to `false` to keep the previous behavior (cached subprocess
@@ -270,16 +386,28 @@ export interface ClaudeCodeProviderSettings {
   /**
    * Route opencode MCP server tools through the in-process `opencode_proxy`
    * MCP server instead of bridging them directly into Claude CLI's
-   * `--mcp-config`. With both layers configured for the same MCP server,
-   * direct bridging causes each tool invocation to execute twice — once by
-   * Claude CLI's own MCP child process and once by opencode. Routing through
-   * the proxy keeps a single execution site (opencode) while preserving the
-   * tool-call/result surface in opencode's UI and its permission prompts.
+   * `--mcp-config`. Routing through the proxy keeps a single execution site
+   * (opencode), so the call is permission-prompted and rendered as an
+   * opencode tool call instead of running inside Claude CLI's own MCP child.
    *
-   * Defaults to `true`. Set to `false` to restore the prior direct-bridge
-   * behavior (Claude CLI executes MCP tools itself; opencode also re-executes
-   * — accept the duplication if you need Claude to invoke the tool without
-   * an opencode round-trip).
+   * Defaults to `false`, and that is a change of default rather than of
+   * behaviour. It used to default to `true` while routing nothing at all:
+   * discovery read `client.tool.list()`, which enumerates opencode's tool
+   * registry (built-ins plus plugin-declared tools) and has never contained
+   * an MCP tool, so no def was ever built. Discovery now reads the model tool
+   * set opencode passes the provider, which is where MCP tools actually live,
+   * so the option works. Leaving it on by default would then have silently
+   * moved every existing user's MCP traffic off the direct bridge that is
+   * carrying it today, so switching over is the operator's call.
+   *
+   * Two things to know before enabling it:
+   *
+   * - It only affects the servers this plugin bridges. If the same server is
+   *   also registered in Claude Code's own config, Claude reaches it directly
+   *   and the proxy is bypassed. Pair this with `strictMcpConfig: true` so
+   *   Claude sees only the config this plugin writes.
+   * - A routed call executes inside opencode with the calling agent's
+   *   permissions, the same trade `proxyOpencodeTools` makes.
    */
   proxyOpencodeMcpTools?: boolean
 
@@ -390,8 +518,27 @@ export interface ClaudeStreamMessage {
       tool_use_id?: string
       content?: string | Array<{ type: string; text?: string }>
       thinking?: string
+      /** On a `tool_result` block: the CLI-executed tool failed. */
+      is_error?: boolean
     }>
   }
+
+  // `system`/`init` fields. Read by `reportSystemInit` in `cli-events.ts`;
+  // shapes confirmed against the CLI's own zod schemas on 2.1.263.
+  apiKeySource?: string
+  permissionMode?: string
+  model?: string
+  claude_code_version?: string
+  tools?: string[]
+  mcp_servers?: Array<{ name?: string; status?: string }>
+
+  // `system`/`compact_boundary`. The stream schema emits `compact_metadata`;
+  // the CLI's own transcript reader uses `compactMetadata`.
+  compact_metadata?: Record<string, unknown>
+  compactMetadata?: Record<string, unknown>
+
+  // `rate_limit_event`. See `RateLimitInfo` in `cli-events.ts`.
+  rate_limit_info?: Record<string, unknown>
 
   tool?: {
     name?: string
@@ -413,6 +560,25 @@ export interface ClaudeStreamMessage {
   result?: string
   is_error?: boolean
   num_turns?: number
+  stop_reason?: string | null
+
+  /**
+   * Per-model totals on `result`, keyed by model id: `inputTokens`,
+   * `outputTokens`, `cacheReadInputTokens`, `cacheCreationInputTokens`,
+   * `webSearchRequests`, `costUSD`. All numeric, which is what makes it safe
+   * to forward whole into `providerMetadata`.
+   */
+  modelUsage?: Record<string, Record<string, number>>
+  /**
+   * Tool calls the CLI's permission layer refused during the turn. Each entry
+   * also carries a `tool_input` on the wire; it is deliberately not declared
+   * here, because it can be a whole file's contents and must not be copied
+   * into provider metadata.
+   */
+  permission_denials?: Array<{
+    tool_name?: string
+    tool_use_id?: string
+  }>
 
   usage?: {
     input_tokens?: number

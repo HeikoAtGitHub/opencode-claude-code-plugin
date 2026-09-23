@@ -5,7 +5,10 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 
-import { shouldAutoContinueIncompleteTurn } from "./src/claude-code-language-model.js"
+import {
+  shouldAutoContinueIncompleteTurn,
+  autoContinueEnabledFor,
+} from "./src/claude-code-language-model.js"
 
 function state(overrides: Record<string, unknown> = {}) {
   return {
@@ -512,9 +515,7 @@ test("v0.4.16 end_turn does NOT beat abort", () => {
   assert.deepEqual(result, { continue: false, reason: "aborted" })
 })
 
-test("v0.4.17 max_tokens stop_reason stops via protocol signal", () => {
-  // v0.4.17: ANY stop_reason value is authoritative. max_tokens is the
-  // model signaling a stop (it was cut off but the protocol said stop).
+test("max_tokens continues: truncation is not a finished turn", () => {
   const result = shouldAutoContinueIncompleteTurn(
     state(),
     snap({
@@ -524,7 +525,79 @@ test("v0.4.17 max_tokens stop_reason stops via protocol signal", () => {
       stopReason: "max_tokens",
     }),
   )
-  assert.deepEqual(result, { continue: false, reason: "max-tokens" })
+  assert.deepEqual(result, { continue: true, reason: "truncated" })
+})
+
+test("truncated prose continues even with no tool or reasoning activity", () => {
+  // The common truncation case: one long answer, cut off mid-sentence. This
+  // is why truncation cannot simply fall through to the keyword heuristic —
+  // it would stop at the no-activity gate.
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({
+      text: "The migration works by first taking the old rows and",
+      lastVisibleText: "The migration works by first taking the old rows and",
+      stopReason: "max_tokens",
+    }),
+  )
+  assert.deepEqual(result, { continue: true, reason: "truncated" })
+})
+
+test("max_output_tokens is treated as truncation too", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    state(),
+    snap({ stopReason: "max_output_tokens" }),
+  )
+  assert.deepEqual(result, { continue: true, reason: "truncated" })
+})
+
+// Mirrors the module-private caps: 8 attempts, 10 minutes.
+const MAX_ATTEMPTS = 8
+const MAX_ELAPSED_MS = 10 * 60 * 1000
+
+test("truncation still respects the attempt cap", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    { ...state(), attempts: MAX_ATTEMPTS },
+    snap({ stopReason: "max_tokens" }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "max-attempts" })
+})
+
+test("truncation still respects the elapsed cap", () => {
+  const started = 1_000
+  const result = shouldAutoContinueIncompleteTurn(
+    { ...state(), startedAt: started },
+    snap({
+      stopReason: "max_tokens",
+      now: started + MAX_ELAPSED_MS + 1,
+    }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "max-elapsed" })
+})
+
+test("truncation does not override an abort or an error", () => {
+  assert.deepEqual(
+    shouldAutoContinueIncompleteTurn(
+      { ...state(), aborted: true },
+      snap({ stopReason: "max_tokens" }),
+    ),
+    { continue: false, reason: "aborted" },
+  )
+  assert.deepEqual(
+    shouldAutoContinueIncompleteTurn(
+      state(),
+      snap({ stopReason: "max_tokens", isError: true }),
+    ),
+    { continue: false, reason: "error" },
+  )
+})
+
+test("truncation does not override a pending operator question", () => {
+  const result = shouldAutoContinueIncompleteTurn(
+    { ...state(), sawAskUserQuestion: true },
+    snap({ stopReason: "max_tokens" }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "question" })
 })
 
 test("v0.4.17 stop_sequence stops via protocol signal", () => {
@@ -615,4 +688,26 @@ test("sawAskUserQuestion latch blocks auto-continue even with non-question trail
     }),
   )
   assert.deepEqual(result, { continue: false, reason: "question" })
+})
+
+test("a compaction turn never continues, not even on truncation", () => {
+  // doStream builds the state with `enabled: false` for compaction turns.
+  // AUTO_CONTINUE_PROMPT says "Do not summarize; keep working", so nudging a
+  // /compact turn would append non-summary text to the session summary.
+  const result = shouldAutoContinueIncompleteTurn(
+    { ...state(), enabled: false },
+    snap({ stopReason: "max_tokens" }),
+  )
+  assert.deepEqual(result, { continue: false, reason: "disabled" })
+})
+
+test("doStream disables auto-continue for compaction turns", () => {
+  // The wiring doStream uses. A compaction turn is off regardless of config;
+  // every other turn passes the configured value through untouched.
+  assert.equal(autoContinueEnabledFor(true, "smart"), false)
+  assert.equal(autoContinueEnabledFor(true, true), false)
+  assert.equal(autoContinueEnabledFor(false, "smart"), "smart")
+  assert.equal(autoContinueEnabledFor(false, true), true)
+  assert.equal(autoContinueEnabledFor(false, false), false)
+  assert.equal(autoContinueEnabledFor(false, undefined), undefined)
 })

@@ -20,9 +20,13 @@ import {
  * equivalents are disabled via --disallowedTools. Our handler blocks until
  * an external broker resolves the call, then responds to Claude.
  *
- * Wire protocol: JSON-RPC 2.0 over plain HTTP POST to `/mcp`. MCP spec
- * also supports SSE streaming, but Claude's HTTP transport accepts single
- * JSON responses for short-lived tool calls, so we keep it simple.
+ * Wire protocol: JSON-RPC 2.0 over plain HTTP POST to `/mcp`. Protocol
+ * methods (`initialize`, `tools/list`) and calls answered in-process get a
+ * single JSON reply. A broker-backed `tools/call` can block for as long as
+ * opencode takes to run the tool, so its reply is streamed: SSE when the
+ * client accepts it, otherwise a chunked JSON body whose headers go out at
+ * once and which carries keepalive whitespace until the result is ready
+ * (see `openEventStream` / `openJsonStream`).
  */
 
 export interface ProxyMcpServer {
@@ -39,14 +43,23 @@ export interface ProxyMcpServer {
   calls: EventEmitter
   /** Write `--mcp-config <path>`-compatible scratch file and return its path. */
   configPath(): string
-  /** Refresh per-turn identity when a Claude process and proxy server are reused. */
-  updateCallerContext?: (context: {
-    sessionAffinity: string
-    opencodeSessionID?: string
-    callerAgent?: string
-    allowedRequestScopedTools?: readonly string[]
-  }) => void
+  /**
+   * Ids of the `tools/call` requests this server is still holding open.
+   * Read-only. An entry leaves this list only when its promise settles, so
+   * it is the direct evidence that a lifecycle event released the HTTP side
+   * of a call and not just the broker's entry for it.
+   */
+  pendingCallIds(): string[]
+  /** Refresh request-bound authorization metadata before a reused process can call. */
+  updateCallerContext(context: ProxyCallerContext): void
   close(): Promise<void>
+}
+
+export interface ProxyCallerContext {
+  sessionAffinity: string
+  opencodeSessionID?: string
+  callerAgent?: string
+  allowedRequestScopedTools: ReadonlySet<string>
 }
 
 export interface ProxyToolDef {
@@ -56,25 +69,47 @@ export interface ProxyToolDef {
   inputSchema: Record<string, unknown>
 }
 
+/**
+ * Liveness of the HTTP reply channel behind one proxy call. Shared by
+ * reference between proxy-mcp (which flips `closed` when Claude's request
+ * goes away) and the broker / language model (which read it before
+ * answering), so the two never need to import each other.
+ */
+export interface ProxyCallChannel {
+  closed: boolean
+}
+
 export interface ProxyToolCall {
   id: string
   toolName: string
   input: Record<string, unknown>
   resolve: (result: ProxyToolResult) => void
   reject: (err: Error) => void
+  /** Absent for calls built by hand in tests; treated as open. */
+  channel?: ProxyCallChannel
+  callerContext?: ProxyCallerContext
+}
+
+/**
+ * Keep unanswered HTTP calls active independently of the tool deadline.
+ * A held call timed out before delivery on CLI 2.1.258; with immediate
+ * headers and these comments, the same 390-second hold completed. The same
+ * cadence drives the whitespace keepalive of a JSON-only reply: both must
+ * stay well under the ~300 s header/body timers in the CLI's HTTP client.
+ */
+export const PROXY_KEEPALIVE_MS = 15_000
+
+/** True when the client advertised `text/event-stream` in Accept. */
+export function acceptsEventStream(acceptHeader: unknown): boolean {
+  return (
+    typeof acceptHeader === "string" &&
+    acceptHeader.toLowerCase().includes("text/event-stream")
+  )
 }
 
 export type ProxyToolResult =
   | { kind: "text"; text: string; isError?: boolean }
   | { kind: "error"; message: string }
-
-// Streamable HTTP (SSE responses to POST /mcp) requires a 2025-03-26+ protocol
-// version. The older 2024-11-05 makes the Claude CLI expect a buffered JSON
-// body on POST and drop our SSE stream ("transport dropped mid-call"). We also
-// echo the client's requested version in `initialize` to keep negotiation
-// correct across CLI versions.
-const PROTOCOL_VERSION = "2025-06-18"
-const PROXY_HEARTBEAT_MS = 60 * 1000
 
 /**
  * Handler that answers a `tools/call` inside this process instead of
@@ -85,6 +120,7 @@ const PROXY_HEARTBEAT_MS = 60 * 1000
 export type ProxyToolInterceptor = (
   input: Record<string, unknown>,
 ) => Promise<ProxyToolResult> | ProxyToolResult
+
 export const SERVER_CLOSED_MESSAGE = "proxy MCP server closed"
 
 /** Rejections that fire on normal lifecycle transitions: AFK-permission
@@ -103,9 +139,67 @@ export function isExpectedCleanupError(message: string): boolean {
   )
 }
 
+const PROTOCOL_VERSION = "2024-11-05"
+const SERVER_NAME = "opencode_proxy"
+export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
+
+// Flat fallback cap on how long a proxy tool call may wait for opencode to
+// resolve it. Matches Claude CLI's hard upper bound for Bash (10 min). The
+// effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
+export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
+
+/** A resolved deadline of 0 means the call waits until a lifecycle event
+ * releases it: a result, an abort, the next user turn's orphan sweep, the
+ * child closing, or the proxy server closing with its process. */
+export const PROXY_NO_DEADLINE_MS = 0
+
+// Per-tool default deadlines, keyed by lowercase proxy tool name. `task` and
+// `task_batch` dispatch opencode subagents, and the wall clock is the wrong
+// unit for those: a 10-min flat ceiling fired mid-subagent and dropped the
+// late result on the floor (@jknlsn, live session ses_0cfc0da6, 2026-07-05),
+// and a 60-min one did the same to any subagent that ran longer (@broskees'
+// dd494a8). So they carry no deadline at all: an abandoned task call is
+// released by the same lifecycle events that already release every other
+// call, and a positive `proxyToolTimeoutMs` override restores a backstop.
+//
+// `question` blocks on a human reading a TUI form, so the flat ceiling is
+// the wrong unit entirely: a question posed just before the operator steps
+// away would be rejected mid-answer. 30 min is jknlsn's original figure and
+// matches the "prefer fewer, high-signal questions" guidance in the def.
+export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
+  task: PROXY_NO_DEADLINE_MS,
+  task_batch: PROXY_NO_DEADLINE_MS, // same reasoning: it IS task calls
+  question: 30 * 60 * 1000, // 30 min
+  submit_plan: 24 * 60 * 60 * 1000, // interactive Plannotator review
+}
+
 export { WORKSTREAM_ACTIONS }
 export const WORKSTREAM_TRANSPORT_CONTRACT_VERSION = WORKSTREAM_CONTRACT_VERSION
 export const WORKSTREAM_TRANSPORT_SCHEMA_HASH = WORKSTREAM_CONTRACT_SHA256
+
+export const REQUEST_SCOPED_PROXY_TOOLS = new Set([
+  "repo_policy_scope",
+  "workstream_manage",
+])
+
+export function isRequestScopedProxyTool(toolName: string): boolean {
+  return REQUEST_SCOPED_PROXY_TOOLS.has(toolName.toLowerCase())
+}
+
+export function filterRequestScopedProxiesByAvailability(
+  tools: ProxyToolDef[],
+  requestToolNames: ReadonlySet<string>,
+  liveToolIds: ReadonlySet<string> | undefined,
+): ProxyToolDef[] {
+  return tools.filter((tool) =>
+    !isRequestScopedProxyTool(tool.name) ||
+    (requestToolNames.has(tool.name) && liveToolIds?.has(tool.name)),
+  )
+}
+
+export function proxyToolExposureHash(tools: ProxyToolDef[] | null): string {
+  return crypto.createHash("sha256").update(JSON.stringify(tools ?? [])).digest("hex")
+}
 
 export function validateProxyToolInput(
   toolName: string,
@@ -130,63 +224,6 @@ export function validateProxyToolInput(
   return null
 }
 
-export const REQUEST_SCOPED_PROXY_TOOLS = new Set([
-  "repo_policy_scope",
-  "workstream_manage",
-])
-
-export function isRequestScopedProxyTool(toolName: string): boolean {
-  return REQUEST_SCOPED_PROXY_TOOLS.has(toolName.toLowerCase())
-}
-
-export function filterRequestScopedProxiesByAvailability(
-  tools: ProxyToolDef[],
-  requestToolNames: ReadonlySet<string>,
-  liveToolIds: ReadonlySet<string> | undefined,
-): ProxyToolDef[] {
-  return tools.filter((tool) =>
-    !isRequestScopedProxyTool(tool.name) ||
-    (requestToolNames.has(tool.name) && liveToolIds?.has(tool.name)),
-  )
-}
-
-export function proxyToolExposureHash(tools: ProxyToolDef[] | null): string {
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify(tools ?? []))
-    .digest("hex")
-}
-
-const SERVER_NAME = "opencode_proxy"
-export const PROXY_TOOL_PREFIX = `mcp__${SERVER_NAME}__`
-
-// Interval between SSE heartbeats (MCP progress notifications) emitted while a
-// proxy tool call is pending. Must stay well under the Claude CLI's ~296s HTTP
-// transport timeout and 300s MCP idle timeout, which otherwise abort a
-// long-pending interactive call (e.g. submit_plan during human plan review).
-// Flat fallback cap on how long a proxy tool call may wait for opencode to
-// resolve it. Matches Claude CLI's hard upper bound for Bash (10 min). The
-// effective deadline is resolved per tool — see `resolveProxyCallTimeoutMs`.
-export const PROXY_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
-
-// Per-tool default deadlines, keyed by lowercase proxy tool name. `task`
-// dispatches an opencode subagent that routinely runs 20-40 min; the old
-// flat ceiling fired mid-subagent, made Claude believe its dispatch had
-// failed, and (because the proxy had already returned a timeout error) the
-// late subagent result was dropped on the floor -- the operator had to
-// nudge "please check now, it seems the task succeeded" (@jknlsn, live
-// session ses_0cfc0da6, 2026-07-05).
-//
-// `question` blocks on a human reading a TUI form, so the flat ceiling is
-// the wrong unit entirely: a question posed just before the operator steps
-// away would be rejected mid-answer. 30 min is jknlsn's original figure and
-// matches the "prefer fewer, high-signal questions" guidance in the def.
-export const PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS: Record<string, number> = {
-  task: 60 * 60 * 1000, // 60 min
-  question: 30 * 60 * 1000, // 30 min
-  submit_plan: 24 * 60 * 60 * 1000, // interactive Plannotator review
-}
-
 // Node's setTimeout delay is a signed 32-bit int; values above 2^31-1 ms
 // (~24.85 days) trigger TimeoutOverflowWarning and fire at ~1ms instead.
 // Clamp absurd overrides / input.timeouts so a misconfigured deadline
@@ -196,13 +233,19 @@ export const MAX_PROXY_TIMEOUT_MS = 2 ** 31 - 1
 /**
  * Resolve the proxy deadline for a tool call. Layers, most-specific last:
  *  1. flat default (`PROXY_DEFAULT_TIMEOUT_MS`, 10 min)
- *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`)
- *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key)
+ *  2. per-tool default (`PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS`; `task` and
+ *     `task_batch` have none)
+ *  3. user override via `proxyToolTimeoutMs` config (case-insensitive key).
+ *     A positive value replaces the default, `0` disables the deadline for
+ *     that tool, and a negative or non-finite value is ignored.
  *  4. for `bash`, the call's own `input.timeout` -- the proxy must never
  *     undercut a build the caller explicitly asked to run long. The bash
  *     proxy def advertises a `timeout` field; before this fix the proxy
- *     ignored it and killed the call at the flat ceiling anyway.
+ *     ignored it and killed the call at the flat ceiling anyway. It only
+ *     ever raises, so it also turns a disabled bash deadline back into one.
  * Finally clamped to `MAX_PROXY_TIMEOUT_MS` to stay within Node's timer range.
+ * Returns `PROXY_NO_DEADLINE_MS` (0) when the call has no deadline; callers
+ * must not arm a timer for that value.
  */
 export function resolveProxyCallTimeoutMs(
   toolName: string,
@@ -213,13 +256,18 @@ export function resolveProxyCallTimeoutMs(
   let ms = PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS[key] ?? PROXY_DEFAULT_TIMEOUT_MS
   if (overrides) {
     const ov = lookupCaseInsensitive(overrides, key)
-    if (typeof ov === "number" && ov > 0) ms = ov
+    if (isDeadlineOverride(ov)) ms = ov
   }
   if (key === "bash") {
     const requested = input?.timeout
     if (typeof requested === "number" && requested > ms) ms = requested
   }
   return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
+}
+
+/** `0` (no deadline) or a positive finite number of milliseconds. */
+function isDeadlineOverride(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
 }
 
 function lookupCaseInsensitive(
@@ -239,7 +287,11 @@ function lookupCaseInsensitive(
  * client aborts each call at its 60-second default even while an opencode
  * subagent is still running (@broskees, PR #18). It must be >= the largest
  * server-side deadline or the client gives up before the broker does, so it
- * tracks the max of the flat default, per-tool defaults, and user overrides.
+ * tracks the max of every tool's effective deadline: the flat default, the
+ * per-tool defaults, and the user's overrides applied on top of them. A tool
+ * with no deadline needs the largest value the client accepts, because the
+ * CLI rejects `timeout: 0` in the MCP config outright (measured on the fork
+ * this came from, @broskees' dd494a8), and this is also Node's timer max.
  * (A bash call raising its own `input.timeout` above this ceiling is a known
  * edge; Claude CLI caps bash at 10 min anyway.)
  */
@@ -247,13 +299,19 @@ export function resolveProxyClientCeilingMs(
   overrides: Record<string, number> | undefined,
 ): number {
   let ms = PROXY_DEFAULT_TIMEOUT_MS
-  for (const v of Object.values(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
-    if (v > ms) ms = v
+  const consider = (deadlineMs: number): boolean => {
+    if (deadlineMs === PROXY_NO_DEADLINE_MS) return true
+    if (deadlineMs > ms) ms = deadlineMs
+    return false
   }
-  if (overrides) {
-    for (const v of Object.values(overrides)) {
-      if (typeof v === "number" && v > ms) ms = v
+  for (const [toolName, defaultMs] of Object.entries(PROXY_PER_TOOL_DEFAULT_TIMEOUT_MS)) {
+    const override = overrides ? lookupCaseInsensitive(overrides, toolName) : undefined
+    if (consider(isDeadlineOverride(override) ? override : defaultMs)) {
+      return MAX_PROXY_TIMEOUT_MS
     }
+  }
+  for (const value of Object.values(overrides ?? {})) {
+    if (isDeadlineOverride(value) && consider(value)) return MAX_PROXY_TIMEOUT_MS
   }
   return Math.min(ms, MAX_PROXY_TIMEOUT_MS)
 }
@@ -271,10 +329,11 @@ export function resolveProxyClientCeilingMs(
 export function buildProxyTimeoutError(toolName: string, ms: number): Error {
   const key = toolName.toLowerCase()
   const base = `Proxy tool '${toolName}' timed out after ${ms}ms waiting for opencode to resolve the call`
-  if (key === "task") {
+  if (key === "task" || key === TASK_BATCH_TOOL_NAME) {
     return new Error(
       base +
-        " (the subagent). The subagent may still be running but its result" +
+        (key === "task" ? " (the subagent)." : " (the subagents).") +
+        " The subagent may still be running but its result" +
         " is no longer reachable in this session. Do not declare the dispatch" +
         " failed, and do not 'schedule a wake-up' or defer -- that mechanism" +
         " does not apply here. If the result is required, re-dispatch or" +
@@ -294,14 +353,101 @@ export function buildProxyTimeoutError(toolName: string, ms: number): Error {
  * Both failure modes are addressed here, at the tool the model reads.
  */
 export const TASK_PROXY_NOTE =
-  "This is the ONLY tool that dispatches opencode subagents (including" +
-  " user @-mentions). Claude Code's built-in TaskCreate/TaskUpdate manage" +
-  " a local todo list and cannot dispatch subagents. Do not search config" +
-  " files to verify a subagent type exists — invalid types fail fast with" +
-  " a clear error. Foreground calls block until the subagent finishes; set" +
-  " `background` to request opencode's background execution mode. Task calls" +
-  " get a 60-minute proxy deadline by default (configurable via" +
-  " proxyToolTimeoutMs)."
+  "This and task_batch are the ONLY tools that dispatch opencode subagents" +
+  " (including user @-mentions). Claude Code's built-in TaskCreate/TaskUpdate" +
+  " manage a local todo list and cannot dispatch subagents. Do not search" +
+  " config files to verify a subagent type exists: invalid types fail fast" +
+  " with a clear error. Foreground calls block until the subagent finishes;" +
+  " set `background` to request opencode's background execution mode. For" +
+  " two or more independent subagents in one response use task_batch, not" +
+  " several task calls: those run one after another. Task calls have no" +
+  " proxy deadline by default: the call waits for the subagent to finish" +
+  " (a positive proxyToolTimeoutMs override adds a deadline)."
+
+/**
+ * `task_batch`: one MCP call that opencode runs as N parallel `task` calls.
+ *
+ * Design and first implementation by Joseph Roberts (@broskees) on his fork
+ * (68ed142), absorbed here with credit. The limitation it works around is
+ * measured, not assumed: Claude Code emits several `mcp__opencode_proxy__*`
+ * tool_use blocks in one assistant message but sends the MCP requests one at
+ * a time, each only after the previous result (2026-09-06, haiku, two
+ * 8-second bash calls: second request arrived 7 ms after the first resolved).
+ * So "call task twice" is serial by construction, and the only way to get two
+ * subagents running at once is a single proxy call that the plugin fans out
+ * inside one opencode tool boundary, where opencode executes tool calls
+ * concurrently. The children are ordinary `task` calls with ids derived from
+ * the parent (`taskBatchChildToolCallId`), and their results are gathered
+ * back onto the parent id (`formatTaskBatchResults`) before the CLI sees it.
+ */
+export const TASK_BATCH_TOOL_NAME = "task_batch"
+
+export const TASK_BATCH_PROXY_NOTE =
+  "Use this instead of several task calls in one response: Claude Code runs" +
+  " MCP tool calls one at a time, so separate task calls run serially even" +
+  " when emitted together, while one task_batch call fans them out as" +
+  " parallel opencode task calls. Each task takes the same fields as the" +
+  " task tool. Results come back in task order, each labelled. Like task it" +
+  " has no proxy deadline by default (a positive proxyToolTimeoutMs override" +
+  " adds one)."
+
+export const TASK_INPUT_REQUIRED = ["description", "prompt", "subagent_type"]
+
+/** Why a `task_batch` input is unusable, or null when it is fine. */
+export function taskBatchInputError(input: Record<string, unknown> | undefined): string | null {
+  const tasks = input?.tasks
+  if (!Array.isArray(tasks) || tasks.length < 2) {
+    return "task_batch requires a `tasks` array with at least two items; use `task` for one subagent"
+  }
+  for (const [index, task] of tasks.entries()) {
+    if (task === null || typeof task !== "object" || Array.isArray(task)) {
+      return `task_batch tasks[${index}] must be an object`
+    }
+    const item = task as Record<string, unknown>
+    for (const field of TASK_INPUT_REQUIRED) {
+      if (typeof item[field] !== "string") {
+        return `task_batch tasks[${index}].${field} must be a string`
+      }
+    }
+  }
+  return null
+}
+
+/** The batch's task inputs, or [] when the input never passed validation. */
+export function taskBatchTasks(input: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  if (taskBatchInputError(input)) return []
+  return input!.tasks as Record<string, unknown>[]
+}
+
+/**
+ * Child ids stay derivable from the parent so the next turn can find every
+ * child's `tool-result` without extra state. Only `[A-Za-z0-9_-]`: AI SDK
+ * bridges normalise other characters and the round trip would not match.
+ */
+export function taskBatchChildToolCallId(parentToolCallId: string, index: number): string {
+  return `${parentToolCallId}_task_${index}`
+}
+
+/**
+ * One readable result for the parent call. Children are labelled in task
+ * order; a child opencode did not answer is said so rather than dropped,
+ * since a silent gap would read as a subagent that never ran.
+ */
+export function formatTaskBatchResults(
+  children: Array<{ task: Record<string, unknown>; result: ProxyToolResult | null }>,
+): ProxyToolResult {
+  const total = children.length
+  const sections = children.map(({ task, result }, index) => {
+    const label = typeof task.description === "string" ? task.description : `task ${index + 1}`
+    const agent = typeof task.subagent_type === "string" ? ` (${task.subagent_type})` : ""
+    const header = `## task ${index + 1} of ${total}: ${label}${agent}`
+    if (!result) return `${header}\n[missing] opencode returned no result for this task in the batch`
+    if (result.kind === "error") return `${header}\n[error] ${result.message}`
+    return `${header}\n${result.isError ? "[error] " : ""}${result.text}`
+  })
+  const failed = children.some(({ result }) => !result || result.kind === "error" || result.isError)
+  return { kind: "text", text: sections.join("\n\n"), ...(failed ? { isError: true } : {}) }
+}
 
 const AGENT_TYPES_HEADING = "Available agent types"
 
@@ -400,7 +546,7 @@ export function overlayTaskProxyDescription(
   const agentTypes = extractAgentTypeList(liveDescription)
   if (!agentTypes) return tools
   return tools.map((t) =>
-    t.name === "task"
+    t.name === "task" || t.name === TASK_BATCH_TOOL_NAME
       ? { ...t, description: `${agentTypes}\n\n${t.description}` }
       : t,
   )
@@ -438,6 +584,38 @@ export function filterQuestionProxyByOpencodeSupport(
 ): ProxyToolDef[] {
   if (opencodeHasQuestion) return tools
   return tools.filter((t) => t.name !== "question")
+}
+
+/** Input fields of one `task`, shared with each `task_batch` item. */
+export const TASK_INPUT_PROPERTIES = {
+  description: {
+    type: "string",
+    description: "A short (3-5 words) description of the task",
+  },
+  prompt: {
+    type: "string",
+    description: "The task for the agent to perform",
+  },
+  subagent_type: {
+    type: "string",
+    description: "The type of specialized agent to use for this task",
+  },
+  task_id: {
+    type: "string",
+    description:
+      "Set this only if you mean to resume a previous task: pass the" +
+      " prior task_id to continue the same subagent session instead of" +
+      " creating a fresh one.",
+  },
+  command: {
+    type: "string",
+    description: "The command that triggered this task",
+  },
+  background: {
+    type: "boolean",
+    description:
+      "Run the task in the background when supported by opencode",
+  },
 }
 
 export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
@@ -550,71 +728,52 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
       TASK_PROXY_NOTE,
     inputSchema: {
       type: "object",
+      properties: TASK_INPUT_PROPERTIES,
+      required: TASK_INPUT_REQUIRED,
+    },
+  },
+  {
+    name: TASK_BATCH_TOOL_NAME,
+    description:
+      "Launch two or more independent opencode subagents at the same time and" +
+      " get all their results back together. Put one ordinary task input in" +
+      " `tasks` for each subagent. " +
+      TASK_BATCH_PROXY_NOTE,
+    inputSchema: {
+      type: "object",
       properties: {
-        description: {
-          type: "string",
-          description: "A short (3-5 words) description of the task",
-        },
-        prompt: {
-          type: "string",
-          description: "The task for the agent to perform",
-        },
-        subagent_type: {
-          type: "string",
-          description: "The type of specialized agent to use for this task",
-        },
-        task_id: {
-          type: "string",
-          description:
-            "Set this only if you mean to resume a previous task — pass the" +
-            " prior task_id to continue the same subagent session instead of" +
-            " creating a fresh one.",
-        },
-        command: {
-          type: "string",
-          description: "The command that triggered this task",
-        },
-        background: {
-          type: "boolean",
-          description:
-            "Run the task in the background when supported by opencode",
+        tasks: {
+          type: "array",
+          minItems: 2,
+          description: "Independent subagent tasks to run concurrently",
+          items: {
+            type: "object",
+            properties: TASK_INPUT_PROPERTIES,
+            required: TASK_INPUT_REQUIRED,
+          },
         },
       },
-      required: ["description", "prompt", "subagent_type"],
+      required: ["tasks"],
     },
   },
   {
     name: "submit_plan",
     description:
       "Submit a plan for user review via opencode's Plannotator submit_plan tool." +
-      " The first call should pass a single edit with start=1 and the full" +
-      " plan as content. Use end=0 only as an insert-before-line-1" +
-      " compatibility fallback when needed. Routed through opencode so the" +
-      " browser approval UI and session feedback stay on the opencode side.",
+      " Pass one edit with start=1 and the full plan on the first call; later" +
+      " calls apply targeted line-range edits. Routed through opencode so the" +
+      " approval UI and session feedback remain on the native side.",
     inputSchema: {
       type: "object",
       properties: {
         edits: {
           type: "array",
-          description: "Line-range edits to apply to the backing plan file.",
           items: {
             type: "object",
             properties: {
-              start: {
-                type: "number",
-                description: "1-indexed start line (inclusive).",
-              },
-              end: {
-                type: "number",
-                description:
-                  "Optional 1-indexed end line (inclusive). Omit to replace" +
-                  " from start through end of file; start=1,end=0 inserts" +
-                  " before line 1 as first-call compatibility fallback.",
-              },
-              content: {
-                type: "string",
-                description: "Replacement content. Empty string deletes the line range.",
-              },
+              start: { type: "number", description: "1-indexed start line (inclusive)." },
+              end: { type: "number", description: "Optional 1-indexed end line (inclusive)." },
+              content: { type: "string", description: "Replacement content." },
             },
             required: ["start", "content"],
           },
@@ -627,10 +786,8 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
     name: "repo_policy_scope",
     description:
       "Load and validate Repo Policy Overlay for one or more action targets" +
-      " through OpenCode's native session-bound tool. Call this before the" +
-      " first effective read, write, or run in another repo or exclusive" +
-      " owner scope. The proxy only transports target paths; OpenCode remains" +
-      " the validation, scope-state, drift, and authorization owner.",
+      " through OpenCode's native session-bound tool. OpenCode remains the" +
+      " validation, scope-state, drift, and authorization owner.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -640,7 +797,6 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
           minItems: 1,
           maxItems: 20,
           items: { type: "string", minLength: 1, maxLength: 2000 },
-          description: "Absolute or workspace-relative action targets to attest.",
         },
       },
       required: ["targets"],
@@ -650,12 +806,9 @@ export const DEFAULT_PROXY_TOOLS: ProxyToolDef[] = [
     name: "workstream_manage",
     description:
       "Transport a controlled workstream_manage call to OpenCode's native" +
-      " tool. OpenCode remains the sole authorization and execution owner," +
-      " including caller-agent checks, session-bound state, approvals, and" +
-      " wrapper execution. This proxy performs no Git operation and exposes" +
-      " no raw argv, ref, remote, force, hash, or state-root input. Planned" +
-      " repository paths are bounded, transient inputs for collision_preview" +
-      " and are interpreted only by OpenCode's native owner.",
+      " tool. OpenCode remains sole authorization and execution owner. The" +
+      " proxy exposes no raw argv, ref, remote, force, hash, token, or" +
+      " state-root input.",
     inputSchema: WORKSTREAM_PROXY_INPUT_SCHEMA,
   },
   {
@@ -744,9 +897,18 @@ export async function createProxyMcpServer(
   tools: ProxyToolDef[] = DEFAULT_PROXY_TOOLS,
   timeoutOverrides?: Record<string, number>,
   interceptors?: Map<string, ProxyToolInterceptor>,
+  options: {
+    /** Keepalive cadence for streamed replies; a test seam, defaults to `PROXY_KEEPALIVE_MS`. */
+    keepaliveMs?: number
+  } = {},
 ): Promise<ProxyMcpServer> {
   const calls = new EventEmitter()
   const pending = new Map<string, ProxyToolCall>()
+  const keepaliveMs = options.keepaliveMs ?? PROXY_KEEPALIVE_MS
+  let callerContext: ProxyCallerContext = {
+    sessionAffinity: "default",
+    allowedRequestScopedTools: new Set(),
+  }
 
   // Per-server bearer secret (256 bits). This endpoint executes Bash/Edit/
   // Write through opencode's executor, so an unauthenticated caller on
@@ -861,6 +1023,10 @@ export async function createProxyMcpServer(
     // result that failed schema validation" (seen live 2026-07-04).
     let requestId: number | string | null = null
     let requestMethod: string | null = null
+    // Hoisted for the same reason: once a streamed reply's headers are out,
+    // an error must travel down that stream instead of through writeJson
+    // (which would try to set headers again and throw inside the catch).
+    let reply: ReplyStream | null = null
     try {
       const body = await readBody(req)
       const request = JSON.parse(body) as {
@@ -887,14 +1053,11 @@ export async function createProxyMcpServer(
       })
 
       if (request.method === "initialize") {
-        const clientProtocol = (
-          request.params as { protocolVersion?: string } | undefined
-        )?.protocolVersion
         writeJson(res, {
           jsonrpc: "2.0",
           id: requestId,
           result: {
-            protocolVersion: clientProtocol ?? PROTOCOL_VERSION,
+            protocolVersion: PROTOCOL_VERSION,
             capabilities: { tools: {} },
             serverInfo: {
               name: SERVER_NAME,
@@ -947,17 +1110,23 @@ export async function createProxyMcpServer(
           return
         }
 
-        const inputError = validateProxyToolInput(toolName, input)
-        if (inputError) {
-          writeJson(res, {
-            jsonrpc: "2.0",
-            id: requestId,
-            result: {
-              content: [{ type: "text", text: inputError }],
-              isError: true,
-            },
+        const governanceInputError = validateProxyToolInput(toolName, input)
+        if (governanceInputError) {
+          writeToolCallResult(res, requestId, {
+            kind: "error",
+            message: governanceInputError,
           })
           return
+        }
+
+        if (toolName === TASK_BATCH_TOOL_NAME) {
+          const problem = taskBatchInputError(input)
+          if (problem) {
+            // Same rule as the unknown-tool path: an MCP result with isError,
+            // never a JSON-RPC error envelope.
+            writeToolCallResult(res, requestId, { kind: "error", message: problem })
+            return
+          }
         }
 
         // Intercepted tools act on plugin state, not on the workspace, so
@@ -983,103 +1152,89 @@ export async function createProxyMcpServer(
         }
 
         const callId = crypto.randomUUID()
-        const deadlineMs = resolveProxyCallTimeoutMs(
-          toolName,
-          input,
-          timeoutOverrides,
-        )
         log.info("proxy-mcp tool call received", {
           callId,
           toolName,
           hasInput: input != null,
-          deadlineMs,
+          sse: acceptsEventStream(req.headers.accept),
         })
 
-        // Only submit_plan needs Streamable HTTP. Keep upstream's buffered MCP
-        // responses for ordinary proxy tools.
-        const useSse = toolName.toLowerCase() === "submit_plan"
-        // A long-pending interactive call — submit_plan during
-        // human plan review — otherwise dies at the Claude CLI's ~296s HTTP
-        // transport timeout (byte-silent connection) and its 300s MCP idle
-        // timeout, neither of which MCP_TOOL_TIMEOUT covers. Periodic progress
-        // notifications keep both alive; SSE also lets us return a terminal
-        // error carrying the request's REAL id instead of the id:null that
-        // desyncs the JSON-RPC transport and wedges the channel.
-        const progressToken = (
-          params as { _meta?: { progressToken?: unknown } }
-        )._meta?.progressToken
-        if (useSse) {
-          res.statusCode = 200
-          res.setHeader("Content-Type", "text/event-stream")
-          res.setHeader("Cache-Control", "no-cache")
-          res.setHeader("Connection", "keep-alive")
-          res.flushHeaders?.()
-        }
-        const sendSse = (msg: unknown) => {
-          try {
-            res.write(`event: message\ndata: ${JSON.stringify(msg)}\n\n`)
-          } catch {}
-        }
-        const sendResponse = (msg: unknown) => {
-          if (useSse) sendSse(msg)
-          else writeJson(res, msg)
-        }
-        let progressN = 0
-        const heartbeat = useSse ? setInterval(() => {
-          progressN += 1
-          if (progressToken !== undefined) {
-            sendSse({
-              jsonrpc: "2.0",
-              method: "notifications/progress",
-              params: { progressToken, progress: progressN },
-            })
-          } else {
-            try {
-              res.write(`: keepalive ${progressN}\n\n`)
-            } catch {}
-          }
-        }, PROXY_HEARTBEAT_MS) : null
-        heartbeat?.unref?.()
+        // Broker-backed calls can block for as long as a subagent runs. The
+        // reply is streamed either way so the client's own HTTP timers never
+        // fire on a silent connection: SSE when the client accepts it
+        // (headers and a comment now, keepalive comments, the JSON-RPC result
+        // as the final event), otherwise a chunked JSON body whose headers go
+        // out now and which carries keepalive whitespace until the result.
+        // Every guard above has already run, so nothing is flushed for an
+        // unauthenticated peer, an unknown tool, or a rejected batch.
+        const channel: ProxyCallChannel = { closed: false }
+        reply = acceptsEventStream(req.headers.accept)
+          ? openEventStream(res, keepaliveMs)
+          : openJsonStream(res, keepaliveMs)
+        res.once("close", () => {
+          reply?.stop()
+          if (res.writableFinished) return
+          channel.closed = true
+          log.notice("proxy-mcp client closed a tool call before its result", {
+            callId,
+            toolName,
+          })
+        })
 
         let timer: ReturnType<typeof setTimeout> | null = null
-        try {
-          const result = await new Promise<ProxyToolResult>((resolve, reject) => {
-            const entry: ProxyToolCall = { id: callId, toolName, input, resolve, reject }
+        const result = await new Promise<ProxyToolResult>(
+          (resolve, reject) => {
+            const entry: ProxyToolCall = {
+              id: callId,
+              toolName,
+              input,
+              resolve,
+              reject,
+              channel,
+              callerContext,
+            }
             pending.set(callId, entry)
-            timer = setTimeout(() => {
-              if (!pending.has(callId)) return
-              pending.delete(callId)
-              log.notice("proxy-mcp tool call timed out", { callId, toolName, deadlineMs })
-              reject(buildProxyTimeoutError(toolName, deadlineMs))
-            }, deadlineMs)
+            const deadlineMs = resolveProxyCallTimeoutMs(
+              toolName,
+              input,
+              timeoutOverrides,
+            )
+            // No deadline means no timer at all: `setTimeout(fn, 0)` would
+            // reject the call on the next tick. The broker applies the same
+            // rule to the same resolved value, so the two layers agree.
+            if (deadlineMs > PROXY_NO_DEADLINE_MS) {
+              timer = setTimeout(() => {
+                if (!pending.has(callId)) return
+                pending.delete(callId)
+                // v0.4.13: demoted from warn to notice. Timeouts are usually
+                // permission-pending while the user is AFK — surfacing each as
+                // a yellow UI bubble produces a wall of noise on return. The
+                // file log still captures the event for diagnostics.
+                log.notice("proxy-mcp tool call timed out", {
+                  callId,
+                  toolName,
+                  deadlineMs,
+                })
+                reject(buildProxyTimeoutError(toolName, deadlineMs))
+              }, deadlineMs)
+            }
             calls.emit("call", entry)
-          }).finally(() => {
-            if (timer) clearTimeout(timer)
-            pending.delete(callId)
+          },
+        ).finally(() => {
+          if (timer) clearTimeout(timer)
+          pending.delete(callId)
+        })
+
+        if (channel.closed) {
+          // Nobody is reading. The language model already saw the closed
+          // channel and hands the result to Claude another way.
+          log.notice("proxy-mcp dropping result for a closed tool call", {
+            callId,
+            toolName,
           })
-          const text = result.kind === "error" ? result.message : result.text
-          const isError = result.kind === "error" || result.isError === true
-          sendResponse({
-            jsonrpc: "2.0",
-            id: requestId,
-            result: { content: [{ type: "text", text }], isError },
-          })
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          log.notice("proxy-mcp tool call rejected; sending error over SSE", {
-            callId, toolName, error: message,
-          })
-          sendResponse({
-            jsonrpc: "2.0",
-            id: requestId,
-            result: { content: [{ type: "text", text: message }], isError: true },
-          })
-        } finally {
-          if (heartbeat) clearInterval(heartbeat)
+          return
         }
-        try {
-          res.end()
-        } catch {}
+        writeToolCallResult(res, requestId, result, reply)
         return
       }
 
@@ -1100,14 +1255,12 @@ export async function createProxyMcpServer(
       // rejects the response as schema-invalid.
       if (requestMethod === "tools/call") {
         try {
-          writeJson(res, {
-            jsonrpc: "2.0",
-            id: requestId,
-            result: {
-              content: [{ type: "text", text: errorMessage }],
-              isError: true,
-            },
-          })
+          writeToolCallResult(
+            res,
+            requestId,
+            { kind: "error", message: errorMessage },
+            reply,
+          )
         } catch {
           try {
             res.statusCode = 500
@@ -1202,6 +1355,15 @@ export async function createProxyMcpServer(
       configFilePath = outPath
       return outPath
     },
+    pendingCallIds() {
+      return [...pending.keys()]
+    },
+    updateCallerContext(context) {
+      callerContext = {
+        ...context,
+        allowedRequestScopedTools: new Set(context.allowedRequestScopedTools),
+      }
+    },
     async close() {
       for (const entry of pending.values()) {
         entry.reject(new Error(SERVER_CLOSED_MESSAGE))
@@ -1243,6 +1405,7 @@ export function disallowedToolFlags(tools: ProxyToolDef[]): string[] {
     grep: ["Grep"],
     webfetch: ["WebFetch"],
     task: ["Agent"],
+    task_batch: ["Agent"],
     // `question` disables Claude Code's built-in `AskUserQuestion` so the
     // structured-questions path flows through opencode's native `question`
     // tool instead — same UI/permission/audit benefits as the other
@@ -1292,6 +1455,202 @@ export function resolveDisallowedTools(options: {
   return out
 }
 
+/** The shape of one `client.tool.list()` entry this resolver needs. */
+export interface OpencodeToolListEntry {
+  id: string
+  description?: string
+  parameters?: unknown
+}
+
+/**
+ * Build proxy defs for the opencode tools named in `proxyOpencodeTools`.
+ *
+ * `resolvedProxyMcpTools` only forwards a tool whose id matches an enabled
+ * MCP server (`<server>` or `<server>_<tool>`), so a tool another opencode
+ * plugin declares directly matches nothing and is dropped. opencode-dcp's
+ * `compress` is the case that motivated this: it is in opencode's registry,
+ * dcp tells the model "you MUST use the `compress` tool now", and under this
+ * provider the model was never offered it. This is the explicit allowlist
+ * that forwards such a tool. It is deliberately never automatic: these run
+ * inside opencode with the caller's permissions, so which ones cross over is
+ * the operator's decision.
+ *
+ * A name already held by another proxy def wins, and the forwarded entry is
+ * dropped with a warning. That is not arbitrary: `ensureProxyServer`
+ * registers interceptors by name and an intercepted call is answered
+ * in-process, so a forwarded def sharing a name with an intercepted one
+ * (`compress` again) could never reach opencode at all. Dropping it loudly
+ * is the difference between documented precedence and a silent shadow.
+ */
+export function resolveProxyOpencodeToolDefs(options: {
+  requested?: readonly string[]
+  items?: readonly OpencodeToolListEntry[]
+  taken?: ReadonlySet<string>
+}): ProxyToolDef[] {
+  const requested = options.requested ?? []
+  if (requested.length === 0) return []
+
+  const items = options.items
+  if (!items) {
+    log.warn(
+      "proxyOpencodeTools is set but opencode's tool registry did not answer;" +
+        " forwarding nothing this spawn",
+      { requested: requested.map(String) },
+    )
+    return []
+  }
+
+  const byLowerId = new Map<string, OpencodeToolListEntry>()
+  for (const item of items) {
+    const key = item.id.toLowerCase()
+    if (!byLowerId.has(key)) byLowerId.set(key, item)
+  }
+
+  const taken = options.taken ?? new Set<string>()
+  const out: ProxyToolDef[] = []
+  const seen = new Set<string>()
+  const unknown: string[] = []
+  const collided: string[] = []
+
+  for (const raw of requested) {
+    const name = String(raw).trim()
+    if (!name) continue
+    const item = byLowerId.get(name.toLowerCase())
+    if (!item) {
+      unknown.push(name)
+      continue
+    }
+    if (taken.has(item.id)) {
+      collided.push(item.id)
+      continue
+    }
+    if (seen.has(item.id)) continue
+    seen.add(item.id)
+    out.push({
+      name: item.id,
+      description: typeof item.description === "string" ? item.description : "",
+      inputSchema:
+        item.parameters && typeof item.parameters === "object"
+          ? (item.parameters as Record<string, unknown>)
+          : { type: "object", properties: {} },
+    })
+  }
+
+  // Same reasoning as the `proxyTools` typo warning: an unrecognised name is
+  // simply not forwarded, and silence looks from the outside like the option
+  // was ignored.
+  if (unknown.length > 0) {
+    log.warn("ignoring unknown proxyOpencodeTools entries", {
+      unknown,
+      known: [...byLowerId.values()].map((item) => item.id).join(", "),
+    })
+  }
+  if (collided.length > 0) {
+    log.warn(
+      "proxyOpencodeTools entry dropped: a proxy tool already holds that name," +
+        " and it keeps it",
+      { collided },
+    )
+  }
+  return out
+}
+
+/** One entry of the AI SDK `tools` array opencode hands `doStream`. */
+export interface ModelToolEntry {
+  type?: string
+  name?: string
+  description?: string
+  inputSchema?: unknown
+}
+
+/** What `resolveMcpProxyToolDefs` found, split by the two things callers need. */
+export interface McpProxyToolResolution {
+  /** One def per MCP tool that will be served from the proxy instead. */
+  defs: ProxyToolDef[]
+  /** Only the servers a def was actually built for. */
+  coveredServers: Set<string>
+}
+
+/**
+ * Build proxy defs for opencode's MCP-backed tools out of the tool array
+ * opencode already passes to `doStream`.
+ *
+ * The discovery source matters, and it is the whole reason this function
+ * exists. The obvious source, `client.tool.list()` behind
+ * `/experimental/tool`, enumerates opencode's `ToolRegistry` only: built-ins
+ * plus plugin-declared tools. MCP tools are not in that registry on 1.18.31,
+ * they are merged into the model's tool set afterwards, so a registry-based
+ * match finds nothing however the prefix rule is written. The AI SDK `tools`
+ * argument is downstream of that merge, so it is the one place a provider
+ * plugin can see them at all.
+ *
+ * Matching is still by enabled-server prefix, longest name first so
+ * `slack_intl_*` resolves to `slack_intl` and not `slack`. That is
+ * deliberately narrow: everything else in the array is a built-in or another
+ * plugin's tool, and forwarding those wholesale is what the explicit
+ * `proxyOpencodeTools` allowlist is for.
+ */
+export function resolveMcpProxyToolDefs(options: {
+  serverNames: readonly string[]
+  tools?: readonly ModelToolEntry[]
+  taken?: ReadonlySet<string>
+}): McpProxyToolResolution {
+  const empty: McpProxyToolResolution = { defs: [], coveredServers: new Set() }
+  const serverNames = options.serverNames ?? []
+  if (serverNames.length === 0) return empty
+
+  const tools = options.tools
+  if (!tools || tools.length === 0) return empty
+
+  const serversByLengthDesc = [...serverNames].sort((a, b) => b.length - a.length)
+  const taken = options.taken ?? new Set<string>()
+  const defs: ProxyToolDef[] = []
+  const coveredServers = new Set<string>()
+  const seen = new Set<string>()
+  const collided: string[] = []
+
+  for (const tool of tools) {
+    // opencode only ever puts plain function tools in this array; a
+    // provider-defined entry has no opencode executor behind it, so
+    // forwarding one would produce a call nothing can answer.
+    if (tool?.type !== undefined && tool.type !== "function") continue
+    const name = typeof tool?.name === "string" ? tool.name.trim() : ""
+    if (!name) continue
+
+    const matchedServer = serversByLengthDesc.find(
+      (server) => name === server || name.startsWith(`${server}_`),
+    )
+    if (!matchedServer) continue
+    if (seen.has(name)) continue
+    if (taken.has(name)) {
+      collided.push(name)
+      continue
+    }
+    seen.add(name)
+    coveredServers.add(matchedServer)
+    defs.push({
+      name,
+      description: typeof tool.description === "string" ? tool.description : "",
+      inputSchema:
+        tool.inputSchema && typeof tool.inputSchema === "object"
+          ? (tool.inputSchema as Record<string, unknown>)
+          : { type: "object", properties: {} },
+    })
+  }
+
+  if (collided.length > 0) {
+    // WARN, not NOTICE: only warn and error are alwaysStderr in src/logger.ts,
+    // and a shadowed MCP tool silently stops being routed through opencode,
+    // which is exactly the class of surprise this lane exists to end.
+    log.warn(
+      "MCP tool not routed through the proxy: another proxy tool already holds" +
+        " that name, and it keeps it",
+      { collided },
+    )
+  }
+  return { defs, coveredServers }
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -1312,20 +1671,112 @@ function writeToolCallResult(
   res: ServerResponse,
   requestId: unknown,
   result: ProxyToolResult,
+  reply: ReplyStream | null = null,
 ): void {
   const text = result.kind === "error" ? result.message : result.text
   const isError = result.kind === "error" || result.isError === true
-  writeJson(res, {
+  const envelope = {
     jsonrpc: "2.0",
     id: requestId ?? null,
     result: {
       content: [{ type: "text", text }],
       isError,
     },
-  })
+  }
+  if (reply) {
+    reply.finish(envelope)
+    return
+  }
+  writeJson(res, envelope)
+}
+
+/**
+ * An in-flight streamed reply whose headers are already on the wire.
+ * `finish` writes the JSON-RPC response and ends the body; `stop` only
+ * cancels the keepalive, for when the client went away first.
+ */
+interface ReplyStream {
+  finish(envelope: unknown): void
+  stop(): void
+}
+
+/**
+ * Write `ping` every `keepaliveMs` until stopped or the response is gone.
+ * Never keeps the host process alive on its own.
+ */
+function startKeepalive(
+  res: ServerResponse,
+  keepaliveMs: number,
+  ping: string,
+): () => void {
+  let timer: ReturnType<typeof setInterval> | null = setInterval(() => {
+    if (res.writableEnded || res.destroyed) {
+      stop()
+      return
+    }
+    res.write(ping)
+  }, keepaliveMs)
+  timer.unref?.()
+  const stop = () => {
+    if (timer) {
+      clearInterval(timer)
+      timer = null
+    }
+  }
+  return stop
+}
+
+/**
+ * SSE reply: the JSON-RPC response goes out as the single `message` event,
+ * which is what the MCP Streamable HTTP client expects for a request
+ * answered over SSE.
+ */
+function openEventStream(res: ServerResponse, keepaliveMs: number): ReplyStream {
+  res.statusCode = 200
+  res.setHeader("Content-Type", "text/event-stream")
+  res.setHeader("Cache-Control", "no-cache, no-transform")
+  res.setHeader("Connection", "keep-alive")
+  res.flushHeaders()
+  // Start the response body without waiting for the tool result.
+  res.write(": open\n\n")
+  const stop = startKeepalive(res, keepaliveMs, ": keepalive\n\n")
+  return {
+    stop,
+    finish(envelope) {
+      stop()
+      if (res.writableEnded || res.destroyed) return
+      res.end(`event: message\ndata: ${JSON.stringify(envelope)}\n\n`)
+    },
+  }
+}
+
+/**
+ * JSON reply for a client that did not ask for SSE (@broskees' 68ed142,
+ * adapted). Headers are flushed at once, which stops the client's header
+ * timer, and whitespace is written on the keepalive cadence, which stops its
+ * body timer. There is no `Content-Length`, so the body is chunked, and the
+ * envelope is written last: whitespace before a JSON value is insignificant
+ * (RFC 8259), so the whole body still parses as the one JSON-RPC response,
+ * on success and on error alike.
+ */
+function openJsonStream(res: ServerResponse, keepaliveMs: number): ReplyStream {
+  res.statusCode = 200
+  res.setHeader("Content-Type", "application/json")
+  res.setHeader("Cache-Control", "no-cache, no-transform")
+  res.flushHeaders()
+  const stop = startKeepalive(res, keepaliveMs, " ")
+  return {
+    stop,
+    finish(envelope) {
+      stop()
+      if (res.writableEnded || res.destroyed) return
+      res.end(JSON.stringify(envelope))
+    },
+  }
 }
 
 function writeJson(res: ServerResponse, body: unknown): void {
+  if (res.destroyed || res.writableEnded) return
   const payload = JSON.stringify(body)
   res.statusCode = 200
   res.setHeader("Content-Type", "application/json")

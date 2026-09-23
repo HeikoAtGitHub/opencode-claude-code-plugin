@@ -3,6 +3,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { execFileSync } from "node:child_process"
 import { randomUUID } from "node:crypto"
+import { cliHygieneEnv } from "./cli-version.js"
 
 /**
  * Persistent interactive Claude Code session driven over Bun's NATIVE PTY
@@ -78,6 +79,9 @@ export interface ClaudeSessionOptions {
   /** Strip ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN from the spawn env so the
    *  CLI uses subscription auth instead of pay-as-you-go API billing. */
   ignoreAnthropicApiKey?: boolean
+  /** CLI effort level (low | medium | high | xhigh | max), exported as
+   *  CLAUDE_CODE_EFFORT_LEVEL so it overrides the account's settings.json. */
+  effort?: string
   cols?: number
   rows?: number
   bootMinMs?: number
@@ -102,6 +106,33 @@ export interface ClaudeSessionOptions {
    *  rejects with an "aborted" error. */
   signal?: AbortSignal
   debug?: boolean
+}
+
+/**
+ * Env for the interactive (TUI) child. The headless counterpart is
+ * `claudeSpawnEnv` in session-manager.ts; both must apply `cliHygieneEnv`, so
+ * this is a named function rather than an object literal inside `Bun.spawn`,
+ * which no test can reach without a real PTY.
+ */
+export function interactiveSpawnEnv(opts: {
+  configDir: string
+  ignoreAnthropicApiKey?: boolean
+  effort?: string
+}): Record<string, string | undefined> {
+  return {
+    ...process.env,
+    CLAUDE_CONFIG_DIR: opts.configDir,
+    TERM: "xterm-256color",
+    // Pin the binary so a mid-session autoupdate cannot invalidate the
+    // detected version the flag gates read, and skip non-essential traffic.
+    // Fills gaps only, so a var the user exported survives untouched.
+    ...cliHygieneEnv(),
+    MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? "86400000",
+    ...(opts.ignoreAnthropicApiKey
+      ? { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined }
+      : {}),
+    ...(opts.effort ? { CLAUDE_CODE_EFFORT_LEVEL: opts.effort } : {}),
+  }
 }
 
 const TERMINAL_STOP = new Set(["end_turn", "stop_sequence", "max_tokens"])
@@ -141,6 +172,7 @@ export class ClaudeSession {
       | "extraArgs"
       | "signal"
       | "ignoreAnthropicApiKey"
+      | "effort"
     >
   > &
     Pick<
@@ -151,6 +183,7 @@ export class ClaudeSession {
       | "settingSources"
       | "extraArgs"
       | "ignoreAnthropicApiKey"
+      | "effort"
     >
 
   constructor(opts: ClaudeSessionOptions = {}) {
@@ -172,6 +205,7 @@ export class ClaudeSession {
       settingSources: opts.settingSources,
       extraArgs: opts.extraArgs ?? [],
       ignoreAnthropicApiKey: opts.ignoreAnthropicApiKey,
+      effort: opts.effort,
       cols: opts.cols ?? 200,
       rows: opts.rows ?? 50,
       bootMinMs: opts.bootMinMs ?? 3000,
@@ -214,18 +248,13 @@ export class ClaudeSession {
     this.lastDataAt = Date.now()
     this.proc = Bun.spawn([claude, ...args], {
       cwd: this.cwd,
-      env: {
-        ...process.env,
-        CLAUDE_CONFIG_DIR: this.o.configDir,
-        TERM: "xterm-256color",
-        // Interactive proxy tools (notably submit_plan) block server-side for
-        // up to 24h waiting for human plan review; match that client-side so
-        // the approval/feedback isn't dropped by a short MCP tool timeout.
-        MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? "86400000",
-        ...(this.o.ignoreAnthropicApiKey
-          ? { ANTHROPIC_API_KEY: undefined, ANTHROPIC_AUTH_TOKEN: undefined }
-          : {}),
-      },
+      env: interactiveSpawnEnv({
+        // The resolved field, not `this.o.configDir`: same value (the
+        // constructor copies it in) but typed as always present.
+        configDir: this.configDir,
+        ignoreAnthropicApiKey: this.o.ignoreAnthropicApiKey,
+        effort: this.o.effort,
+      }),
       terminal: {
         cols: this.o.cols,
         rows: this.o.rows,

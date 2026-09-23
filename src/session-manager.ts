@@ -1,17 +1,28 @@
 import { spawn, type ChildProcess } from "node:child_process"
 import { createInterface } from "node:readline"
+import { randomUUID } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { unlink } from "node:fs/promises"
 import { log } from "./logger.js"
-import type { ProxyMcpServer } from "./proxy-mcp.js"
-import { clearLedger } from "./todo-ledger.js"
-import { clearExitPlanModeQuestions } from "./plan-mode-question.js"
+import { SERVER_CLOSED_MESSAGE, type ProxyMcpServer, type ProxyToolResult } from "./proxy-mcp.js"
 import {
+  getPendingProxyCalls,
+  rejectAllPendingProxyCallsForSession,
+  type PendingProxyCall,
+} from "./proxy-broker.js"
+import { clearLedger } from "./todo-ledger.js"
+import { clearExitPlanModeQuestions, hasExitPlanModeQuestions } from "./plan-mode-question.js"
+import { clearAccountFailoverQuestions } from "./account-failover.js"
+import { clearCompression } from "./compression-store.js"
+import {
+  cliHygieneEnv,
   cliSupportsFastMode,
   cliSupportsThinking,
   cliSupportsThinkingDisplay,
   type CliVersion,
 } from "./cli-version.js"
+import type { ReasoningEffort } from "./types.js"
+import { dispatchSideQuestionResponse, isSideQuestionPending } from "./side-question.js"
 
 export interface ActiveProcess {
   proc: ChildProcess
@@ -24,14 +35,136 @@ export interface ActiveProcess {
    * and force a respawn.
    */
   mcpHash?: string | null
-  /** Hash of proxy definitions exposed to this process. Reuse is safe only
-   * while the current request resolves to the same exposure set. */
+  /** Hash of effective request-scoped proxy definitions for reuse safety. */
   proxyExposureHash?: string
   /** Temp file holding `--append-system-prompt-file` content; unlinked on exit. */
   systemPromptFile?: string
-  /** Hash of the complete appended system prompt. Reuse is safe only while
-   * current forwarded system context and proxy runtime guidance match. */
-  systemPromptHash?: string
+  /** Effort the process was spawned with, so a respawn keeps it. */
+  effort?: ReasoningEffort
+  /** When the child was spawned, so `/claude-code-doctor` can report its age. */
+  startedAt?: number
+  /**
+   * The binary this child was spawned with. Account failover compares it
+   * against the path the current turn resolves to: a difference means the
+   * conversation has moved to another account, and the process plus its
+   * Claude session id have to go because a transcript cannot resume across
+   * accounts. Absent on the interactive shim, which never fails over.
+   */
+  cliPath?: string
+  cliArgs?: string[]
+  // Retain resolved calls until continuation settles, including late channel closure.
+  pendingProxyCompletions?: Map<string, {
+    call: PendingProxyCall
+    result: ProxyToolResult
+    recoveryRequired: boolean
+  }>
+  /**
+   * stdout lines the child emitted while no turn had a line listener
+   * attached (between opencode turns). Bounded; see `bufferUnattendedLine`.
+   * Absent on the interactive shim, which has no unattended window.
+   */
+  unattendedLines?: string[]
+  /** Lines evicted from `unattendedLines` because the cap was hit. */
+  unattendedDropped?: number
+  /**
+   * opencode session this process last served, tagged by doStream each turn.
+   * `/btw` runs from a command hook that only knows the session id, so this is
+   * how it finds the process to ask (see `findActiveProcessBySessionId`).
+   */
+  opencodeSessionID?: string
+  /** What the /btw command hook needs to send a side question to this process early. */
+  asideTransport?: { cliPath: string; interactive: boolean }
+  /**
+   * True from a stdin write that asks the CLI for work until its terminal
+   * `result` line, whether or not a turn is still listening. Set by
+   * `noteTurnStarted`, cleared by `noteTurnLine` (see `interruptTurn`).
+   */
+  turnInFlight?: boolean
+  turnIdleWaiters?: Array<() => void>
+  /**
+   * Tail of what the child last wrote to stderr, capped at
+   * `STDERR_RETAIN_BYTES` with the newest bytes kept. Often the only record
+   * of why a child died when it closed without emitting a terminal `result`
+   * line; see `describeChildCrash`.
+   */
+  lastStderr?: string
+}
+
+/** Most recently used process serving an opencode session id, if any. */
+export function findActiveProcessBySessionId(sessionID: string): ActiveProcess | undefined {
+  let found: ActiveProcess | undefined
+  // Map order is LRU (see `touch`), so the last match is the freshest.
+  for (const ap of activeProcesses.values()) {
+    if (ap.opencodeSessionID === sessionID) found = ap
+  }
+  return found
+}
+
+// A child normally only speaks while a doStream turn is listening. The one
+// exception is a turn that ended on the CLI's side while opencode was still
+// waiting on a proxy call (Claude's MCP client gave up on the request and
+// the model carried on alone). Keep what it said so the next turn can show
+// it instead of losing it; cap it so a runaway child cannot grow the heap.
+const UNATTENDED_LINE_CAP = 500
+const UNATTENDED_BYTE_CAP = 2 * 1024 * 1024
+
+export function bufferUnattendedLine(ap: ActiveProcess, line: string): void {
+  const lines = (ap.unattendedLines ??= [])
+  lines.push(line)
+  let bytes = 0
+  for (const kept of lines) bytes += Buffer.byteLength(kept)
+  while (
+    lines.length > 0 &&
+    (lines.length > UNATTENDED_LINE_CAP || bytes > UNATTENDED_BYTE_CAP)
+  ) {
+    bytes -= Buffer.byteLength(lines.shift()!)
+    ap.unattendedDropped = (ap.unattendedDropped ?? 0) + 1
+  }
+}
+
+/** Hand over and clear everything the child said while nobody listened. */
+export function takeUnattendedLines(ap: ActiveProcess): {
+  lines: string[]
+  dropped: number
+} {
+  const lines = ap.unattendedLines ?? []
+  const dropped = ap.unattendedDropped ?? 0
+  ap.unattendedLines = []
+  ap.unattendedDropped = 0
+  return { lines, dropped }
+}
+
+// The CLI writes its own diagnostics to stderr, which is where the reason a
+// child died is usually the only thing on record. Keep the tail so a turn
+// that ends with the child gone can say why; bounded, newest bytes win.
+const STDERR_RETAIN_BYTES = 2 * 1024
+
+export function retainStderr(ap: ActiveProcess, chunk: string): void {
+  ap.lastStderr = ((ap.lastStderr ?? "") + chunk).slice(-STDERR_RETAIN_BYTES)
+}
+
+/**
+ * One line (plus the stderr tail) explaining a child that closed its stdio
+ * without emitting a terminal `result`. Before this the turn simply finished
+ * with reason `stop` and empty usage, so a crashed CLI read as a short but
+ * successful answer.
+ */
+export function describeChildCrash(
+  exitCode: number | null | undefined,
+  signal: NodeJS.Signals | null | undefined,
+  lastStderr: string | undefined,
+): string {
+  const how = signal
+    ? `was killed by ${signal}`
+    : typeof exitCode === "number"
+      ? `exited with code ${exitCode}`
+      : "closed its output"
+  const tail = lastStderr?.trim()
+  return (
+    `The Claude Code CLI ${how} before finishing this turn (no result was emitted), ` +
+    "so the answer above may be incomplete." +
+    (tail ? `\n\nLast stderr from the CLI:\n${tail}` : "")
+  )
 }
 
 // One active CLI process per session key. Keyed by a composite
@@ -40,13 +173,40 @@ export interface ActiveProcess {
 // make this a poor-man's LRU; see `touch()` below.
 const activeProcesses = new Map<string, ActiveProcess>()
 const claudeSessions = new Map<string, string>()
+// Idle-eviction timers keyed like `activeProcesses` (idle timeout by
+// @bernardofortes, absorbed from a5f723a).
+const idleEvictionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const MAX_IDLE_TIMEOUT_MS = 2_147_483_647
+
+/**
+ * Idle eviction is off unless `idleProcessTimeoutMs` is set: an unset option
+ * resolves to 0, which arms no timer, so workers live until LRU eviction as
+ * they always have. PR #36 (@broskees) proposed 30 minutes by default; that
+ * was reverted at merge because it changes when a resumed chat pays for a
+ * fresh `--resume` spawn, which is the user's call. An idle `claude --print`
+ * holds roughly 250 MB resident, so setting it is worth documenting, not
+ * imposing. The Claude session id survives eviction either way.
+ */
+export const DEFAULT_IDLE_PROCESS_TIMEOUT_MS = 0
+
+/** The idle timeout a caller-facing option resolves to: unset means the default. */
+export function resolveIdleProcessTimeoutMs(configured: number | undefined): number {
+  return configured === undefined ? DEFAULT_IDLE_PROCESS_TIMEOUT_MS : configured
+}
 
 // Cap on live CLI subprocesses. Session-affinity-keyed entries accumulate
 // one-per-chat, so an unbounded map would leak processes as users open new
-// chats. This caps at a reasonable working-set and evicts the oldest.
-const MAX_ACTIVE_PROCESSES = 16
+// chats. This caps at a reasonable working-set and evicts the oldest idle
+// one, never a process that is mid-turn. Kept at 16: PR #36 proposed 8 on
+// the assumption that a default idle timer does the real work, and that
+// default was not adopted, so the cap is still the only bound.
+export const MAX_ACTIVE_PROCESSES = 16
 const PROCESS_EXIT_TIMEOUT_MS = 1_500
 const PROCESS_FORCE_EXIT_TIMEOUT_MS = 500
+/** Same wording the attached turn's close handler uses, so one log line
+ * shape covers a child that died mid-turn and one that died between turns. */
+export const CHILD_EXITED_MESSAGE =
+  "Claude CLI subprocess closed before pending tool calls were resolved"
 
 function envFlagEnabled(value: string | undefined): boolean {
   if (value === undefined) return false
@@ -62,18 +222,40 @@ export function isClaudeThinkingDisabled(): boolean {
   )
 }
 
+/**
+ * The CLI's effort vocabulary is low | medium | high | xhigh | max. `minimal`
+ * is this provider's own lowest step with no CLI counterpart, so it lands on
+ * `low`.
+ */
+export function cliEffortLevel(effort: ReasoningEffort): string {
+  return effort === "minimal" ? "low" : effort
+}
+
 export function claudeSpawnEnv(opts?: {
   ignoreAnthropicApiKey?: boolean
+  /** Reasoning effort for this spawn; wins over a shell-level override. */
+  effort?: ReasoningEffort
 }): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     TERM: "xterm-256color",
-    // Interactive proxy tools (notably submit_plan) block server-side for up
-    // to 24h waiting for human plan review. Claude Code's default MCP tool
-    // timeout is far shorter, so the client abandons the call early and the
-    // user's approval/feedback never returns into the session. Match the
-    // server-side ceiling; pass through any value the user set explicitly.
+    // Pin the child to the binary whose version we detected, and keep it off
+    // non-essential network calls. Fills gaps only, so an explicit shell value
+    // survives: see `cliHygieneEnv` for why the version has to hold still.
+    ...cliHygieneEnv(),
+    // Claude's MCP client otherwise applies a much shorter ambient ceiling.
+    // Fill gaps only; explicit user configuration wins.
     MCP_TOOL_TIMEOUT: process.env.MCP_TOOL_TIMEOUT ?? "86400000",
+  }
+
+  // Effort travels as CLAUDE_CODE_EFFORT_LEVEL, which the CLI treats as the
+  // session-wide override (it beats settings.json and `/effort`). An env var
+  // rather than `--effort` because a CLI too old to know it ignores it
+  // instead of refusing to start. Unlike the thinking vars below, an explicit
+  // effort from the request wins over the shell: the variant picker and an
+  // agent's `reasoningEffort` are per-request choices, a shell export is not.
+  if (opts?.effort) {
+    env.CLAUDE_CODE_EFFORT_LEVEL = cliEffortLevel(opts.effort)
   }
 
   // Force subscription auth: with an API key in the env, Claude Code bills
@@ -105,31 +287,273 @@ function touch(key: string): void {
   }
 }
 
-function evictIfNeeded(): void {
+/**
+ * Make room for a new child, but never by killing one that is mid-turn.
+ * Insertion order is LRU, so the first idle entry is the oldest safe victim.
+ * Evicting an in-flight process truncates that turn silently: its readline
+ * closes, the close handler finishes the stream, and the operator sees a
+ * half-written answer with no error. When every process is busy we exceed the
+ * cap for now rather than kill live work; the next spawn tries again.
+ */
+export function evictIfNeeded(): void {
   while (activeProcesses.size >= MAX_ACTIVE_PROCESSES) {
-    const oldestKey = activeProcesses.keys().next().value
-    if (!oldestKey) break
-    log.info("evicting LRU claude process", { sessionKey: oldestKey })
-    deleteActiveProcess(oldestKey)
+    let victimKey: string | undefined
+    for (const [key, ap] of activeProcesses) {
+      if (!isTurnInFlight(ap)) {
+        victimKey = key
+        break
+      }
+    }
+    if (!victimKey) {
+      log.warn("every claude process is mid-turn; skipping LRU eviction", {
+        active: activeProcesses.size,
+        cap: MAX_ACTIVE_PROCESSES,
+      })
+      return
+    }
+    log.info("evicting LRU claude process", { sessionKey: victimKey })
+    deleteActiveProcess(victimKey)
   }
+}
+
+// Turn lifecycle and interrupt (from @broskees' 68ed142, adapted).
+//
+// The Claude CLI runs one turn per process. Closing the opencode-side stream
+// tells it nothing: before this, an abort only detached our listeners and the
+// CLI ran the abandoned turn to completion (Joseph Roberts measured ~7,500
+// extra characters generated after abort on a haiku probe), kept billing, kept
+// running tools, and its late output landed in whatever turn came next, whose
+// own stream was then closed early by the stale `result`. The CLI answers a
+// stream-json `control_request` of subtype `interrupt` by aborting the turn
+// and emitting a terminal `result`, normally within milliseconds.
+
+const TURN_INTERRUPT_TIMEOUT_MS = 5_000
+
+/** Cheap pre-filter before JSON.parse, since every CLI stdout line hits this. */
+function isTerminalResultLine(line: string): boolean {
+  if (!line.includes('"result"')) return false
+  try {
+    return (JSON.parse(line) as { type?: string }).type === "result"
+  } catch {
+    return false
+  }
+}
+
+function settleTurn(ap: ActiveProcess): void {
+  ap.turnInFlight = false
+  const waiters = ap.turnIdleWaiters ?? []
+  ap.turnIdleWaiters = []
+  for (const wake of waiters) wake()
+}
+
+/** Call immediately before any stdin write that asks the CLI to do work. */
+export function noteTurnStarted(ap: ActiveProcess): void {
+  // The interactive transport never reports through `noteTurnLine`, so a flag
+  // set there would never clear.
+  if (ap.asideTransport?.interactive) return
+  ap.turnInFlight = true
+}
+
+/**
+ * Feed every CLI stdout line here, independent of whichever turn currently
+ * owns the stream: a `result` that lands after its turn detached (the abort
+ * case) must still mark the CLI idle rather than leak into the next turn.
+ */
+export function noteTurnLine(ap: ActiveProcess, line: string): void {
+  if (!ap.turnInFlight) return
+  if (isTerminalResultLine(line)) settleTurn(ap)
+}
+
+export function isTurnInFlight(ap: ActiveProcess): boolean {
+  return ap.turnInFlight === true
+}
+
+/** Resolves true once the CLI is idle, false if it stayed busy past the timeout. */
+export function awaitTurnIdle(ap: ActiveProcess, timeoutMs: number): Promise<boolean> {
+  if (!ap.turnInFlight) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    const wake = () => {
+      clearTimeout(timer)
+      resolve(true)
+    }
+    const timer = setTimeout(() => {
+      const waiters = ap.turnIdleWaiters ?? []
+      const at = waiters.indexOf(wake)
+      if (at >= 0) waiters.splice(at, 1)
+      resolve(false)
+    }, timeoutMs)
+    ;(ap.turnIdleWaiters ??= []).push(wake)
+  })
+}
+
+/** Ask the CLI to abandon the in-flight turn, and wait for it to say it did. */
+export function interruptTurn(
+  ap: ActiveProcess,
+  timeoutMs = TURN_INTERRUPT_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!ap.turnInFlight) return Promise.resolve(true)
+  const stdin = ap.proc.stdin
+  if (ap.asideTransport?.interactive || !stdin || !stdin.writable) {
+    // A TUI stdin would type the JSON in as text. Wait the turn out instead.
+    log.notice("cannot interrupt this transport; waiting for the turn to end")
+    return awaitTurnIdle(ap, timeoutMs)
+  }
+  try {
+    stdin.write(
+      JSON.stringify({
+        type: "control_request",
+        request_id: randomUUID(),
+        request: { subtype: "interrupt" },
+      }) + "\n",
+    )
+  } catch (error) {
+    log.warn("failed to write interrupt control request", {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return Promise.resolve(false)
+  }
+  return awaitTurnIdle(ap, timeoutMs)
+}
+
+function cancelIdleProcessEviction(key: string): void {
+  const timer = idleEvictionTimers.get(key)
+  if (!timer) return
+  clearTimeout(timer)
+  idleEvictionTimers.delete(key)
 }
 
 export function getActiveProcess(key: string): ActiveProcess | undefined {
   const ap = activeProcesses.get(key)
-  if (ap) touch(key)
+  if (ap) {
+    cancelIdleProcessEviction(key)
+    touch(key)
+  }
   return ap
 }
 
 export function setActiveProcess(key: string, ap: ActiveProcess): void {
+  cancelIdleProcessEviction(key)
   activeProcesses.set(key, ap)
 }
 
+/**
+ * Evict a headless Claude worker after a completed turn has stayed idle.
+ * Armed by the turn's `completeResult`, so the clock starts when a turn
+ * finishes, not when the child was spawned. Reusing the worker through
+ * `getActiveProcess` cancels the timer. The Claude session id is
+ * intentionally retained so the next turn can continue the same conversation
+ * via `--resume`. A process found mid-turn when the timer fires (a recovered
+ * continuation, an auto-continue, a late tool result) is not evicted; the
+ * timer is re-armed instead, the same rule the LRU cap follows.
+ */
+export function scheduleIdleProcessEviction(
+  key: string,
+  timeoutMs: number | undefined,
+): void {
+  cancelIdleProcessEviction(key)
+  if (
+    typeof timeoutMs !== "number" ||
+    !Number.isFinite(timeoutMs) ||
+    timeoutMs <= 0 ||
+    timeoutMs > MAX_IDLE_TIMEOUT_MS
+  ) {
+    return
+  }
+
+  const scheduledProcess = activeProcesses.get(key)
+  if (!scheduledProcess) return
+
+  const timer = setTimeout(() => {
+    idleEvictionTimers.delete(key)
+    if (activeProcesses.get(key) !== scheduledProcess) return
+    if (isTurnInFlight(scheduledProcess)) {
+      log.info("idle timer found a turn in flight; re-arming", { sessionKey: key, timeoutMs })
+      scheduleIdleProcessEviction(key, timeoutMs)
+      return
+    }
+    log.info("evicting idle claude process", { sessionKey: key, timeoutMs })
+    deleteActiveProcess(key)
+  }, timeoutMs)
+  timer.unref()
+  idleEvictionTimers.set(key, timer)
+}
+
+/** Whether an idle-eviction timer is armed for the key (read-only, for tests). */
+export function isIdleProcessEvictionScheduled(key: string): boolean {
+  return idleEvictionTimers.has(key)
+}
+
 function detachActiveProcess(key: string): ActiveProcess | undefined {
+  cancelIdleProcessEviction(key)
   const ap = activeProcesses.get(key)
   if (!ap) return undefined
   activeProcesses.delete(key)
-  void ap.proxyServer?.close()
+  if (ap.proxyServer) {
+    void ap.proxyServer.close()
+    // The server's close already answered every open HTTP request with an
+    // error; the broker's entries for them can never be resolved to anyone
+    // now, and a `task` call has no deadline that would otherwise reap them.
+    rejectAllPendingProxyCallsForSession(key, new Error(SERVER_CLOSED_MESSAGE))
+  }
   return ap
+}
+
+/**
+ * Release everything this plugin holds for one opencode session that was
+ * deleted: its live `claude` children (any model, effort, or compaction
+ * spawn), the remembered Claude session ids, and per-session state. Unlike
+ * idle eviction this is a real deletion, so nothing is kept for a resume.
+ * The `"default"` affinity is the shared bucket used when no session id is
+ * known and is deliberately never matched. Returns the released keys.
+ */
+export function deleteActiveProcessesForSession(sessionID: string): string[] {
+  if (!sessionID || sessionID === "default") return []
+  const released: string[] = []
+  for (const [key, ap] of [...activeProcesses]) {
+    const owned =
+      ap.opencodeSessionID === sessionID || describeSessionKey(key).session === sessionID
+    if (!owned) continue
+    log.info("releasing claude process for deleted session", { sessionKey: key, sessionID })
+    void deleteActiveProcessAndWait(key)
+    released.push(key)
+  }
+  // Session ids and per-session state can outlive their process (idle
+  // eviction keeps them for `--resume`); a deleted session never resumes.
+  for (const key of [...claudeSessions.keys()]) {
+    if (describeSessionKey(key).session !== sessionID) continue
+    deleteClaudeSessionId(key)
+    clearCompression(key)
+    if (!released.includes(key)) released.push(key)
+  }
+  return released
+}
+
+/**
+ * Synchronous best-effort sweep for host process exit. Node does not kill
+ * children on exit, so without this a hard opencode shutdown reparents every
+ * live `claude` to init. Must stay sync: `process.on("exit")` runs no async
+ * work. Session ids are left alone; the process is going away with them.
+ */
+export function killAllActiveProcesses(): string[] {
+  const keys = [...activeProcesses.keys()]
+  for (const key of keys) deleteActiveProcess(key)
+  return keys
+}
+
+let processExitCleanupWired = false
+
+/**
+ * Arm `killAllActiveProcesses` for host process exit, once per process. The
+ * plugin entry can run more than once (tests, account expansion), and each
+ * run must not add another `exit` listener. Returns whether this call armed it.
+ */
+export function ensureProcessExitCleanup(): boolean {
+  if (processExitCleanupWired) return false
+  processExitCleanupWired = true
+  process.once("exit", () => {
+    killAllActiveProcesses()
+  })
+  return true
 }
 
 export function deleteActiveProcess(key: string): void {
@@ -195,15 +619,101 @@ export function getClaudeSessionId(key: string): string | undefined {
   return claudeSessions.get(key)
 }
 
+/**
+ * A Claude session id outlives its process on purpose, so nothing in the
+ * ordinary lifecycle ever removes one: under a long-lived `opencode serve`
+ * that hops projects and models this map only grows, and each entry pins a
+ * todo ledger with it. The cap is the same shape as
+ * `MAX_COMPRESSION_ENTRIES`, and it is generous because the cost of getting
+ * it wrong is a conversation that silently restarts.
+ */
+export const MAX_CLAUDE_SESSION_ENTRIES = 64
+
+/**
+ * A key with a live process, a proxied call still in the air or an unanswered
+ * plan-mode question is doing work that the id is part of; dropping it would
+ * strand that work on a session the next turn no longer resumes. Read from
+ * the map directly rather than through `getActiveProcess`: that one refreshes
+ * LRU order and cancels idle timers, which a scan must not do.
+ */
+function claudeSessionIsBusy(key: string): boolean {
+  if (activeProcesses.has(key)) return true
+  return getPendingProxyCalls(key).length > 0 || hasExitPlanModeQuestions(key)
+}
+
+/**
+ * Shed the least recently used idle sessions. When every key is busy this
+ * evicts nothing and the map runs over the cap for a while, the same rule
+ * `evictIfNeeded` follows: exceeding a cap briefly is cheaper than cutting a
+ * conversation that is still running.
+ */
+function capClaudeSessions(): void {
+  for (const key of [...claudeSessions.keys()]) {
+    if (claudeSessions.size <= MAX_CLAUDE_SESSION_ENTRIES) return
+    if (claudeSessionIsBusy(key)) continue
+    log.info("claude session cap reached; releasing an idle session", {
+      sessionKey: key,
+      size: claudeSessions.size,
+      cap: MAX_CLAUDE_SESSION_ENTRIES,
+    })
+    // Through the central release so the todo ledger and any pending
+    // plan-mode question go with it rather than outliving the id.
+    deleteClaudeSessionId(key)
+  }
+}
+
 export function setClaudeSessionId(key: string, sessionId: string): void {
+  // Re-inserting moves the key to the back, so the cap sheds the conversation
+  // that has been quiet longest rather than the one that started first.
+  claudeSessions.delete(key)
   claudeSessions.set(key, sessionId)
+  capClaudeSessions()
 }
 
 export function deleteClaudeSessionId(key: string): void {
   clearExitPlanModeQuestions(key)
+  clearAccountFailoverQuestions(key)
   const claudeSessionId = claudeSessions.get(key)
   if (claudeSessionId) clearLedger(claudeSessionId)
   claudeSessions.delete(key)
+}
+
+export function effortSessionKey(baseKey: string, effort?: ReasoningEffort): string {
+  return effort ? `${baseKey}::effort=${effort}` : baseKey
+}
+
+/** Retire sibling effort sessions before deciding whether to replay history. */
+export function invalidateOtherEffortSessions(
+  baseKey: string,
+  effort?: ReasoningEffort,
+): void {
+  const levels: (ReasoningEffort | undefined)[] = [
+    undefined, "minimal", "low", "medium", "high", "xhigh", "max",
+  ]
+  const staleKeys = levels
+    .filter((level) => level !== effort)
+    .map((level) => effortSessionKey(baseKey, level))
+
+  // Refuse the transition atomically. Tool results and recovery completions
+  // still belong to the old process; they must finish at its original effort.
+  for (const key of staleKeys) {
+    const active = activeProcesses.get(key)
+    if (
+      getPendingProxyCalls(key).length ||
+      hasExitPlanModeQuestions(key) ||
+      active?.pendingProxyCompletions?.size ||
+      (active && (active.lineEmitter.listenerCount("line") > 0 || isSideQuestionPending(active)))
+    ) {
+      throw new Error(
+        "Cannot change reasoning effort while the previous effort session has pending work. Finish that work at its original effort first.",
+      )
+    }
+  }
+  for (const key of staleKeys) {
+    deleteActiveProcess(key)
+    deleteClaudeSessionId(key)
+    clearCompression(key)
+  }
 }
 
 export function spawnClaudeProcess(
@@ -215,44 +725,78 @@ export function spawnClaudeProcess(
   mcpHash?: string | null,
   systemPromptFile?: string,
   ignoreAnthropicApiKey?: boolean,
-  proxyExposureHash?: string,
-  systemPromptHash?: string,
+  effort?: ReasoningEffort,
 ): ActiveProcess {
   evictIfNeeded()
-  log.info("spawning new claude process", { cliPath, cliArgs, cwd, sessionKey })
+  log.info("spawning new claude process", {
+    cliPath,
+    cliArgs,
+    cwd,
+    sessionKey,
+    effort,
+  })
 
   const proc = spawn(cliPath, cliArgs, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: claudeSpawnEnv({ ignoreAnthropicApiKey }),
+    env: claudeSpawnEnv({ ignoreAnthropicApiKey, effort }),
     shell: process.platform === "win32",
   })
 
   const lineEmitter = new EventEmitter()
-
-  const rl = createInterface({ input: proc.stdout! })
-  rl.on("line", (line: string) => {
-    lineEmitter.emit("line", line)
-  })
-  rl.on("close", () => {
-    lineEmitter.emit("close")
-  })
 
   const ap: ActiveProcess = {
     proc,
     lineEmitter,
     proxyServer: proxyServer ?? null,
     mcpHash,
-    proxyExposureHash,
     systemPromptFile,
-    systemPromptHash,
+    effort,
+    startedAt: Date.now(),
+    cliPath,
+    cliArgs: [...cliArgs],
+    unattendedLines: [],
+    unattendedDropped: 0,
   }
+
+  const rl = createInterface({ input: proc.stdout! })
+  rl.on("line", (line: string) => {
+    if (dispatchSideQuestionResponse(ap, line)) return
+    noteTurnLine(ap, line)
+    if (lineEmitter.listenerCount("line") === 0) {
+      bufferUnattendedLine(ap, line)
+      return
+    }
+    lineEmitter.emit("line", line)
+  })
+  rl.on("close", () => {
+    settleTurn(ap)
+    lineEmitter.emit("close")
+  })
+  cancelIdleProcessEviction(sessionKey)
   activeProcesses.set(sessionKey, ap)
 
   // Baseline 'error' listener so Node doesn't throw when the process emits
   // an error between stream turns (no per-stream listener attached then).
   proc.on("error", (err) => {
     log.error("claude process error", { sessionKey, error: err.message })
+  })
+
+  // Same baseline for the child's stdin, which is a separate emitter. Every
+  // write that asks the CLI for work (fresh envelope, auto-continue, the
+  // watchdog re-send, the interrupt request) can land after the child died,
+  // and an unhandled 'error' on a stream throws inside opencode's own
+  // process. Ending the turn is not this handler's job: the child is gone,
+  // so its readline 'close' follows and the turn's close handler reports it
+  // (see `describeChildCrash`). Releasing `turnInFlight` is, since no
+  // terminal `result` is ever coming for a write that never arrived.
+  proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+    log.warn("claude process stdin error", {
+      sessionKey,
+      code: err.code,
+      error: err.message,
+    })
+    settleTurn(ap)
   })
 
   proc.on("exit", (code, signal) => {
@@ -262,7 +806,20 @@ export function spawnClaudeProcess(
       void unlink(systemPromptFile).catch(() => {})
     }
     const ownsSessionKey = activeProcesses.get(sessionKey) === ap
-    if (ownsSessionKey) activeProcesses.delete(sessionKey)
+    if (ownsSessionKey) {
+      cancelIdleProcessEviction(sessionKey)
+      activeProcesses.delete(sessionKey)
+      // The child is the only thing that could still consume these calls'
+      // results. A turn that is attached rejects them from its own close
+      // handler; this covers a child that dies between turns, which no
+      // deadline would otherwise reap now that `task` has none.
+      if (getPendingProxyCalls(sessionKey).length > 0) {
+        rejectAllPendingProxyCallsForSession(
+          sessionKey,
+          new Error(CHILD_EXITED_MESSAGE),
+        )
+      }
+    }
     if (ownsSessionKey && code !== 0 && code !== null) {
       log.info("process exited with error, clearing session", {
         code,
@@ -275,6 +832,7 @@ export function spawnClaudeProcess(
   proc.stderr?.on("data", (data: Buffer) => {
     const stderr = data.toString()
     log.debug("stderr", { data: stderr.slice(0, 200) })
+    retainStderr(ap, stderr)
 
     // "No conversation found with session ID: <uuid>" is what `--resume`
     // prints for a purged transcript — note the lowercase "session ID",
@@ -346,6 +904,13 @@ export function appendResumeIfNeeded(
  * `spawnClaudeProcess`. `claudeSessions` is left intact so the respawn can
  * add `--resume` (see `appendResumeIfNeeded`).
  *
+ * The respawn happens in the middle of the same logical turn, and the caller
+ * re-sends that turn's envelope at once. Turn state lives on the
+ * `ActiveProcess`, so the replacement inherits the old process's in-flight
+ * marker (@broskees' b719497); without that handoff abort, LRU eviction, the
+ * idle timer and the next turn's quiesce all mistake the busy replacement
+ * for an idle process.
+ *
  * Returns the new `ActiveProcess`, or `undefined` if there was no active
  * process for the key (caller should treat that as "nothing to respawn").
  */
@@ -358,6 +923,7 @@ export function respawnActiveProcess(
 ): ActiveProcess | undefined {
   const old = activeProcesses.get(sessionKey)
   if (!old) return undefined
+  const turnWasInFlight = isTurnInFlight(old)
   activeProcesses.delete(sessionKey)
   // Silence the old exit handler so it doesn't close the proxy server,
   // unlink the system-prompt file, or touch claudeSessions on its way out
@@ -367,18 +933,22 @@ export function respawnActiveProcess(
   try {
     old.proc.kill()
   } catch {}
-  return spawnClaudeProcess(
+  const replacement = spawnClaudeProcess(
     cliPath,
-    appendResumeIfNeeded(sessionKey, cliArgs),
+    appendResumeIfNeeded(sessionKey, old.cliArgs ?? cliArgs),
     cwd,
     sessionKey,
     old.proxyServer,
     old.mcpHash,
     old.systemPromptFile,
     ignoreAnthropicApiKey,
-    old.proxyExposureHash,
-    old.systemPromptHash,
+    old.effort,
   )
+  replacement.pendingProxyCompletions = old.pendingProxyCompletions
+  replacement.proxyExposureHash = old.proxyExposureHash
+  delete old.pendingProxyCompletions
+  if (turnWasInFlight) noteTurnStarted(replacement)
+  return replacement
 }
 
 export function buildCliArgs(opts: {
@@ -391,6 +961,8 @@ export function buildCliArgs(opts: {
   strictMcpConfig?: boolean
   disallowedTools?: string[]
   appendSystemPromptFile?: string
+  /** `--plugin-dir` values (skill bridge), one flag per directory. */
+  pluginDirs?: string[]
   thinking?: "enabled" | "disabled"
   thinkingDisplay?: "summarized" | "omitted"
   fastMode?: boolean
@@ -406,6 +978,7 @@ export function buildCliArgs(opts: {
     strictMcpConfig,
     disallowedTools,
     appendSystemPromptFile,
+    pluginDirs,
     thinking,
     thinkingDisplay,
     fastMode,
@@ -474,6 +1047,9 @@ export function buildCliArgs(opts: {
   if (appendSystemPromptFile) {
     args.push("--append-system-prompt-file", appendSystemPromptFile)
   }
+  for (const dir of pluginDirs ?? []) {
+    args.push("--plugin-dir", dir)
+  }
 
   // Fast mode's only headless opt-in. `--settings` feeds the CLI's
   // `flagSettings` layer, which is the one its SDK gate checks; a `fastMode`
@@ -484,7 +1060,16 @@ export function buildCliArgs(opts: {
     args.push("--settings", JSON.stringify({ fastMode: true }))
   }
 
-  if (skipPermissions) {
+  // Plan mode is a capability restriction, not a prompt policy, and the CLI
+  // lets `--dangerously-skip-permissions` override it outright: measured on
+  // 2.1.258, a plan-mode run carrying both flags wrote a file on request
+  // without prompting, while the same run without the skip flag refused and
+  // created nothing. Since `skipPermissions` defaults to true, passing both
+  // is the common case, so anyone asking for plan mode was silently getting
+  // full write access. Plan mode must never permit edits, so it wins here.
+  // Every other `permissionMode` value governs prompting, which is exactly
+  // what the skip flag is for, so those still pass both.
+  if (skipPermissions && permissionMode !== "plan") {
     args.push("--dangerously-skip-permissions")
   }
 
@@ -497,4 +1082,72 @@ export function buildCliArgs(opts: {
  */
 export function sessionKey(cwd: string, modelId: string): string {
   return `${cwd}::${modelId}`
+}
+
+/**
+ * Pull the readable parts back out of a session key for the doctor report.
+ * The key is `<cwd>::<model>::<scope>::<affinity>::context=[...]` with an
+ * optional `::effort=<level>` tail, and the compaction variant is
+ * `<cwd>::<model>::compaction::<affinity>`, so the model and the opencode
+ * session id sit at the same two positions either way.
+ */
+export function describeSessionKey(key: string): {
+  cwd: string
+  model: string
+  session: string
+  compaction: boolean
+} {
+  const parts = key.split("::")
+  return {
+    cwd: parts[0] ?? "unknown",
+    model: parts[1] ?? "unknown",
+    session: parts[3] ?? "unknown",
+    compaction: parts[2] === "compaction",
+  }
+}
+
+/** One live `claude` child, flattened for `/claude-code-doctor`. */
+export interface ActiveProcessSnapshot {
+  sessionKey: string
+  session: string
+  model: string
+  compaction: boolean
+  pid?: number
+  inFlight: boolean
+  ageMs?: number
+  effort?: ReasoningEffort
+  attached: boolean
+  proxyUrl?: string
+  /**
+   * Tail of the child's stderr, when something upstream of this module is
+   * recording one. Read through an optional property so the doctor works
+   * whether or not that field exists on the running build.
+   */
+  lastStderr?: string
+}
+
+/**
+ * Every live child, oldest-used first (the map is LRU). Read-only; nothing
+ * here touches eviction or the process's own listeners.
+ */
+export function snapshotActiveProcesses(now = Date.now()): ActiveProcessSnapshot[] {
+  const out: ActiveProcessSnapshot[] = []
+  for (const [key, ap] of activeProcesses) {
+    const described = describeSessionKey(key)
+    const lastStderr = (ap as { lastStderr?: unknown }).lastStderr
+    out.push({
+      sessionKey: key,
+      session: ap.opencodeSessionID ?? described.session,
+      model: described.model,
+      compaction: described.compaction,
+      pid: ap.proc.pid,
+      inFlight: ap.turnInFlight === true,
+      ageMs: ap.startedAt === undefined ? undefined : Math.max(0, now - ap.startedAt),
+      effort: ap.effort,
+      attached: ap.lineEmitter.listenerCount("line") > 0,
+      proxyUrl: ap.proxyServer?.url,
+      lastStderr: typeof lastStderr === "string" ? lastStderr : undefined,
+    })
+  }
+  return out
 }
