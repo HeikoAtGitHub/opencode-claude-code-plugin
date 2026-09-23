@@ -963,7 +963,7 @@ export function _resetFastModeWarnings(): void {
  *
  * Fast mode fails soft: an ineligible account or a rate-limit cooldown drops
  * back to standard speed with no error. That silence is the problem worth
- * solving here: the fast model ids advertise 10x pricing in opencode's picker,
+ * solving here: the fast model ids advertise fast pricing in opencode's picker,
  * so a downgrade the user cannot see means the picker is lying about cost for
  * every subsequent turn.
  *
@@ -994,7 +994,7 @@ export function reportFastModeState(
   const reason = msg.fast_mode_disabled_reason
   if (state === "cooldown") {
     log.notice(
-      "fast mode is in cooldown after a rate limit; this turn runs at standard speed and is billed at standard Opus rates, not the 10x shown in the model picker.",
+      "fast mode is in cooldown after a rate limit; this turn runs at standard speed and is billed at standard Opus rates, not the fast price shown in the model picker.",
       { state, reason: reason ?? null },
     )
     return
@@ -1004,7 +1004,7 @@ export function reportFastModeState(
   const explanation = reason ? FAST_MODE_REASONS[reason] : undefined
   const message = `fast mode was requested but is off${
     explanation ? `: ${explanation}` : reason ? ` (${reason})` : ""
-  }. Turns run at standard speed and are billed at standard Opus rates, not the 10x shown in the model picker. Switch to the non-fast model id to make the picker's price accurate.`
+  }. Turns run at standard speed and are billed at standard Opus rates, not the fast price shown in the model picker. Switch to the non-fast model id to make the picker's price accurate.`
 
   if (warnedFastModeReasons.has(key)) {
     log.debug(message, { state, reason: reason ?? null })

@@ -84,7 +84,7 @@ CI installs and builds on **Node 24** (`.github/workflows/publish.yml`), which i
 
 ## Models
 
-The plugin auto-registers the following, and they appear in the model picker with no extra config: Haiku 4.5, Sonnet 4.5/4.6/5, Opus 4.5/4.6/4.7/4.8/5 (plus two fast-mode Opus entries), Fable 5/5.1 and Mythos 5/5.1, each except Haiku carrying `low` / `medium` / `high` / `xhigh` / `max` reasoning variants.
+The plugin auto-registers the following, and they appear in the model picker with no extra config: Haiku 4.5, Sonnet 4.5/4.6/5, Opus 4.5/4.6/4.7/4.8/5/5.5 (plus three fast-mode Opus entries), Fable 5/5.1 and Mythos 5/5.1, each except Haiku carrying `low` / `medium` / `high` / `xhigh` / `max` reasoning variants.
 
 | ID | Display name | Context | Output | Reasoning variants | Price × |
 |---|---|---|---|---|---|
@@ -99,6 +99,8 @@ The plugin auto-registers the following, and they appear in the model picker wit
 | `claude-opus-4-8-fast` | Claude Opus 4.8 Fast | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-opus-5` | Claude Opus 5 | 1M | 128,000 | low/medium/high/xhigh/max | 5× |
 | `claude-opus-5-fast` | Claude Opus 5 Fast | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
+| `claude-opus-5-5` | Claude Opus 5.5 | 1M | 128,000 | low/medium/high/xhigh/max | 4× |
+| `claude-opus-5-5-fast` | Claude Opus 5.5 Fast | 1M | 128,000 | low/medium/high/xhigh/max | 8× |
 | `claude-fable-5` | Claude Fable 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-fable-5-1` | Claude Fable 5.1 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
 | `claude-mythos-5` | Claude Mythos 5 | 1M | 128,000 | low/medium/high/xhigh/max | 10× |
@@ -108,15 +110,17 @@ The plugin auto-registers the following, and they appear in the model picker wit
 
 Capabilities for every model: text + image input, text output, tool use, attachments. No temperature control, no PDF/audio/video, no interleaved streaming.
 
-**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing (input and output ratios both come out the same: Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus $5/$25 = 5×, Fable/Mythos 5 and 5.1 / Opus fast mode $10/$50 = 10×). So **Fable/Mythos 5 and 5.1, and fast-mode Opus, all cost 2× standard Opus 5**. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
+**Price ×** is each model's per-token list price relative to Haiku, the cheapest model. It's derived exactly from Anthropic's published pricing (input and output ratios both come out the same: Haiku $1/$5 = 1×, Sonnet $3/$15 = 3×, Opus 5.5 $4/$20 = 4×, Opus $5/$25 = 5×, Opus 5.5 fast mode $8/$40 = 8×, Fable/Mythos 5 and 5.1 / Opus 5 and 4.8 fast mode $10/$50 = 10×). So **Fable/Mythos 5 and 5.1, and fast-mode Opus 5 and 4.8, all cost 2× standard Opus 5**, and fast mode is 2× the standard price on every Opus that offers it. The same multiplier is shown as a `(N×)` suffix on the display name in opencode's model picker, since opencode has no dedicated multiplier field. On a flat Max/Pro subscription it doubles as a rough guide to how fast each model drains your usage limit.
 
 Fable 5.1 and Mythos 5.1 keep the same $10/M input and $50/M output rates as 5.0, but cache reads cost $0.25/M instead of $1/M. Their cache-write rate remains $12.50/M.
 
-The model ID is passed straight through to `claude --model`, so anything Claude Code accepts works. The two `-fast` IDs are the one exception, described below.
+Opus 5.5 is priced below the Opus line at $4/M input and $20/M output, with cache writes at $5/M and cache reads at $0.20/M (0.05× input rather than the usual 0.1×). It needs **Claude Code 2.1.280 or newer**: the API rejects it from an older CLI with a 400 naming that floor, which shows up as a failed turn.
+
+The model ID is passed straight through to `claude --model`, so anything Claude Code accepts works. The three `-fast` IDs are the one exception, described below.
 
 ### Fast mode
 
-`claude-opus-5-fast` and `claude-opus-4-8-fast` run the same models at up to 2.5× the output tokens per second, at 2× the price ($10/M input, $50/M output, the 10× column). Pick them in the model selector like any other model.
+`claude-opus-5-5-fast`, `claude-opus-5-fast` and `claude-opus-4-8-fast` run the same models at up to 2.5× the output tokens per second, at 2× the price ($8/M input, $40/M output for Opus 5.5, the 8× column; $10/M input, $50/M output for Opus 5 and 4.8, the 10× column). Pick them in the model selector like any other model.
 
 The `-fast` suffix is this plugin's own marker, not a model name Anthropic serves. The plugin strips it and spawns `claude --model claude-opus-5 --settings '{"fastMode":true}'`, because that settings layer is the only way to opt a headless (`--print`) session into fast mode: there is no `--fast` flag, and the old `claude-opus-4-6-fast` style model names are retired. Requires Claude Code 2.1.220+; below that the plugin skips the opt-in and you get standard speed.
 
@@ -1221,7 +1225,7 @@ This plugin absorbs work from its forks directly, cherry-picked with the origina
 | [@galvani](https://github.com/galvani) (Jan Kozak) | Per-session working directory for `opencode serve`, so one server spawns each project's `claude` in the right place. Also found the stale `toolCallMap` re-emission three months before it was fixed here. | `9e02ce4`, `2238ed0` |
 | [@HeikoAtGitHub](https://github.com/HeikoAtGitHub) | Stopped sending `AGENTS.md` to the model twice (opencode already forwards it). Independently diagnosed the 5-minute proxy wall. | `25260a4`, `42f426d` |
 | [@bernardofortes](https://github.com/bernardofortes) (Bernardo Fortes) | `idleProcessTimeoutMs`, idle eviction of retained `claude` workers. | `a5f723a` |
-| [@broskees](https://github.com/broskees) (Joseph Roberts) | Task proxy default-on (PR #18), the abort `interrupt` so Esc really stops the CLI, the skill bridge, `task_batch` for concurrent subagents (and the measurement that the CLI serialises MCP calls), the undici 300 s diagnosis of the proxy wall, and the lifecycle release of proxied calls that made the `task` deadline unnecessary (PR #36). | PR #18, `68ed142`, PR #36 |
+| [@broskees](https://github.com/broskees) (Joseph Roberts) | Task proxy default-on (PR #18), the abort `interrupt` so Esc really stops the CLI, the skill bridge, `task_batch` for concurrent subagents (and the measurement that the CLI serialises MCP calls), the undici 300 s diagnosis of the proxy wall, the lifecycle release of proxied calls that made the `task` deadline unnecessary (PR #36), and Claude Opus 5.5 with its fast-mode entry (PR #43). | PR #18, `68ed142`, PR #36, PR #43 |
 | [@jknlsn](https://github.com/jknlsn) (Jake Nelson) | Per-tool proxy timeouts, subagent dispatch steering, the question proxy, the start watchdog respawn. | `84f3db9`, `94980a6`, `47501d0`, `ffefc24` |
 | [@CollieIsCute](https://github.com/CollieIsCute) (Collie Tsai) | The plan-mode approval bridge. | `8c5b583` |
 | [@flupkede](https://github.com/flupkede) | The compress proxy tool design and the AI-SDK v4 image-part fix. | `4ac319f`, `60a6e9a` |
