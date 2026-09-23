@@ -22,7 +22,13 @@ import {
 } from "./message-builder.js"
 import { resolveAgentEffort, resolveAgentModel } from "./agent-models.js"
 import { parseSideQuestion, requestSideQuestion, collectSideQuestionHistory, SIDE_QUESTION_USAGE, type SideQuestionResult } from "./side-question.js"
-import { BTW_NO_SESSION_MESSAGE, registerAsideSink, takeSideQuestionAnswer } from "./btw-command.js"
+import {
+  BTW_NO_SESSION_MESSAGE,
+  isSessionStopped,
+  registerAsideSink,
+  takeSideQuestionAnswer,
+  type BtwSdkClient,
+} from "./btw-command.js"
 import {
   describeResultFailure,
   formatResultFailureNote,
@@ -72,6 +78,7 @@ import {
   getRuntimeMcpStatus,
   fetchOpencodeToolList,
   fetchSessionParentId,
+  getOpencodeClient,
   type OpencodeToolListItem,
   resolveSpawnCwdForSession,
 } from "./runtime-status.js"
@@ -5120,19 +5127,27 @@ export class ClaudeCodeLanguageModel implements LanguageModelV3 {
               // The CLI is parked in that call and nobody else will answer
               // it; but only while no later turn has attached to the
               // process, since that turn's calls are its own.
-              if (
-                activeProcess &&
+              // opencode also fires this signal while it is still running the
+              // tool, so only a session that went idle counts as stopped.
+              const parked = () =>
+                !!activeProcess &&
                 activeProcess.lineEmitter.listenerCount("line") === 0 &&
                 getPendingProxyCalls(sk).length > 0
-              ) {
+              if (!parked()) return
+              void isSessionStopped(getOpencodeClient() as BtwSdkClient | null, affinity).then((stopped) => {
+                if (!stopped) {
+                  log.info("abort after proxy tool boundary while the session is still busy; keeping calls for the tool result", { sk })
+                  return
+                }
+                if (!parked()) return
                 log.info("abort between proxy tool boundaries; releasing pending calls", { sk })
-                void interruptTurn(activeProcess).then((idle) => {
+                void interruptTurn(activeProcess!).then((idle) => {
                   log.info("interrupt sent for aborted turn", { sk, idle })
                 })
                 releaseAbandonedProxyCalls(
                   "Provider stream was aborted while opencode was running its proxy tool calls",
                 )
-              }
+              })
               return
             }
 

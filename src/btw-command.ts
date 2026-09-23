@@ -457,6 +457,32 @@ export async function settleSessionBusy(
   }
 }
 
+/**
+ * Whether an abort that lands after a stream closed on a proxy tool boundary
+ * really stopped the turn. opencode also fires that stream's signal while it
+ * is still running the tool (measured 2026-09-23 on 1.18.32: 34 times in one
+ * day, 0.5 to 0.8 s after the boundary, with no operator input), and treating
+ * that as Esc rejects a call whose result is on its way. A stopped turn leaves
+ * the session idle; one still running its tool keeps it busy. Without a status
+ * route, or for the shared "default" affinity, it answers true so the caller
+ * keeps the release-at-once behaviour.
+ */
+export async function isSessionStopped(
+  client: BtwSdkClient | null,
+  sessionID: string,
+  options: { pollMs?: number; timeoutMs?: number } = {},
+): Promise<boolean> {
+  if (!sessionID || sessionID === "default") return true
+  const pollMs = options.pollMs ?? 250
+  const timeoutMs = options.timeoutMs ?? 3_000
+  const started = Date.now()
+  for (;;) {
+    if ((await sessionStatus(client, sessionID)) !== "busy") return true
+    if (Date.now() - started >= timeoutMs) return false
+    await new Promise((resolve) => setTimeout(resolve, pollMs))
+  }
+}
+
 function errorText(error: unknown): string {
   if (error instanceof Error) return error.message
   if (error && typeof error === "object" && "message" in error && typeof (error as { message: unknown }).message === "string") {

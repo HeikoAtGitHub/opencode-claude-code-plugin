@@ -40,7 +40,13 @@ import {
   type ProxyMcpServer,
   type ProxyToolCall,
 } from "./src/proxy-mcp.js"
-import { getPendingProxyCalls, onPendingProxyCall, queuePendingProxyCall } from "./src/proxy-broker.js"
+import {
+  getPendingProxyCalls,
+  onPendingProxyCall,
+  queuePendingProxyCall,
+  resolvePendingProxyCallById,
+} from "./src/proxy-broker.js"
+import { setOpencodeClient } from "./src/runtime-status.js"
 import {
   deleteActiveProcess,
   deleteActiveProcessAndWait,
@@ -371,10 +377,14 @@ type Ctx = {
   server: () => ProxyMcpServer
 }
 
-async function withParkedTaskCli(mode: Parameters<typeof parkedTaskCli>[0], run: (ctx: Ctx) => Promise<void>) {
+async function withParkedTaskCli(
+  mode: Parameters<typeof parkedTaskCli>[0],
+  run: (ctx: Ctx) => Promise<void>,
+  affinity = "default",
+) {
   const fake = parkedTaskCli(mode)
-  const modelId = `claude-test-lifecycle-${mode}`
-  const sk = sessionKey(fake.cwd, `${modelId}::tools::default::context=["claude-code",null]`)
+  const modelId = `claude-test-lifecycle-${mode}-${affinity}`
+  const sk = sessionKey(fake.cwd, `${modelId}::tools::${affinity}::context=["claude-code",null]`)
   let captured: ProxyMcpServer | undefined
   try {
     const model = createClaudeCode({
@@ -484,6 +494,66 @@ test("an abort while opencode is running the tool, with the stream already close
   const second = await collect((await model.doStream(nextUserTurn())).stream)
   assert.ok(textOf(second).includes("second answer"), textOf(second))
 }))
+
+/** opencode's `GET /session/status`, answering `type` for one session. */
+function statusClient(sessionID: string, type: () => string) {
+  return { session: { status: async () => ({ data: { [sessionID]: { type: type() } } }) } }
+}
+
+test("an abort opencode fires while it still runs the tool keeps the parked call for its result", {
+  timeout: 15_000,
+}, async () => {
+  const sessionID = "ses_boundary_busy"
+  setOpencodeClient(statusClient(sessionID, () => "busy"))
+  try {
+    await withParkedTaskCli("park", async (ctx) => {
+      const { model, sk, events } = ctx
+      const abort = new AbortController()
+      const turn = { ...firstTurn(), headers: { "x-session-affinity": sessionID }, abortSignal: abort.signal }
+      const first = await collect((await model.doStream(turn)).stream)
+      assert.equal((first.find((part) => part.type === "finish") as any)?.finishReason.unified, "tool-calls")
+      const [pending] = getPendingProxyCalls(sk)
+      assert.ok(pending, "the call is parked")
+
+      // Not the operator: opencode is still running the tool, the session stays busy.
+      abort.abort()
+      await new Promise((resolve) => setTimeout(resolve, 3_500))
+      assert.equal(getPendingProxyCalls(sk).length, 1, "broker entry kept")
+      assert.equal(ctx.server().pendingCallIds().length, 1, "HTTP entry kept")
+      assert.equal(events().some((event) => event.type === "interrupt"), false, "the CLI is not interrupted")
+
+      // The tool result arrives and answers the parked request normally.
+      assert.ok(resolvePendingProxyCallById(pending.toolCallId, { kind: "text", text: "subagent done" }))
+      await eventually("the CLI to record its answered HTTP call", () => events().some((event) => event.type === "http"))
+      const http = events().find((event) => event.type === "http")
+      assert.notEqual(http.body.result.isError, true)
+      assert.equal(http.body.result.content[0].text, "subagent done")
+    }, sessionID)
+  } finally {
+    setOpencodeClient({})
+  }
+})
+
+test("an abort after the tool boundary that leaves the session idle still releases the parked call", {
+  timeout: 15_000,
+}, async () => {
+  const sessionID = "ses_boundary_idle"
+  setOpencodeClient(statusClient(sessionID, () => "idle"))
+  try {
+    await withParkedTaskCli("park", async (ctx) => {
+      const { model, sk, events } = ctx
+      const abort = new AbortController()
+      const turn = { ...firstTurn(), headers: { "x-session-affinity": sessionID }, abortSignal: abort.signal }
+      await collect((await model.doStream(turn)).stream)
+      assert.equal(getPendingProxyCalls(sk).length, 1)
+      abort.abort()
+      await eventually("the interrupt to reach the parked CLI", () => events().some((event) => event.type === "interrupt"))
+      await assertReleased(ctx, /stream was aborted while opencode was running its proxy tool calls/)
+    }, sessionID)
+  } finally {
+    setOpencodeClient({})
+  }
+})
 
 test("a CLI that dies mid-call ends the turn as an error and releases the call on both sides", {
   timeout: 15_000,
