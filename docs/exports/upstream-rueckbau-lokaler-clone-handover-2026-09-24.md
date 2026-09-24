@@ -98,6 +98,81 @@ Zu klaeren in der Folgesession:
    ueberhaupt im Model-Tool-Set sieht (Namen `nvim-tools_<tool>`), und ob
    nur der Server-Namensfilter blockiert. Das waere der kleinste PR.
 
+## Nachtrag 2026-09-24: mcp-tools-Klaerung und Live-Probe
+
+### Registrierungsweg (read-only geklaert)
+
+- `mcp-tools.nvim/lua/mcp-tools/integrations/opencode.lua:71-95`:
+  `POST <opencode-url>/mcp` mit
+  `{name:"nvim-tools", config:{type:"remote", url:"http://127.0.0.1:<port>", headers:{Authorization:"Bearer <token>"}}}`.
+- Port ephemer (`MCP_PORT=0`, `bridge.lua:203`), Bridge an je eine
+  nvim-Instanz gebunden; Token pro Start rotierend (opencode-Pfad).
+- Ausloeser: `<leader>kt`/`<leader>km` → `opencode_register_mcp` →
+  `McpToolsRegisterOpencodeVdyk`, erst wenn opencode laeuft.
+- Voller Disk-Eintrag mit echter URL daher nicht moeglich.
+- Upstream-Blocker (Code): `resolveMcpProxyToolDefs` matcht korrekt auf
+  `nvim-tools_*`, aber Servernamen stammen nur aus Disk-Config; Layer-5-
+  Overlay (`mcp-bridge.ts:550-563`) iteriert nur Disk-Namen.
+
+### Loesungsweg ohne Code: deaktivierter Disk-Platzhalter
+
+```jsonc
+"mcp": {
+  "nvim-tools": { "type": "remote", "url": "http://127.0.0.1:1", "enabled": false }
+}
+```
+
+plus Provider-Optionen `proxyOpencodeMcpTools: true`,
+`bridgeOpencodeMcp: true`, `strictMcpConfig: true`.
+
+Mechanik: Platzhalter liefert den Namen fuer den Filter, `POST /mcp` von
+nvim ersetzt ihn in opencode zur Laufzeit, Overlay setzt ihn bei
+`connected` auf enabled, Proxy routet `nvim-tools_*` ueber opencode (das die
+echte dynamische Verbindung haelt). Platzhalter-URL geht nicht an Claude,
+solange der Proxy den Server abdeckt.
+
+### Live-Probe (verifiziert, Scratch-Umgebung)
+
+Aufbau: Upstream v0.27.1 per `git archive` nach `/tmp/ocprobe`, gebaut;
+`opencode serve` 1.18.32 mit Scratch-`XDG_*` und **ohne** vererbtes
+`OPENCODE_CONFIG_DIR` (sonst laedt der lokale Clone mit: `plugin ready`
+zweimal); `plugin ready` genau einmal (0.27.1). Headless nvim mit
+mcp-tools + nvim-dap, echte Bridge, Registrierung mit exakt dem
+mcp-tools-Payload; Modell `claude-code/claude-haiku-4-5`.
+
+| Schritt | Ergebnis |
+|---|---|
+| Platzhalter `enabled:false` | opencode-Status `disabled`; Modell sieht keine nvim-Tools |
+| `POST /mcp` (echte URL + Token) | HTTP 200, `connected`; Platzhalter ersetzt, nicht abgelehnt |
+| Folgeturn in vorher gestarteter Session | Respawn `opencode MCP config changed, respawning claude` (Status-Wechsel aendert Hash) |
+| frische Session | `routing opencode MCP tools through the proxy` (22 Tools), `--strict-mcp-config`, `proxy-mcp tool call received nvim-tools_nvim_dap_status` |
+| Tool-Resultat | `{"active": false, "message": "No active debug session", "agent_takeover": false}` |
+
+Ergebnis: Upstream ohne lokalen Clone erreicht dynamischen nvim-DAP-Server
+fuer claude-code-Modelle, geroutet ueber opencode.
+
+Offene Grenzen:
+
+- Erste Test-nvim hatte 0 Tools (nvim-dap unter `--clean` nicht geladen,
+  `pcall(require)` still). Dann lieferte opencode keine `nvim-tools_*`, das
+  Plugin bridgte den Server direkt mit Platzhalter-URL an Claude → Timeout,
+  `failed`. Risiko real: registriert nvim, bevor Tools geladen sind, erbt der
+  respawnte Prozess den kaputten Direktweg bis zur naechsten neuen Session.
+- Re-Registrierung mit neuem Port bei bereits `connected` erzeugt keinen
+  Respawn. Im Proxy-Fall unkritisch (URL nur in opencode), plausibel, aber
+  nicht direkt verifiziert.
+- `proxyOpencodeTools` fuer `submit_plan`/`repo_policy_scope`/
+  `workstream_manage` in dieser Probe nicht getestet.
+- Keine Nebenwirkung: mcp-tools-Integrationen default `false`,
+  `~/.claude.json` ohne `ocprobe`-Eintrag. Dort nur `nvim-tools-<slug>`
+  (claudecode-Integration, feste Ports 99xx), durch `strictMcpConfig`
+  neutralisiert. Scratch-Prozesse beendet, `/tmp/ocprobe` verbleibt.
+
+Konsequenz fuer Reihenfolge: Punkt 1–2 der Folgesession erledigt;
+Entscheidung = Disk-Platzhalter, Upstream-PR nur optional (Komfort:
+Runtime-Server ohne Platzhalter; Guard gegen Direkt-Bridge mit
+Platzhalter-URL waere sinnvoller PR-Inhalt).
+
 ## Weitere offene Punkte
 
 - **submit_plan-Deadline:** Upstream-Default fuer forwardete Tools ist
@@ -155,3 +230,12 @@ Zu klaeren in der Folgesession:
 > Upstream v0.27.1 (`proxyOpencodeMcpTools` / Bridge) ihn ohne lokalen
 > Patch erreichen kann. Danach Empfehlung: Disk-Eintrag, Upstream-PR oder
 > Mini-Patch. Keine Aenderung ohne genehmigten Plan.
+
+Aktualisiert nach Nachtrag 2026-09-24:
+
+> Lies den Handover inkl. Nachtrag. mcp-tools-Frage ist per Live-Probe
+> geklaert (Disk-Platzhalter). Naechster Schritt: Migrationsplan mit
+> Change-Impact-Matrix (Plugin-Quelle, `proxyTools` → `proxyOpencodeTools`,
+> `proxyToolTimeoutMs.submit_plan`, `strictMcpConfig`, Platzhalter
+> `nvim-tools`), vorher Live-Probe fuer `submit_plan` (>15 min),
+> `repo_policy_scope`, `workstream_manage list` in Scratch-Config.
