@@ -198,14 +198,57 @@ Platzhalter-URL waere sinnvoller PR-Inhalt).
   `~/.claude/history.jsonl` seit 2026-09-10 fast nur Test-/Exit-Eintraege.
   Plannotator-Fork (`apps/hook` nativ, `apps/opencode-plugin` fuer
   opencode) ist vom Plugin-Rueckbau nicht betroffen. Separate Frage.
-- **Alternative ianjwhite99/opencode-with-claude:** Offene Frage, noch nicht
-  analysiert: Was wuerde sich bei Umstieg auf
-  <https://github.com/ianjwhite99/opencode-with-claude> aendern, und ist das
-  ueberhaupt eine gangbare Option? Vergleichsachsen fuer die Folgesession:
-  Transport (CLI-Wrapper vs. anderer Weg), Abrechnung/Account-Modell,
-  Weiterleitung nativer opencode-Tools (`submit_plan`, `repo_policy_scope`,
-  `workstream_manage`), MCP-Anbindung inkl. Runtime-Server `nvim-tools`,
-  Plannotator-Flow, Wartungsstand und opencode-2-Kompatibilitaet.
+- **Alternative ianjwhite99/opencode-with-claude (Meridian-basiert):**
+  Read-only Code-Analyse 2026-09-24, kein Live-Test. Pins:
+  opencode-with-claude `0f31808` (v1.10.3, bundelt `@rynfar/meridian`
+  1.71.1 + `@rynfar/meridian-plugin-opencode-scrub` 0.2.0), Meridian-Main
+  `466bf33` (2026-09-23). Clones unter `/tmp/owc-probe`, `/tmp/meridian-probe`.
+  - **Transport:** opencode nutzt den *nativen* `anthropic`-Provider gegen
+    einen lokalen Meridian-HTTP-Proxy; Meridian ruft das Claude Agent SDK
+    (`query()`) mit OAuth-Login. Kein CLI-Wrapper, kein eigener Provider.
+  - **Tool-Passthrough (Kernfrage): ja.** Plugin setzt
+    `MERIDIAN_PASSTHROUGH ??= "true"` (`src/proxy.ts:12`), opencode-Adapter
+    defaultet ohnehin auf `true` (`src/proxy/transforms/opencode.ts:28`).
+    Jeder Request registriert opencodes `tools[]` als SDK-MCP-Server `oc`;
+    PreToolUse-Hook blockt die Ausfuehrung, `tool_use` geht an opencode
+    zurueck (`src/proxy/passthroughTools.ts` Kopfkommentar). Folge laut Code:
+    `submit_plan`, `repo_policy_scope`, `workstream_manage` und MCP-Tools inkl.
+    `nvim-tools` wuerden als native opencode-Tools ausgefuehrt; der lokale
+    Proxy-Routen-Grund fuer den Clone entfiele. **Nicht live verifiziert.**
+  - **Einschraenkung Task/Subagents:** Meridian parst opencodes `task`-Tool
+    in SDK-`agents` (`buildAgentDefinitionsFromTool`, an `query()` via
+    `agents:` in `src/proxy/query.ts:674`). Subagents laufen damit
+    SDK-intern, erlaubt nur `mcp__oc__read|write|edit|bash|glob|grep`
+    (`ALLOWED_MCP_TOOLS`, `src/proxy/tools.ts:104`), nicht als opencode-
+    Child-Sessions. Governance-Agenten mit `submit_plan`/Workstream-Rechten
+    als Subagent waeren so nicht abbildbar. Aus Code gelesen, nicht gemessen.
+  - **Tool-Deferral:** ab >15 Tools automatisch deferred via ToolSearch
+    (`DEFAULT_DEFER_THRESHOLD`, `passthroughTools.ts:235`,
+    `MERIDIAN_DEFER_TOOL_THRESHOLD`). Unser Setup liegt deutlich darueber.
+  - **Plan-Flow:** `ExitPlanMode`/`EnterPlanMode` gesperrt
+    (`CLAUDE_CODE_ONLY_TOOLS`); Plannotator liefe ueber natives `submit_plan`.
+  - **Accounts/Billing:** Meridian-Profile (`~/.config/meridian/profiles.json`,
+    `claudeConfigDir` je Profil). Abrechnung ueber Agent SDK, vermutlich
+    dasselbe Agent-SDK-Guthaben wie `claude -p` (nicht verifiziert).
+  - **opencode 2:** laut README aus einem Paket (`server()` + `setup()`).
+  - **Risiko (entscheidungsrelevant):** Das Scrub-Plugin entfernt laut
+    eigener Doku gezielt opencode-Fingerprints, die "Anthropic's billing
+    layer treats as a third-party-impersonation signal" (Opus sonst hinter
+    Extra Usage). Das ist bewusste Umgehung von Anthropics
+    Drittanbieter-Klassifizierung, ToS-/Account-Risiko. Einordnung: Unser
+    Plugin laesst im Interactive-Modus den forwarded opencode-Systemprompt
+    ebenfalls weg (Usage-Gate); Unterschied ist die explizite Tarnabsicht.
+  - **Empfehlung:** Tool-Passthrough loest die Clone-Probleme architektonisch
+    sauberer, aber Scrub-Risiko und SDK-interne Subagents sprechen gegen
+    einen Umstieg ohne Nutzerentscheidung. Scrub ist im Plugin **nicht
+    abschaltbar**: `experimental.chat.system.transform` ruft ihn fuer jeden
+    `anthropic`-Request unbedingt auf (`src/index.ts` ~Z. 116). Ohne Scrub
+    ginge nur Meridian direkt (ohne dieses Plugin) oder ein Fork. Falls
+    weiter verfolgt: Scratch-Test `submit_plan`, `nvim-tools`, `task` live.
+  - **Nutzerentscheidung 2026-09-24:** Vorerst **keine Migration** auf die
+    Meridian-basierte Loesung, wegen ToS-Bedenken (Scrub/Fingerprint-
+    Umgehung). Befund bleibt als Referenz; Weg bleibt Upstream-Rueckbau des
+    lokalen Clones wie oben beschrieben.
 - **Agent-Sync stale:** `~/.claude/agents` zuletzt 2026-09-03, OpenCode-
   Agents bis 2026-09-16 geaendert; Sync-Script unter `~/.claude/scripts`
   nicht gefunden. Nur melden, nicht Teil dieses Rueckbaus.
