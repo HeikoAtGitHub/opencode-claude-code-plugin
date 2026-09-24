@@ -123,6 +123,14 @@ Zu klaeren in der Folgesession:
   `~/.claude/history.jsonl` seit 2026-09-10 fast nur Test-/Exit-Eintraege.
   Plannotator-Fork (`apps/hook` nativ, `apps/opencode-plugin` fuer
   opencode) ist vom Plugin-Rueckbau nicht betroffen. Separate Frage.
+- **Alternative ianjwhite99/opencode-with-claude:** Offene Frage, noch nicht
+  analysiert: Was wuerde sich bei Umstieg auf
+  <https://github.com/ianjwhite99/opencode-with-claude> aendern, und ist das
+  ueberhaupt eine gangbare Option? Vergleichsachsen fuer die Folgesession:
+  Transport (CLI-Wrapper vs. anderer Weg), Abrechnung/Account-Modell,
+  Weiterleitung nativer opencode-Tools (`submit_plan`, `repo_policy_scope`,
+  `workstream_manage`), MCP-Anbindung inkl. Runtime-Server `nvim-tools`,
+  Plannotator-Flow, Wartungsstand und opencode-2-Kompatibilitaet.
 - **Agent-Sync stale:** `~/.claude/agents` zuletzt 2026-09-03, OpenCode-
   Agents bis 2026-09-16 geaendert; Sync-Script unter `~/.claude/scripts`
   nicht gefunden. Nur melden, nicht Teil dieses Rueckbaus.
